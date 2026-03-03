@@ -3777,6 +3777,18 @@ class GPUModelRunner(
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded
+                if pad_attn or has_separate_kv_update
+                else num_tokens_unpadded,
+                num_reqs_padded=(
+                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+                ),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
