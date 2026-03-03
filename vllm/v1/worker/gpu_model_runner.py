@@ -3831,6 +3831,10 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # When spec decode is enabled, delay clearing connector metadata
+        # until after draft model runs in sample_tokens.
+        clear_kv_metadata = self.speculative_config is None
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (

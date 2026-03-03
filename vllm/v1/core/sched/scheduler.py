@@ -919,7 +919,6 @@ class Scheduler(SchedulerInterface):
                 logger.info("Processing computed_token_gaps for request %s: %s",
                            request.request_id, computed_token_gaps)
                 for start, end in computed_token_gaps:
-                    print(f"Gap: ({start},{end})")
                     nrd_copy = replace(nrd)
                     parent_req_id = nrd_copy.req_id  # Save parent before modification
                     nrd_copy.req_id = nrd_copy.req_id + "." + str(start)
@@ -1576,7 +1575,6 @@ class Scheduler(SchedulerInterface):
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
-            print(f"Inserted {len(failed_kv_load_req_ids)} failed_kv_load_req_ids.")
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
@@ -1795,14 +1793,26 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
-        self.waiting.add_request(request)
-        print(
-            f"Added request {request.request_id}. BEFORE, self.requests is: {self.requests}"
-        )
-        self.requests[request.request_id] = request
-        print(f"AFTER, self.requests is: {self.requests}")
-        if self.log_stats:
-            request.record_event(EngineCoreEventType.QUEUED)
+        existing = self.requests.get(request.request_id)
+        if existing is not None:
+            update = StreamingUpdate.from_request(request)
+            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+                assert existing.streaming_queue is not None, "duplicate request id"
+                # Queue next input chunk (or finished sentinel).
+                existing.streaming_queue.append(update)
+            elif update is not None:
+                # Commence next input chunk.
+                self._update_request_as_session(existing, update)
+            else:
+                # Streaming-input session finished.
+                self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        else:
+            if request.resumable:
+                request.streaming_queue = deque()
+            self.waiting.add_request(request)
+            self.requests[request.request_id] = request
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

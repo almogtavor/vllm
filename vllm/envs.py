@@ -237,7 +237,15 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
-    
+    VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+    VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
+    VLLM_DISABLE_LOG_LOGO: bool = False
+    VLLM_LORA_DISABLE_PDL: bool = False
+    VLLM_ENABLE_CUDA_COMPATIBILITY: bool = False
+    VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
+    VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
+    VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+
     # spans vars
     VLLM_V1_SPANS_ENABLED: bool = False
     VLLM_V1_SPANS_DEBUG: bool = False
@@ -1483,6 +1491,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
         int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
     ),
+
+    "VLLM_SYSTEM_START_DATE": lambda: os.getenv("VLLM_SYSTEM_START_DATE", None),
 
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED":
