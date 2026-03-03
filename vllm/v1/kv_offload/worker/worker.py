@@ -143,6 +143,7 @@ class OffloadingWorker:
             logger.warning("Failed to submit %r transfer %d", transfer_type, job_id)
         else:
             logger.debug("Submitted %r transfer %d: %r", transfer_type, job_id, spec)
+
         return success
 
     def get_finished(self) -> list[TransferResult]:

@@ -38,6 +38,7 @@ class ReqMeta:
     # Is store or load
     is_store: bool
     mm_hashes: list[str]
+    req_id: str
 
     @staticmethod
     def make_meta(
@@ -46,6 +47,7 @@ class ReqMeta:
         block_size: int,
         is_store: bool,
         mm_hashes: list[str],
+        req_id: str = "",
     ) -> "ReqMeta":
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
@@ -62,6 +64,7 @@ class ReqMeta:
             slot_mapping=slot_mapping,
             is_store=is_store,
             mm_hashes=mm_hashes,
+            req_id=req_id,
         )
 
 
@@ -76,9 +79,12 @@ class ExampleConnectorMetadata(KVConnectorMetadata):
         block_size: int,
         is_store: bool,
         mm_hashes: list[str],
+        req_id: str = "",
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store, mm_hashes)
+            ReqMeta.make_meta(
+                token_ids, block_ids, block_size, is_store, mm_hashes, req_id
+            )
         )
 
 
@@ -151,7 +157,7 @@ class ExampleConnector(KVConnectorBase_V1):
                 offsets = slot_mapping % self._block_size
                 dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
             else:
-                num_pages = dst_kv_cache_layer_shape[1]
+                num_pages = dst_kv_cache_layer_shape[0]
                 page_size = dst_kv_cache_layer_shape[2]
                 dst_kv_cache_layer = dst_kv_cache_layer.reshape(
                     2, num_pages * page_size, -1
@@ -240,11 +246,7 @@ class ExampleConnector(KVConnectorBase_V1):
             if isinstance(attn_metadata, MLACommonMetadata):
                 num_pages, page_size = layer.shape[0], layer.shape[1]
                 return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
-            elif isinstance(attn_metadata, TritonAttentionMetadata):
-                block_idxs = slot_mapping // self._block_size
-                offsets = slot_mapping % self._block_size
-                return layer[block_idxs, :, offsets]
-            num_pages, page_size = layer.shape[1], layer.shape[2]
+            num_pages, page_size = layer.shape[0], layer.shape[2]
             return layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
 
         connector_metadata = self._get_connector_metadata()
@@ -335,6 +337,7 @@ class ExampleConnector(KVConnectorBase_V1):
                     block_size=self._block_size,
                     is_store=False,
                     mm_hashes=mm_hashes,
+                    req_id=new_req.req_id,
                 )
                 total_need_load += 1
             else:
@@ -349,6 +352,7 @@ class ExampleConnector(KVConnectorBase_V1):
                         block_size=self._block_size,
                         is_store=True,
                         mm_hashes=mm_hashes,
+                        req_id=new_req.req_id,
                     )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -379,6 +383,7 @@ class ExampleConnector(KVConnectorBase_V1):
                 block_size=self._block_size,
                 is_store=False,
                 mm_hashes=[f.identifier for f in request.mm_features],
+                req_id=req_id,
             )
             total_need_load += 1
 
@@ -454,4 +459,4 @@ class ExampleConnector(KVConnectorBase_V1):
 
 def align_to_block_size(num_tokens: int, block_size) -> int:
     """Align the number of tokens to the block size."""
-    return (num_tokens - 1) // block_size * block_size
+    return (num_tokens // block_size) * block_size  

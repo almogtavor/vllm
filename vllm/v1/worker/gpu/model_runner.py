@@ -382,7 +382,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None, None
 
         assert self.execute_model_state is not None
-        input_batch, _, _, _, hidden_states, _, _ = self.execute_model_state
+        input_batch, _, _, _, hidden_states, _, _, _ = self.execute_model_state
         self.execute_model_state = None
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
@@ -816,6 +816,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             computed_prefill, self.req_states.prefill_len.np, out=computed_prefill
         )
 
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -977,6 +978,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states,
             aux_hidden_states,
             kv_connector_output,
+            scheduler_output.virtual_gap_req_ids,
         )
 
         if not self.is_last_pp_rank:
@@ -1003,6 +1005,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states,
             aux_hidden_states,
             kv_connector_output,
+            virtual_gap_req_ids,
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -1080,6 +1083,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
 
+        # Handle virtual gap requests: cleanup only (KV written directly to parent)
+        if virtual_gap_req_ids is not None:
+            # Virtual gap requests share parent's blocks and write directly
+            # to parent's KV cache during model execution. Only need cleanup.
+            for req_id in virtual_gap_req_ids:
+                self.req_states.remove_request(req_id)
+                if self.supports_mm_inputs:
+                    self.encoder_runner.remove_request(req_id)
+
         if self.use_async_scheduling:
             return async_output
         return async_output.get_output()
@@ -1093,7 +1105,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The prior execute_model call must have failed.
             return None
 
-        input_batch, _, _, _, hidden_states, _, kv_connector_output = (
+        input_batch, _, _, _, hidden_states, _, kv_connector_output, _ = (
             self.execute_model_state
         )
         self.execute_model_state = None
