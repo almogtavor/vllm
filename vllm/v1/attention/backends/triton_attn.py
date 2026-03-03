@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+
+from vllm._aiter_ops import rocm_aiter_ops
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
