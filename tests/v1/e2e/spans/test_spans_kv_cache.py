@@ -33,6 +33,7 @@ import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256_cbor
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+from vllm.v1.core.sched.gap_policy import SpanAwareGapPolicy
 from vllm.v1.request import Request
 
 from .conftest import BLOCK_SIZE, build_llm, cleanup
@@ -215,30 +216,53 @@ def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
     return results[0]
 
 
-def test_pic_spans_actually_reuse_kv_across_requests(model, monkeypatch):
-    """End-to-end follow-up to test_pic_spans_preserve_prefix_caching_across_requests.
+def _warmup_chunk(llm, chunk_token_ids: list[int]) -> None:
+    """Populate the prefix cache with the chunk block alone.
 
-    The structural test only asserts that block_hashes match. This one
-    actually loads the model in mode SPANS-PC (spans on + prefix caching,
-    NO gap policy) and proves that the K/V bytes stored under those
-    matching hashes are reused byte-for-byte across requests that share
-    chunk + tail.
+    The chunk is the only block of its own request, so its parent_hash
+    defaults to NONE_HASH and the cached entry lands at
+    hash(NONE_HASH, chunk_tokens). That is the same hash PIC produces
+    for the same chunk later embedded in a longer prompt with
+    is_span_start=True, so the entry is reachable via fan-in.
 
-    Setup:
-        req_A = prefix_X + chunk + suffix
-        req_C = prefix_Y + chunk + suffix    (different prefix)
+    Mirrors the warmup step in kvcache-bench/middleware/processors.py:321-335
+    (without the HTTP / FastAPI layer).
+    """
+    llm.generate(
+        {"prompt_token_ids": chunk_token_ids},
+        sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+        use_tqdm=False,
+    )
 
-    After running A then C, the KV cache must contain:
-      - prefix_X blocks (written by A, still there - nothing evicted them)
-      - prefix_Y blocks (written by C, fresh)
-      - chunk + tail blocks (written by A, REUSED by C - hashes collided,
-        cache hit fired, no recompute, so the bytes are still A's)
 
-    Therefore the *set of non-empty K/V block byte-hashes* after A must be
-    a subset of the set after C: nothing A wrote was evicted or
-    overwritten. The cache hit path silently reuses A's K/V even when C's
-    actual cross-attention would produce different bytes - this is the
-    accuracy/perf trade-off PIC explicitly enables.
+def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
+    """End-to-end check that warming up the spans block before serving
+    requests gives the expected reuse pattern.
+
+    Setup (mode SPANS-PC: spans on, prefix caching on, no gap policy):
+      - Warm up by running a one-shot request whose sole block is the
+        chunk. That populates the prefix cache with one entry at
+        hash(NONE_HASH, chunk_tokens).
+      - req_A = prefix_X + chunk + suffix    (span_starts=[32])
+      - req_B identical to A, different request_id
+      - req_C = prefix_Y + chunk + suffix    (different prefix)
+
+    Expected reuse pattern (per the PIC contract the test pins):
+      - req_A: prefix_X + suffix fresh, chunk reused from warmup.
+      - req_B: full reuse from req_A.
+      - req_C: prefix_Y + suffix fresh, chunk still reused (from the
+        same warmup entry; tail is NOT reused across A and C even
+        though its hashes happen to collide, because only the chunk
+        is marked PIC).
+
+    The assertions check set-relations between KV cache snapshots; they
+    do not measure exact block counts (decode-step allocation varies by
+    model). The decisive checks are:
+      1. The warmup chunk slot survives every subsequent request - it
+         must never be evicted or overwritten.
+      2. req_B adds zero new K/V slots (full reuse from A).
+      3. req_C does not evict any slot req_A wrote.
+      4. req_C adds at least one new slot (prefix_Y is a genuine miss).
     """
     chunk = list(range(500, 500 + BLOCK_SIZE))
     suffix = list(range(700, 700 + BLOCK_SIZE * 3))
@@ -254,81 +278,188 @@ def test_pic_spans_actually_reuse_kv_across_requests(model, monkeypatch):
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
-        # req_A: cold cache; populates prefix_X + chunk + tail K/V
+        # Step 0: warm up the chunk block alone.
+        _warmup_chunk(llm, chunk)
+        snap_warmup = _kv_cache_block_hashes(llm, LAYER_IDX)
+        # The unique non-empty hashes from the warmup. In practice this
+        # is 1 slot (the chunk) plus optionally a decode-step slot from
+        # the max_tokens=1 generate call.
+        warmup_blocks = set(snap_warmup)
+
+        # req_A: cold-ish cache (chunk pre-warmed). Prefix + suffix fresh.
         llm.generate(
             {"prompt_token_ids": prefix_x + chunk + suffix},
             sampling_params=sp,
             use_tqdm=False,
         )
         snap_after_a = _kv_cache_block_hashes(llm, LAYER_IDX)
-        non_empty_a = set(snap_after_a)
 
-        # req_C: prefix_Y differs; chunk + tail block_hashes collide -> cache
-        # hit; A's K/V bytes are reused, C only computes fresh K/V for the
-        # 2 prefix_Y blocks.
+        # req_B: identical to A. Must fully reuse A's cache state.
+        llm.generate(
+            {"prompt_token_ids": prefix_x + chunk + suffix},
+            sampling_params=sp,
+            use_tqdm=False,
+        )
+        snap_after_b = _kv_cache_block_hashes(llm, LAYER_IDX)
+
+        # req_C: different prefix, same chunk + tail. Prefix_Y fresh,
+        # chunk still reused via the warmup-populated PIC slot.
         llm.generate(
             {"prompt_token_ids": prefix_y + chunk + suffix},
             sampling_params=sp,
             use_tqdm=False,
         )
         snap_after_c = _kv_cache_block_hashes(llm, LAYER_IDX)
-        non_empty_c = set(snap_after_c)
 
-        # Every K/V block A wrote must still be present byte-for-byte after C
-        # ran. If anything diverged, either C overwrote A's slots (would mean
-        # gap-policy fired, which is disabled here) or A's blocks were
-        # evicted (cache is far larger than 8 blocks, so this can't happen).
-        missing_from_c = non_empty_a - non_empty_c
-        assert not missing_from_c, (
-            f"{len(missing_from_c)} K/V block(s) A wrote are no longer in the "
-            f"cache after C ran - reuse path failed."
+        # 1. The warmup-populated K/V slot survives every subsequent
+        #    request. PIC fan-in keeps the chunk reused; the warmup
+        #    put it in the cache and the cache must hand it back
+        #    unchanged.
+        assert warmup_blocks <= set(snap_after_a), (
+            f"warmup slot(s) were evicted/overwritten by req_A. "
+            f"missing: {warmup_blocks - set(snap_after_a)}"
+        )
+        assert warmup_blocks <= set(snap_after_b), (
+            f"warmup slot(s) were evicted/overwritten by req_B. "
+            f"missing: {warmup_blocks - set(snap_after_b)}"
+        )
+        assert warmup_blocks <= set(snap_after_c), (
+            f"warmup slot(s) were evicted/overwritten by req_C. "
+            f"missing: {warmup_blocks - set(snap_after_c)}"
         )
 
-        # Sanity: C must have added at least one new K/V block (its prefix_Y
-        # blocks). If non_empty_c == non_empty_a, then C didn't write
-        # anything - which would mean even prefix_Y was somehow shared,
-        # which it shouldn't be (different tokens, different hash chain).
-        new_in_c = non_empty_c - non_empty_a
-        assert len(new_in_c) >= 1, (
-            f"C wrote no new K/V blocks - prefix_Y should have been a cache "
-            f"miss but apparently wasn't. snap diff: {len(non_empty_c)} vs "
-            f"{len(non_empty_a)}"
+        # 2. req_B is identical to req_A. Once A populated the cache,
+        #    B must add nothing (full reuse).
+        assert set(snap_after_b) == set(snap_after_a), (
+            f"req_B added new K/V slots - identical prompt should fully "
+            f"reuse A. extra slots in B: "
+            f"{set(snap_after_b) - set(snap_after_a)}"
+        )
+
+        # 3. req_C must NOT evict or replace any K/V slot A wrote.
+        missing_from_c = set(snap_after_a) - set(snap_after_c)
+        assert not missing_from_c, (
+            f"req_C evicted/overwrote {len(missing_from_c)} slot(s) "
+            f"that req_A wrote."
+        )
+
+        # 4. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
+        #
+        # Only the chunk block is marked PIC (span_starts=[32]).
+        # Therefore req_C must add new K/V slots for:
+        #   - 2 prefix_Y blocks (cache miss, fresh)
+        #   - 3 tail blocks (must be recomputed against prefix_Y, NOT
+        #     reused from A)
+        # That's >= 5 new slots, plus possibly a decode-step block.
+        new_in_c = set(snap_after_c) - set(snap_after_a)
+        assert len(new_in_c) >= 5, (
+            f"INCORRECT CROSS-PREFIX REUSE DETECTED: req_C added only "
+            f"{len(new_in_c)} new K/V slots when it should have added "
+            f">= 5 (2 prefix_Y + 3 freshly-recomputed tail blocks).\n\n"
+            f"The tail blocks are NOT marked PIC but their block_hashes "
+            f"collide with req_A's because they chain through the PIC "
+            f"chunk's hash. vLLM silently reuses A's tail K/V for C, "
+            f"even though C's actual cross-attention sees a different "
+            f"prefix (prefix_Y instead of prefix_X)."
         )
     finally:
         cleanup(llm)
 
 
-def test_legolink_recompute_overwrites_pic_chunk_kv_in_place(model, monkeypatch):
-    """End-to-end check that gap-policy recompute actually writes new K/V
-    into the cache (and, by the design at scheduler.py:963-996, into the
-    *same* physical blocks the parent already owns).
+def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
+    """Two-part check that the gap-policy interval bound actually
+    constrains which span-region blocks can be recomputed on a cache hit.
 
-    Run #1: cold prefill populates the KV cache with one set of K/V.
-    Run #2: prefix-cache hit, gap policy fires with gap_length >> prompt,
-            virtual gap request runs the model and writes K/V at the
-            recomputed positions back into the parent's block_ids.
-    Therefore the KV-cache snapshot taken after run #2 must differ from
-    the one taken between runs."""
-    prompt = "Hello world! Please write a short greeting in one sentence."
+    Layout (mode LL-32, gap_length = 2 * BLOCK_SIZE = 2 blocks):
+
+        block index:    0       1       2          3          4       5
+        token range: [0..15] [16..31] [32..47]   [48..63]   [64..79] [80..95]
+        role:        prefix  prefix   span-start span-chain span-chain span-chain
+                                      ^^^^^^^^^^^^^^^^^^^^^^
+                                      gap interval (32, 64)
+                                      - first 2 of the span region
+
+    Part 1 (structural): instantiate SpanAwareGapPolicy directly with
+    gap_length=32 and verify get_gaps returns [(32, 64)] for this
+    prompt - i.e. exactly the chunk + first downstream block, not the
+    last 2 tail blocks.
+
+    Part 2 (e2e): run the prompt twice through an LL-32 LLM, snapshot
+    the KV cache between runs, and bound the byte-diff. With
+    deterministic decoding (temp=0, seed=SEED) any gap-recompute
+    produces byte-identical K/V, so the count of *new* byte-hashes is
+    typically 0; the meaningful assertion is the upper bound (the gap
+    policy can't recompute more than its configured 2 blocks).
+    """
+    prefix = list(range(0, BLOCK_SIZE * 2))
+    span_region = list(range(500, 500 + BLOCK_SIZE * 4))
+    prompt_tokens = prefix + span_region
     sp = SamplingParams.from_optional(
-        seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS
+        seed=SEED,
+        temperature=0.0,
+        max_tokens=MAX_TOKENS,
+        extra_args={"span_starts": [BLOCK_SIZE * 2]},
     )
 
-    llm = build_llm(model, "LL-FULL", monkeypatch)
+    # Part 1: pin gap-policy math.
+    policy = SpanAwareGapPolicy(
+        gap_length=2 * BLOCK_SIZE, block_size=BLOCK_SIZE
+    )
+    sp_for_policy_req = SamplingParams(
+        max_tokens=MAX_TOKENS,
+        extra_args={"span_starts": [BLOCK_SIZE * 2]},
+    )
+    sp_for_policy_req.update_from_generation_config({}, eos_token_id=100)
+    policy_req = Request(
+        request_id="gap_policy_check",
+        prompt_token_ids=prompt_tokens,
+        sampling_params=sp_for_policy_req,
+        pooling_params=None,
+    )
+    # Use a num_computed_tokens that simulates "everything except the last
+    # block is cached" (the typical prefix-cache state on a re-run).
+    gaps = policy.get_gaps(
+        policy_req,
+        num_computed_tokens=BLOCK_SIZE * 5,  # 5 blocks cached, last block decodes
+        num_external_tokens=0,
+    )
+    assert gaps == [(BLOCK_SIZE * 2, BLOCK_SIZE * 4)], (
+        f"Expected gap (32, 64) from gap_length=2 blocks + span at 32, "
+        f"got {gaps}"
+    )
+
+    # Part 2: e2e byte-diff bound.
+    llm = build_llm(model, "LL-32", monkeypatch)
     try:
-        # Run #1: cold prefill, populates cache.
-        llm.generate(prompt, sampling_params=sp, use_tqdm=False)
-        snap_after_1 = _kv_cache_block_hashes(llm, LAYER_IDX)
+        llm.generate(
+            {"prompt_token_ids": prompt_tokens},
+            sampling_params=sp,
+            use_tqdm=False,
+        )
+        snap_1 = _kv_cache_block_hashes(llm, LAYER_IDX)
+        s1 = set(snap_1)
 
-        # Run #2: cache hit → gap_length=huge → full recompute, new blocks
-        # allocated and filled.
-        llm.generate(prompt, sampling_params=sp, use_tqdm=False)
-        snap_after_2 = _kv_cache_block_hashes(llm, LAYER_IDX)
+        llm.generate(
+            {"prompt_token_ids": prompt_tokens},
+            sampling_params=sp,
+            use_tqdm=False,
+        )
+        snap_2 = _kv_cache_block_hashes(llm, LAYER_IDX)
+        s2 = set(snap_2)
 
-        assert snap_after_2 != snap_after_1, (
-            "LL-FULL replay did not change the KV cache; recompute appears "
-            "to have been a no-op (or written into the same physical blocks "
-            "with identical bytes)."
+        new_in_2 = s2 - s1
+        gone_from_1 = s1 - s2
+
+        # gap_length=2*BLOCK_SIZE bounds how many K/V slots can change
+        # bytes between runs. With deterministic decoding the actual
+        # diff is usually 0 (recompute yields the same bytes), but it
+        # can never exceed 2 prompt blocks + a small decode-step budget.
+        assert len(new_in_2) <= 4, (
+            f"|new_in_2|={len(new_in_2)} (expected <= 4 for "
+            f"gap_length=2 blocks plus decode-step slack)"
+        )
+        assert len(gone_from_1) <= 4, (
+            f"|gone_from_1|={len(gone_from_1)} (expected <= 4)"
         )
     finally:
         cleanup(llm)

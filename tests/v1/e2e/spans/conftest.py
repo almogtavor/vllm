@@ -91,6 +91,14 @@ def build_llm(
             "block_size": BLOCK_SIZE,
         }
         enable_prefix_caching = True
+    elif mode == "LL-32":
+        spans_enabled = True
+        gap_policy_name = "span_aware"
+        gap_policy_config = {
+            "gap_length": 2 * BLOCK_SIZE,
+            "block_size": BLOCK_SIZE,
+        }
+        enable_prefix_caching = True
     elif mode == "LL-FULL":
         spans_enabled = True
         gap_policy_name = "span_aware"
