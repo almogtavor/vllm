@@ -60,53 +60,6 @@ def _make_request(
     )
 
 
-def test_same_pic_chunk_hashes_match_across_requests_no_recompute():
-    """Pure block-hash check (NO recompute, no LLM): two requests with the
-    same PIC chunk but different surrounding tokens hash the chunk to the
-    same block hash (fan-in / position-invariant), and the surrounding
-    blocks to different hashes. This is structural — gap policy and runtime
-    K/V overwrite are not involved."""
-    original = envs.VLLM_V1_SPANS_ENABLED
-    try:
-        envs.VLLM_V1_SPANS_ENABLED = True
-        chunk = list(range(500, 500 + BLOCK_SIZE))
-
-        # Two prefixes of equal length, different content, both 1 block.
-        prefix_a = list(range(0, BLOCK_SIZE))
-        prefix_b = list(range(900, 900 + BLOCK_SIZE))
-
-        sp = SamplingParams(
-            max_tokens=MAX_TOKENS,
-            extra_args={"span_starts": [BLOCK_SIZE]},
-        )
-        sp.update_from_generation_config({}, eos_token_id=100)
-        hasher = get_request_block_hasher(BLOCK_SIZE, sha256_cbor)
-
-        req_a = Request(
-            request_id="pic_share_a",
-            prompt_token_ids=prefix_a + chunk,
-            sampling_params=sp,
-            pooling_params=None,
-            block_hasher=hasher,
-        )
-        req_b = Request(
-            request_id="pic_share_b",
-            prompt_token_ids=prefix_b + chunk,
-            sampling_params=sp,
-            pooling_params=None,
-            block_hasher=hasher,
-        )
-
-        assert len(req_a.block_hashes) == 2
-        assert len(req_b.block_hashes) == 2
-        # Pre-chunk blocks differ (different prefixes).
-        assert req_a.block_hashes[0] != req_b.block_hashes[0]
-        # PIC chunk: identical hash regardless of preceding context (fan-in).
-        assert req_a.block_hashes[1] == req_b.block_hashes[1]
-    finally:
-        envs.VLLM_V1_SPANS_ENABLED = original
-
-
 def test_pic_spans_preserve_prefix_caching_across_requests():
     """Prefix caching survives PIC spans embedded in a long prompt.
 
@@ -233,6 +186,177 @@ def _warmup_chunk(llm, chunk_token_ids: list[int]) -> None:
         sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
         use_tqdm=False,
     )
+
+
+def test_pic_chunk_hash_invariant_across_positions_e2e(model, monkeypatch):
+    """E2E counterpart to test_pic_chunk_hash_invariant_across_positions.
+
+    Setup (SPANS-PC, warmup chunk):
+      - Warm up the chunk alone -> cache slot at hash(NONE_HASH, chunk).
+      - req_A = prefix_a (1 block) + chunk, span_starts=[BLOCK_SIZE].
+                Chunk lands at block index 1.
+      - req_B = prefix_b (3 blocks, different content) + chunk,
+                span_starts=[BLOCK_SIZE * 3]. Chunk lands at block index 3.
+
+    Both requests should HIT the warmup-cached chunk slot via PIC fan-in
+    despite the chunk being at different positions in their prompts.
+    The warmup K/V slot must be in the cache both after req_A and after
+    req_B.
+    """
+    chunk = list(range(500, 500 + BLOCK_SIZE))
+    prefix_a = list(range(0, BLOCK_SIZE))
+    prefix_b = list(range(200, 200 + BLOCK_SIZE * 3))
+
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
+    try:
+        _warmup_chunk(llm, chunk)
+        warmup_blocks = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        sp_a = SamplingParams.from_optional(
+            seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
+            extra_args={"span_starts": [BLOCK_SIZE]},
+        )
+        sp_b = SamplingParams.from_optional(
+            seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
+            extra_args={"span_starts": [BLOCK_SIZE * 3]},
+        )
+
+        llm.generate({"prompt_token_ids": prefix_a + chunk},
+                     sampling_params=sp_a, use_tqdm=False)
+        snap_after_a = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        llm.generate({"prompt_token_ids": prefix_b + chunk},
+                     sampling_params=sp_b, use_tqdm=False)
+        snap_after_b = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        assert warmup_blocks <= snap_after_a, (
+            "warmup chunk slot was evicted/overwritten by req_A (chunk at "
+            "position 16) - PIC fan-in did not hit the warmed slot."
+        )
+        assert warmup_blocks <= snap_after_b, (
+            "warmup chunk slot was evicted/overwritten by req_B (chunk at "
+            "position 48) - PIC fan-in did not hit the warmed slot."
+        )
+    finally:
+        cleanup(llm)
+
+
+def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
+    """E2E counterpart to test_span_boundary_resets_block_hash_chain_no_recompute.
+
+    Same 4-block prompt sent two ways:
+      - baseline: no span_starts -> block 2 hashes through its parent chain
+      - marked:   span_starts=[BLOCK_SIZE * 2] -> block 2 hashes with
+                  parent dropped (NONE_HASH)
+
+    With the chunk pre-warmed, only the "marked" request can hit the
+    warmup slot at block 2 (because only it produces the fan-in hash).
+    The "baseline" request misses on every block (chain hashes don't
+    match the warmup) and writes fresh K/V.
+
+    The warmup slot must survive the marked run; the baseline run must
+    add at least one new non-warmup slot.
+    """
+    chunk_at_block_2 = list(range(32, 32 + BLOCK_SIZE))
+    prompt = list(range(0, BLOCK_SIZE * 4))  # 4 blocks: [0..63]
+    # Re-stitch so the chunk-tokens at positions [32..47] are byte-equal
+    # to the warmup chunk.
+    assert prompt[32:48] == chunk_at_block_2
+
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
+    try:
+        _warmup_chunk(llm, chunk_at_block_2)
+        warmup_blocks = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        # baseline: no span_starts -> regular hash chain -> warmup slot NOT
+        # reachable for block 2.
+        sp_baseline = SamplingParams.from_optional(
+            seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
+        )
+        llm.generate({"prompt_token_ids": prompt},
+                     sampling_params=sp_baseline, use_tqdm=False)
+        snap_after_baseline = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        # marked: span_starts=[32] -> block 2 hashed with NONE_HASH parent
+        # -> matches warmup slot, hits.
+        sp_marked = SamplingParams.from_optional(
+            seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
+            extra_args={"span_starts": [BLOCK_SIZE * 2]},
+        )
+        llm.generate({"prompt_token_ids": prompt},
+                     sampling_params=sp_marked, use_tqdm=False)
+        snap_after_marked = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        # Warmup slot survives both runs (cache is large; nothing evicts it).
+        assert warmup_blocks <= snap_after_baseline, (
+            "warmup slot was evicted by the baseline run"
+        )
+        assert warmup_blocks <= snap_after_marked, (
+            "warmup slot was evicted by the marked run"
+        )
+        # Baseline must have added at least one new slot - it can't have
+        # used the warmup slot because its chain-hashed block 2 differs
+        # from the warmup's NONE_HASH-rooted block 2.
+        new_after_baseline = snap_after_baseline - warmup_blocks
+        assert len(new_after_baseline) >= 1, (
+            "baseline run added no new slots - it shouldn't have been "
+            "able to reuse the warmup slot (different hash chain), but "
+            "the snapshots match. Something else cached the prompt."
+        )
+    finally:
+        cleanup(llm)
+
+
+def test_same_pic_chunk_reuse_across_prefixes_e2e(model, monkeypatch):
+    """E2E counterpart to test_same_pic_chunk_hashes_match_across_requests_no_recompute.
+
+    Two requests share the same PIC chunk but have completely different
+    1-block prefixes. After warming up the chunk, both requests must hit
+    the warmup slot via PIC fan-in even though their prefix hash chains
+    are independent.
+    """
+    chunk = list(range(500, 500 + BLOCK_SIZE))
+    prefix_a = list(range(0, BLOCK_SIZE))
+    prefix_b = list(range(900, 900 + BLOCK_SIZE))
+
+    sp = SamplingParams.from_optional(
+        seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
+        extra_args={"span_starts": [BLOCK_SIZE]},
+    )
+
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
+    try:
+        _warmup_chunk(llm, chunk)
+        warmup_blocks = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        llm.generate({"prompt_token_ids": prefix_a + chunk},
+                     sampling_params=sp, use_tqdm=False)
+        snap_after_a = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        llm.generate({"prompt_token_ids": prefix_b + chunk},
+                     sampling_params=sp, use_tqdm=False)
+        snap_after_b = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+
+        # Warmup slot survives both runs (PIC fan-in keeps the chunk
+        # reused, the cache doesn't evict it).
+        assert warmup_blocks <= snap_after_a, (
+            "warmup slot was evicted by req_A (prefix_a + chunk)"
+        )
+        assert warmup_blocks <= snap_after_b, (
+            "warmup slot was evicted by req_B (prefix_b + chunk)"
+        )
+        # The two prefix slots must differ - prefix_a and prefix_b have
+        # different tokens, so their hashes differ, so different slots.
+        new_a = snap_after_a - warmup_blocks
+        new_b = snap_after_b - warmup_blocks
+        # Both runs must have written their prefix's K/V to new slots.
+        assert len(new_a) >= 1, "req_A wrote no new slots"
+        assert len(new_b - new_a) >= 1, (
+            "req_B added no new slots beyond req_A's - prefix_b should "
+            "have a different hash than prefix_a and miss the cache."
+        )
+    finally:
+        cleanup(llm)
 
 
 def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
@@ -428,9 +552,13 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
         f"got {gaps}"
     )
 
-    # Part 2: e2e byte-diff bound.
+    # Part 2: e2e byte-diff bound. Pre-warm the chunk so the span block
+    # is reachable via PIC fan-in before either main run.
+    chunk_tokens = prompt_tokens[BLOCK_SIZE * 2:BLOCK_SIZE * 3]
     llm = build_llm(model, "LL-32", monkeypatch)
     try:
+        _warmup_chunk(llm, chunk_tokens)
+
         llm.generate(
             {"prompt_token_ids": prompt_tokens},
             sampling_params=sp,

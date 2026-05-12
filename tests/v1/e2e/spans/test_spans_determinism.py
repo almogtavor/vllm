@@ -91,34 +91,46 @@ def test_pic_at_start_all_modes_match(model, monkeypatch):
 
 
 def test_legolink_gap_huge_equals_full_recompute(model, monkeypatch):
-    """LL-FULL with prefix caching: cold prefill populates the cache, second
-    run hits it and (because gap_length >> prompt) re-prefills everything.
-    Output must equal clean FR.
+    """Verify that 5 ostensibly-equivalent configurations all produce the
+    same next-token top-K logprobs on the same prompt.
 
-    Uses a tokenized prompt with an explicit ``span_starts`` so the spans
-    machinery (PIC hash reset + gap policy) is genuinely exercised. The
-    previous version of this test used a string prompt with no
-    ``span_starts``, which left ``request.span_starts`` as None and the
-    gap policy as a no-op; the assertion still passed but for trivial
-    reasons (no recompute = same output).
+    Modes compared (all on a 4-block, 64-token prompt with no padding):
+
+      1. FR              regular vLLM, no spans, no gap policy.
+      2. SPANS + no_sp   VLLM_V1_SPANS_ENABLED=True but no span_starts on
+                         the request - the PIC code path never fires.
+      3. SPANS + sp[0]   VLLM_V1_SPANS_ENABLED=True with span_starts=[0]
+                         (entire prompt is one span). The PIC reset at
+                         block 0 is a no-op (block 0's parent was already
+                         None), so the hash chain is unchanged.
+      4. LL-FULL+no_sp   gap_policy=span_aware, gap_length=huge, prefix
+                         caching ON, but no span_starts -> gap policy
+                         early-returns []; cold + replay both produce
+                         FR-equivalent K/V.
+      5. LL-FULL+sp[0]   same as 4 but with span_starts=[0]. Cold prefill
+                         is FR-equivalent (PIC at 0 is a no-op). On
+                         replay the gap policy fires gap=(0, num_computed),
+                         re-prefills the entire prompt against the actual
+                         prefix; output must still match FR.
+
+    None of these configurations should actually change the K/V the model
+    sees. Strict top-K logprob equality is the assertion.
+
+    This test does NOT use a chunk warmup, because warmup would only
+    matter for cross-request PIC fan-in (which is covered by tests 1/3).
+    Here we're just asserting that all "no-real-PIC-fan-in" code paths
+    produce identical numerical output.
     """
-    prefix = list(range(0, BLOCK_SIZE * 2))
-    span_region = list(range(500, 500 + BLOCK_SIZE * 4))
-    prompt_tokens = prefix + span_region
+    prompt_tokens = list(range(0, BLOCK_SIZE * 4))
 
-    fr_sp = SamplingParams.from_optional(
-        seed=SEED,
-        temperature=0.0,
-        max_tokens=MAX_TOKENS,
-        logprobs=LOGPROBS_TOPK,
-    )
-    ll_sp = SamplingParams.from_optional(
-        seed=SEED,
-        temperature=0.0,
-        max_tokens=MAX_TOKENS,
-        logprobs=LOGPROBS_TOPK,
-        extra_args={"span_starts": [BLOCK_SIZE * 2]},
-    )
+    def _greedy(extra_args=None):
+        return SamplingParams.from_optional(
+            seed=SEED,
+            temperature=0.0,
+            max_tokens=MAX_TOKENS,
+            logprobs=LOGPROBS_TOPK,
+            extra_args=extra_args,
+        )
 
     def _run_tokens(llm, sp):
         res = llm.generate(
@@ -129,42 +141,71 @@ def test_legolink_gap_huge_equals_full_recompute(model, monkeypatch):
         out = res[0].outputs[0]
         return out.text, extract_step0_topk(out, LOGPROBS_TOPK)
 
-    # Reference: clean FR with the same token sequence, no spans / no gap.
+    # Mode 1: FR baseline.
     fr_llm = build_llm(model, "FR", monkeypatch)
     try:
-        ref_text, ref_top = _run_tokens(fr_llm, fr_sp)
+        ref_text, ref_top = _run_tokens(fr_llm, _greedy())
     finally:
         cleanup(fr_llm)
 
+    results: dict[str, tuple[str, list]] = {"FR": (ref_text, ref_top)}
+
+    # Mode 2: SPANS, no span_starts.
+    spans_llm = build_llm(model, "SPANS", monkeypatch)
+    try:
+        results["SPANS+no_sp"] = _run_tokens(spans_llm, _greedy())
+    finally:
+        cleanup(spans_llm)
+
+    # Mode 3: SPANS, span_starts=[0] (entire prompt is one span).
+    spans_llm = build_llm(model, "SPANS", monkeypatch)
+    try:
+        results["SPANS+sp[0]"] = _run_tokens(
+            spans_llm, _greedy(extra_args={"span_starts": [0]})
+        )
+    finally:
+        cleanup(spans_llm)
+
+    # Mode 4: LL-FULL, no span_starts. Cold then replay (gap won't fire
+    # either way, but we run twice to mirror modes 5 + the cache state).
     ll_llm = build_llm(model, "LL-FULL", monkeypatch)
     try:
-        # Run #1: cold prefill with spans on, populates cache.
-        _run_tokens(ll_llm, ll_sp)
-        # Run #2: every block is now a cache hit, gap policy with
-        # gap_length >> prompt re-prefills everything against the
-        # actual prefix.
-        replay_text, replay_top = _run_tokens(ll_llm, ll_sp)
+        _run_tokens(ll_llm, _greedy())  # cold
+        results["LL-FULL+no_sp"] = _run_tokens(ll_llm, _greedy())  # replay
     finally:
         cleanup(ll_llm)
 
-    assert replay_text == ref_text, "LL-FULL replay diverged from FR"
-    # Top-1 (greedy decoding) must agree - that's the load-bearing claim.
-    assert replay_top[0][0] == ref_top[0][0], (
-        f"LL-FULL replay top-1 token differs from FR: "
-        f"ref={ref_top[0][0]} replay={replay_top[0][0]}"
-    )
-    # The full top-K is *almost* identical but typically drifts in lower
-    # ranks by ~1e-2 in logprob - the cold-prefill path and the
-    # gap-recompute path have slightly different numerical character even
-    # though both end up computing K/V against the same prefix. Compare
-    # the set of top-K token IDs; expect them to overlap heavily but not
-    # necessarily match exactly.
-    ref_ids = {tid for tid, _ in ref_top}
-    replay_ids = {tid for tid, _ in replay_top}
-    assert len(ref_ids & replay_ids) >= LOGPROBS_TOPK - 2, (
-        f"top-{LOGPROBS_TOPK} sets diverged by more than 2 IDs: "
-        f"ref={ref_ids - replay_ids}, replay={replay_ids - ref_ids}"
-    )
+    # Mode 5: LL-FULL, span_starts=[0]. Cold + replay; on replay the gap
+    # policy fires gap=(0, num_computed) and re-prefills the entire
+    # prompt against the current prefix.
+    ll_llm = build_llm(model, "LL-FULL", monkeypatch)
+    try:
+        _run_tokens(ll_llm, _greedy(extra_args={"span_starts": [0]}))  # cold
+        results["LL-FULL+sp[0]"] = _run_tokens(
+            ll_llm, _greedy(extra_args={"span_starts": [0]})
+        )  # replay
+    finally:
+        cleanup(ll_llm)
+
+    # All modes must produce bit-identical text + top-K to FR.
+    drifts: list[str] = []
+    for mode, (text, top) in results.items():
+        if mode == "FR":
+            continue
+        if text != ref_text:
+            drifts.append(
+                f"{mode} text drift:\n  ref:    {ref_text!r}\n  got:    {text!r}"
+            )
+        if top != ref_top:
+            ref_ids = [tid for tid, _ in ref_top]
+            got_ids = [tid for tid, _ in top]
+            drifts.append(
+                f"{mode} top-{LOGPROBS_TOPK} drift:\n"
+                f"  ref ids: {ref_ids}\n"
+                f"  got ids: {got_ids}"
+            )
+
+    assert not drifts, "Mode equivalence failed:\n\n" + "\n\n".join(drifts)
 
 
 def test_block_size_constant_matches_conftest():
