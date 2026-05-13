@@ -121,38 +121,54 @@ def _request_block_hashes(
 def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
     """E2E counterpart to test_span_boundary_resets_block_hash_chain_no_recompute.
 
-    Same 4-block prompt sent two ways:
-      - baseline: no span_starts -> block 2 hashes through its parent chain
-      - marked:   span_starts=[BLOCK_SIZE * 2] -> block 2 hashes with
-                  parent dropped (NONE_HASH)
+    The same 4-block prompt is sent two ways:
+      - baseline: no span_starts -> block index 2 hashes through its
+                  parent chain
+      - marked:   span_starts=[BLOCK_SIZE * 2] -> block index 2 hashes
+                  with parent dropped (NONE_HASH)
 
-    With the chunk pre-warmed, only the "marked" request can hit the
-    warmup slot at block 2 (because only it produces the fan-in hash).
-    The "baseline" request misses on every block (chain hashes don't
-    match the warmup) and writes fresh K/V.
-
-    The warmup slot must survive the marked run; the baseline run must
-    add at least one new non-warmup slot.
+    Even though the prompt tokens are identical, the hash of the next
+    block, index 3, must also differ because its parent hash differs.
     """
-    chunk_at_block_2 = list(range(32, 32 + BLOCK_SIZE))
+    span_chunk_at_block_2 = list(range(32, 32 + BLOCK_SIZE))
     prompt = list(range(0, BLOCK_SIZE * 4))  # 4 blocks: [0..63]
-    # Re-stitch so the chunk-tokens at positions [32..47] are byte-equal
-    # to the warmup chunk.
-    assert prompt[32:48] == chunk_at_block_2
+    # The chunk-tokens at positions [32..47] are byte-equal to the warmup chunk.
+    assert prompt[32:48] == span_chunk_at_block_2
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
-        _warmup_prompt(llm, chunk_at_block_2)
-        warmup_blocks = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+        baseline_hashes: list[BlockHash] = _request_block_hashes(
+            prompt,
+            span_starts=None,
+        )
+        marked_hashes: list[BlockHash] = _request_block_hashes(
+            prompt,
+            span_starts=[BLOCK_SIZE * 2],
+        )
+        warmup_chunk_hash: BlockHash = _request_block_hashes(
+            span_chunk_at_block_2,
+            span_starts=None,
+        )[0]
 
-        # baseline: no span_starts -> regular hash chain -> warmup slot NOT
-        # reachable for block 2.
+        assert baseline_hashes[2] != marked_hashes[2], (
+            "span_starts should reset the block index 2 parent hash"
+        )
+        assert marked_hashes[2] == warmup_chunk_hash, (
+            "marked block index 2 should match the standalone warmup chunk"
+        )
+        assert baseline_hashes[3] != marked_hashes[3], (
+            "block index 3 should diverge because its parent block hash differs"
+        )
+
+        _warmup_prompt(llm, span_chunk_at_block_2) # [32, 33, 34, ..., 47]
+        warmup_kv_blocks = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+        # baseline: no span_starts -> regular hash chain -> warmup slot NOT reachable.
         sp_baseline = SamplingParams.from_optional(
             seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
         )
         llm.generate({"prompt_token_ids": prompt},
                      sampling_params=sp_baseline, use_tqdm=False)
-        snap_after_baseline = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+        kv_hashes_after_baseline_req_a = set(_kv_cache_block_hashes(llm, LAYER_IDX))
 
         # marked: span_starts=[32] -> block 2 hashed with NONE_HASH parent
         # -> matches warmup slot, hits.
@@ -162,20 +178,20 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
         )
         llm.generate({"prompt_token_ids": prompt},
                      sampling_params=sp_marked, use_tqdm=False)
-        snap_after_marked = set(_kv_cache_block_hashes(llm, LAYER_IDX))
+        kv_hashes_after_marked = set(_kv_cache_block_hashes(llm, LAYER_IDX))
 
-        # Warmup slot survives both runs (cache is large; nothing evicts it).
-        assert warmup_blocks <= snap_after_baseline, (
+        # <= shows every item in warmup_kv_blocks is also present in kv_hashes_after_baseline_req_a.
+        assert warmup_kv_blocks <= kv_hashes_after_baseline_req_a, (
             "warmup slot was evicted by the baseline run"
         )
-        assert warmup_blocks <= snap_after_marked, (
+        assert warmup_kv_blocks <= kv_hashes_after_marked, (
             "warmup slot was evicted by the marked run"
         )
         # Baseline must have added at least one new slot - it can't have
         # used the warmup slot because its chain-hashed block 2 differs
         # from the warmup's NONE_HASH-rooted block 2.
-        new_after_baseline = snap_after_baseline - warmup_blocks
-        assert len(new_after_baseline) >= 1, (
+        new_kv_after_baseline = kv_hashes_after_baseline_req_a - warmup_kv_blocks
+        assert len(new_kv_after_baseline) >= 1, (
             "baseline run added no new slots - it shouldn't have been "
             "able to reuse the warmup slot (different hash chain), but "
             "the snapshots match. Something else cached the prompt."
