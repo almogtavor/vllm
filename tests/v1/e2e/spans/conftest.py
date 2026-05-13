@@ -53,6 +53,7 @@ def model(request) -> str:
 
 def _set_spans_env(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", enabled)
+    monkeypatch.setenv("VLLM_V1_SPANS_ENABLED", str(enabled))
 
 
 def build_llm(
