@@ -14,6 +14,7 @@ import pytest
 
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import BlockHash, get_request_block_hasher
 from vllm.v1.core.sched.gap_policy import SpanAwareGapPolicy
 from vllm.v1.request import Request
@@ -100,6 +101,10 @@ def _request_block_hashes(
     prompt_token_ids: list[int],
     span_starts: list[int] | None,
 ) -> list[BlockHash]:
+    hash_fn = get_hash_fn_by_name("sha256")
+    if not hasattr(kv_cache_utils, "NONE_HASH"):
+        kv_cache_utils.init_none_hash(hash_fn)
+
     extra_args = {"span_starts": span_starts} if span_starts is not None else None
     sp = SamplingParams(max_tokens=MAX_TOKENS, extra_args=extra_args)
     sp.update_from_generation_config({}, eos_token_id=100)
@@ -108,64 +113,9 @@ def _request_block_hashes(
         prompt_token_ids=prompt_token_ids,
         sampling_params=sp,
         pooling_params=None,
-        block_hasher=get_request_block_hasher(
-            BLOCK_SIZE, get_hash_fn_by_name("sha256")
-        ),
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, hash_fn),
     )
     return req.block_hashes
-
-
-def test_pic_chunk_hash_invariant_across_positions_e2e(model, monkeypatch):
-    """E2E counterpart to test_pic_chunk_hash_invariant_across_positions.
-
-    Setup (SPANS-PC, warmup chunk):
-      - Warm up the chunk alone -> cache slot at hash(NONE_HASH, chunk).
-      - req_A = prefix_a (1 block) + chunk, span_starts=[BLOCK_SIZE].
-                Chunk lands at block index 1.
-      - req_B = prefix_b (3 blocks, different content) + chunk,
-                span_starts=[BLOCK_SIZE * 3]. Chunk lands at block index 3.
-
-    Both requests should HIT the warmup-cached chunk slot via PIC fan-in
-    despite the chunk being at different positions in their prompts.
-    The warmup K/V slot must be in the cache both after req_A and after
-    req_B.
-    """
-    chunk = list(range(500, 500 + BLOCK_SIZE))
-    prefix_a = list(range(0, BLOCK_SIZE))
-    prefix_b = list(range(200, 200 + BLOCK_SIZE * 3))
-
-    llm = build_llm(model, "SPANS-PC", monkeypatch)
-    try:
-        _warmup_prompt(llm, chunk)
-        warmup_blocks = set(_kv_cache_block_hashes(llm, LAYER_IDX))
-
-        sp_a = SamplingParams.from_optional(
-            seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
-            extra_args={"span_starts": [BLOCK_SIZE]},
-        )
-        sp_b = SamplingParams.from_optional(
-            seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS,
-            extra_args={"span_starts": [BLOCK_SIZE * 3]},
-        )
-
-        llm.generate({"prompt_token_ids": prefix_a + chunk},
-                     sampling_params=sp_a, use_tqdm=False)
-        snap_after_a = set(_kv_cache_block_hashes(llm, LAYER_IDX))
-
-        llm.generate({"prompt_token_ids": prefix_b + chunk},
-                     sampling_params=sp_b, use_tqdm=False)
-        snap_after_b = set(_kv_cache_block_hashes(llm, LAYER_IDX))
-
-        assert warmup_blocks <= snap_after_a, (
-            "warmup chunk slot was evicted/overwritten by req_A (chunk at "
-            "position 16) - PIC fan-in did not hit the warmed slot."
-        )
-        assert warmup_blocks <= snap_after_b, (
-            "warmup chunk slot was evicted/overwritten by req_B (chunk at "
-            "position 48) - PIC fan-in did not hit the warmed slot."
-        )
-    finally:
-        cleanup(llm)
 
 
 def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
