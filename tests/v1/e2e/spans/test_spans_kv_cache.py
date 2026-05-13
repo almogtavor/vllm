@@ -2,37 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-cache and gap-policy assertions for the spans / Legolink machinery.
 
-Migrated from examples/offline_inference/spans/spans_time_and_kv.py:
-the example's per-block SHA-256 dump becomes the snapshot used to assert
-recompute actually changed cached K/V content. Timing / TTFT / TPOT
-metrics are dropped (perf, not correctness).
-
-Tests:
-  test_same_pic_chunk_hashes_match_across_requests_no_recompute
-      same PIC chunk in two requests with different prefixes → identical
-      chunk hash but different pre-chunk hashes (the "fan-in" guarantee
-      from the user's perspective: same content, different chain). Pure
-      structural hash check, no recompute.
-  test_pic_spans_preserve_prefix_caching_across_requests
-      Three structural requests sharing a PIC chunk + tail: pins
-      determinism, chunk fan-in, post-PIC tail share-ability, and that
-      divergence stays scoped to the pre-span blocks.
-  test_legolink_recompute_overwrites_pic_chunk_kv_in_place
-      LL-FULL + prefix caching: run the same prompt twice. Run #2 hits the
-      cache, gap policy fires, and the virtual gap request shares the
-      parent's block_ids (see scheduler.py:963-996) → K/V is recomputed
-      and written back into the same physical slots, overwriting them.
-      The KV-cache snapshot after run #2 must differ from the one taken
-      between runs.
+End-to-end tests that hash the worker's KV cache per block (mirroring
+examples/offline_inference/spans/spans_time_and_kv.py) and use set-
+relations between snapshots to pin PIC fan-in, span-boundary hash chain
+reset, cross-prefix chunk reuse, prefix-cache-survives-PIC behavior, and
+the Legolink gap-policy interval bound.
 """
 import hashlib
 
 import pytest
 
-import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
-from vllm.utils.hashing import sha256_cbor
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.core.sched.gap_policy import SpanAwareGapPolicy
 from vllm.v1.request import Request
 
@@ -58,90 +38,6 @@ def _make_request(
         sampling_params=sp,
         pooling_params=None,
     )
-
-
-def test_pic_spans_preserve_prefix_caching_across_requests():
-    """Prefix caching survives PIC spans embedded in a long prompt.
-
-    Three structural requests, all with span_starts=[BLOCK_SIZE * 2] (one PIC
-    chunk in the middle of the prompt) and a shared post-PIC tail:
-
-        req_a = prefix_X + chunk + suffix    (request id "a")
-        req_b = prefix_X + chunk + suffix    (same content, different id)
-        req_c = prefix_Y + chunk + suffix    (different prefix, same chunk + tail)
-
-    The four assertions pin properties prefix caching depends on:
-
-      1. Determinism — replaying the same request hashes identically end-to-end.
-         Without this, prefix caching cannot reuse anything on a re-run.
-      2. Fan-in on the PIC chunk — same chunk hashes the same regardless of
-         preceding prefix. Cross-request cache reuse on the chunk itself.
-      3. Post-PIC tail is also shareable — every block downstream of the chunk
-         hashes the same across A and C. PIC dropping the parent at the span
-         boundary means the tail's chain only depends on chunk + tail tokens,
-         not on the prefix. This is the load-bearing property: it turns a
-         single shared chunk into a shared *suffix from the chunk onward*.
-      4. Divergence stays scoped — pre-span blocks hash differently across A
-         and C. The span boundary is the only point where chains decouple.
-    """
-    original = envs.VLLM_V1_SPANS_ENABLED
-    try:
-        envs.VLLM_V1_SPANS_ENABLED = True
-
-        prefix_x = list(range(0, BLOCK_SIZE * 2))               # 2 blocks
-        prefix_y = list(range(900, 900 + BLOCK_SIZE * 2))       # 2 blocks, different content
-        chunk = list(range(500, 500 + BLOCK_SIZE))              # 1 block, the PIC chunk
-        suffix = list(range(700, 700 + BLOCK_SIZE * 3))         # 3 blocks, shared tail
-
-        sp = SamplingParams(
-            max_tokens=MAX_TOKENS,
-            extra_args={"span_starts": [BLOCK_SIZE * 2]},
-        )
-        sp.update_from_generation_config({}, eos_token_id=100)
-        hasher = get_request_block_hasher(BLOCK_SIZE, sha256_cbor)
-
-        req_a = Request(
-            request_id="pic_pc_a",
-            prompt_token_ids=prefix_x + chunk + suffix,
-            sampling_params=sp,
-            pooling_params=None,
-            block_hasher=hasher,
-        )
-        req_b = Request(
-            request_id="pic_pc_b",
-            prompt_token_ids=prefix_x + chunk + suffix,
-            sampling_params=sp,
-            pooling_params=None,
-            block_hasher=hasher,
-        )
-        req_c = Request(
-            request_id="pic_pc_c",
-            prompt_token_ids=prefix_y + chunk + suffix,
-            sampling_params=sp,
-            pooling_params=None,
-            block_hasher=hasher,
-        )
-
-        # 6 blocks each: 2 prefix + 1 chunk + 3 suffix.
-        assert len(req_a.block_hashes) == 6
-        assert len(req_b.block_hashes) == 6
-        assert len(req_c.block_hashes) == 6
-
-        # 1. Determinism: same prompt + same spans → identical hashes.
-        assert req_a.block_hashes == req_b.block_hashes
-
-        # 2. Fan-in on the PIC chunk across different prefixes.
-        assert req_a.block_hashes[2] == req_c.block_hashes[2]
-
-        # 3. Post-PIC tail is shareable across requests with matching chunk
-        #    + tail, even when prefixes differ. THIS is the property that
-        #    makes PIC actually pay off in cache hit-rate.
-        assert req_a.block_hashes[2:] == req_c.block_hashes[2:]
-
-        # 4. Divergence is scoped to the pre-span blocks only.
-        assert req_a.block_hashes[0:2] != req_c.block_hashes[0:2]
-    finally:
-        envs.VLLM_V1_SPANS_ENABLED = original
 
 
 def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
@@ -364,20 +260,20 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
     requests gives the expected reuse pattern.
 
     Setup (mode SPANS-PC: spans on, prefix caching on, no gap policy):
-      - Warm up by running a one-shot request whose sole block is the
-        chunk. That populates the prefix cache with one entry at
-        hash(NONE_HASH, chunk_tokens).
-      - req_A = prefix_X + chunk + suffix    (span_starts=[32])
+      - Warm up by running a one-shot request whose only blocks are the
+        2-block chunk. That populates the prefix cache with two entries:
+        hash(NONE_HASH, chunk[0..16]) and hash(prev, chunk[16..32]).
+      - req_A = prefix_X + chunk(2 blocks) + suffix    (span_starts=[32])
       - req_B identical to A, different request_id
-      - req_C = prefix_Y + chunk + suffix    (different prefix)
+      - req_C = prefix_Y + chunk + suffix              (different prefix)
 
     Expected reuse pattern (per the PIC contract the test pins):
       - req_A: prefix_X + suffix fresh, chunk reused from warmup.
       - req_B: full reuse from req_A.
       - req_C: prefix_Y + suffix fresh, chunk still reused (from the
-        same warmup entry; tail is NOT reused across A and C even
-        though its hashes happen to collide, because only the chunk
-        is marked PIC).
+        same warmup entries; tail is NOT reused across A and C even
+        though its hashes happen to collide, because only the chunk's
+        2 blocks are marked PIC).
 
     The assertions check set-relations between KV cache snapshots; they
     do not measure exact block counts (decode-step allocation varies by
@@ -388,7 +284,7 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
       3. req_C does not evict any slot req_A wrote.
       4. req_C adds at least one new slot (prefix_Y is a genuine miss).
     """
-    chunk = list(range(500, 500 + BLOCK_SIZE))
+    chunk = list(range(500, 500 + BLOCK_SIZE * 2))  # 2-block PIC chunk
     suffix = list(range(700, 700 + BLOCK_SIZE * 3))
     prefix_x = list(range(0, BLOCK_SIZE * 2))
     prefix_y = list(range(900, 900 + BLOCK_SIZE * 2))
@@ -402,12 +298,12 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
-        # Step 0: warm up the chunk block alone.
+        # Step 0: warm up the 2-block chunk alone.
         _warmup_chunk(llm, chunk)
         snap_warmup = _kv_cache_block_hashes(llm, LAYER_IDX)
         # The unique non-empty hashes from the warmup. In practice this
-        # is 1 slot (the chunk) plus optionally a decode-step slot from
-        # the max_tokens=1 generate call.
+        # is 2 slots (the chunk's two blocks) plus optionally a
+        # decode-step slot from the max_tokens=1 generate call.
         warmup_blocks = set(snap_warmup)
 
         # req_A: cold-ish cache (chunk pre-warmed). Prefix + suffix fresh.
@@ -469,7 +365,8 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
 
         # 4. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
         #
-        # Only the chunk block is marked PIC (span_starts=[32]).
+        # Only the chunk's 2 blocks are marked PIC
+        # (span_starts=[32], chunk spans [32, 64)).
         # Therefore req_C must add new K/V slots for:
         #   - 2 prefix_Y blocks (cache miss, fresh)
         #   - 3 tail blocks (must be recomputed against prefix_Y, NOT
