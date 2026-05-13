@@ -315,14 +315,17 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
     The decisive checks are:
       1. The warmup chunk slot survives every subsequent request - it
          must never be evicted or overwritten.
-      2. req_B adds zero new K/V slots (full reuse from A).
+      2. req_B reports BLOCK_SIZE * 7 cached tokens (engine itself
+         confirms it reused all of A's prompt via PIC fan-in).
       3. req_C does not evict any slot req_A wrote.
-      4. req_C adds at least one new slot (prefix_Y is a genuine miss).
+      4. req_C adds >= 5 new slots (2 prefix_Y + 3 fresh tail);
+         this is the correctness pin and currently FAILS by design.
     """
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))  # 2-block PIC chunk
     suffix = list(range(700, 700 + BLOCK_SIZE * 3))
     prefix_x = list(range(0, BLOCK_SIZE * 2))
     prefix_y = list(range(900, 900 + BLOCK_SIZE * 2))
+    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  # bounds cached count
 
     sp = SamplingParams.from_optional(
         seed=SEED,
@@ -343,24 +346,29 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
 
         # req_A: cold-ish cache (chunk pre-warmed). Prefix + suffix fresh.
         llm.generate(
-            {"prompt_token_ids": prefix_x + chunk + suffix},
+            {"prompt_token_ids": prefix_x + chunk + suffix + cold_suffix},
             sampling_params=sp,
             use_tqdm=False,
         )
         kv_hashes_after_a = _kv_cache_block_hashes(llm, LAYER_IDX)
 
-        # req_B: identical to A. Must fully reuse A's cache state.
-        llm.generate(
-            {"prompt_token_ids": prefix_x + chunk + suffix},
-            sampling_params=sp,
-            use_tqdm=False,
+        # req_B: identical to A. Engine should charge all of A's prompt
+        # (prefix_X + chunk + suffix = 7 blocks) as cached; cold_suffix is
+        # the 8th block, bounding cached_b at 7 * BLOCK_SIZE.
+        cached_b = _generate_num_cached_tokens(
+            llm, prefix_x + chunk + suffix + cold_suffix, sp
         )
         kv_hashes_after_b = _kv_cache_block_hashes(llm, LAYER_IDX)
+        assert cached_b == BLOCK_SIZE * 7, (
+            f"req_B should reuse all of A's prompt via prefix cache "
+            f"(chunk included); got cached_b={cached_b}, "
+            f"expected {BLOCK_SIZE * 7}"
+        )
 
         # req_C: different prefix, same chunk + tail. Prefix_Y fresh,
         # chunk still reused via the warmup-populated PIC slot.
         llm.generate(
-            {"prompt_token_ids": prefix_y + chunk + suffix},
+            {"prompt_token_ids": prefix_y + chunk + suffix + cold_suffix},
             sampling_params=sp,
             use_tqdm=False,
         )
@@ -383,22 +391,14 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
             f"missing: {warmup_blocks - set(kv_hashes_after_c)}"
         )
 
-        # 2. req_B is identical to req_A. Once A populated the cache,
-        #    B must add nothing (full reuse).
-        assert set(kv_hashes_after_b) == set(kv_hashes_after_a), (
-            f"req_B added new K/V slots - identical prompt should fully "
-            f"reuse A. extra slots in B: "
-            f"{set(kv_hashes_after_b) - set(kv_hashes_after_a)}"
-        )
-
-        # 3. req_C must NOT evict or replace any K/V slot A wrote.
+        # 2. req_C must NOT evict or replace any K/V slot A wrote.
         missing_from_c = set(kv_hashes_after_a) - set(kv_hashes_after_c)
         assert not missing_from_c, (
             f"req_C evicted/overwrote {len(missing_from_c)} slot(s) "
             f"that req_A wrote."
         )
 
-        # 4. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
+        # 3. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
         #
         # Only the chunk's 2 blocks are marked PIC
         # (span_starts=[32], chunk spans [32, 64)).
@@ -440,12 +440,13 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
     prompt - i.e. exactly the chunk + first downstream block, not the
     last 2 tail blocks.
 
-    Part 2 (e2e): run the prompt twice through an LL-32 LLM, snapshot
-    the KV cache between runs, and bound the byte-diff. With
-    deterministic decoding (temp=0, seed=SEED) any gap-recompute
-    produces byte-identical K/V, so the count of *new* byte-hashes is
-    typically 0; the meaningful assertion is the upper bound (the gap
-    policy can't recompute more than its configured 2 blocks).
+    Part 2 (e2e): run the prompt twice through an LL-32 LLM, assert the
+    replay sees the expected prefix-cache hit, snapshot the KV cache
+    between runs, and bound the byte-diff. With deterministic decoding
+    (temp=0, seed=SEED) any gap-recompute produces byte-identical K/V,
+    so the count of *new* byte-hashes is typically 0; the meaningful
+    assertion is the upper bound (the gap policy can't recompute more
+    than its configured 2 blocks).
     """
     prefix = list(range(0, BLOCK_SIZE * 2))
     span_region = list(range(500, 500 + BLOCK_SIZE * 4))
@@ -472,6 +473,7 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
         sampling_params=sp_for_policy_req,
         pooling_params=None,
     )
+    policy_req.span_starts = [BLOCK_SIZE * 2]
     # Use a num_computed_tokens that simulates "everything except the last
     # block is cached" (the typical prefix-cache state on a re-run).
     gaps = policy.get_gaps(
@@ -491,18 +493,14 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
     try:
         _warmup_prompt(llm, chunk_tokens)
 
-        llm.generate(
-            {"prompt_token_ids": prompt_tokens},
-            sampling_params=sp,
-            use_tqdm=False,
-        )
+        cached_1 = _generate_num_cached_tokens(llm, prompt_tokens, sp)
         snap_1 = _kv_cache_block_hashes(llm, LAYER_IDX)
         s1 = set(snap_1)
 
-        llm.generate(
-            {"prompt_token_ids": prompt_tokens},
-            sampling_params=sp,
-            use_tqdm=False,
+        cached_2 = _generate_num_cached_tokens(llm, prompt_tokens, sp)
+        assert cached_2 == BLOCK_SIZE * 5, (
+            f"LL-32 replay should prefix-cache all non-final prompt blocks "
+            f"({BLOCK_SIZE * 5} tokens), got {cached_2}; cold run got {cached_1}"
         )
         snap_2 = _kv_cache_block_hashes(llm, LAYER_IDX)
         s2 = set(snap_2)
