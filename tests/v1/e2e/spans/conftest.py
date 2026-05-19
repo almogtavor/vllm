@@ -122,7 +122,7 @@ def build_llm(
         model=model,
         tensor_parallel_size=1,
         kv_transfer_config=None,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.2,
         enforce_eager=True,
         block_size=BLOCK_SIZE,
         enable_prefix_caching=enable_prefix_caching,

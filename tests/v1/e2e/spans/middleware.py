@@ -110,9 +110,6 @@ def calculate_usage_info(
         full_text: Generated text
         ttft_seconds: Time to first token
         tokenizer: Tokenizer instance
-
-    Returns:
-        Dictionary with usage information
     """
     output_tokens = tokenizer(full_text, add_special_tokens=False)["input_ids"]
     return {

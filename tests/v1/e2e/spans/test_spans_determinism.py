@@ -1,21 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cross-mode output equivalence for spans / Legolink.
-
-Migrated from examples/offline_inference/spans/basic_spans_determinism.py:
-the example's diagnostics (top-K logprob equivalence, multi-seed drift,
-gap-policy replay) become the assertions of these tests.
-
-The contract:
-  * On a prompt with no PIC chunk, FR == SPANS == LL-16 == LL-FULL
-    (text + top-K logprobs bit-identical at temp=0).
-  * On a prompt whose first 16 tokens are a PIC chunk and no preload
-    (cache empty), the four modes still agree because no cache hit means
-    the gap policy never fires.
-  * LL-FULL with prefix-caching ON, run twice: run #2 hits the cache,
-    gap policy with gap_length >> prompt forces a full recompute, output
-    must equal a clean FR reference.
-"""
 import pytest
 
 from vllm import SamplingParams

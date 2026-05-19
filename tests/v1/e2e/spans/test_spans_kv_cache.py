@@ -187,6 +187,7 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
         marked_hashes: list[BlockHash] = _request_block_hashes(
             prompt,
             span_starts=[BLOCK_SIZE * 2],
+            cross_span_starts=[BLOCK_SIZE * 3],
         )
         warmup_chunk_hash: BlockHash = _request_block_hashes(
             span_chunk_at_block_2,
@@ -213,7 +214,10 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
             seed=SEED,
             temperature=0.0,
             max_tokens=MAX_TOKENS,
-            extra_args={"span_starts": [BLOCK_SIZE * 2]},
+            extra_args={
+                "span_starts": [BLOCK_SIZE * 2],
+                "cross_span_starts": [BLOCK_SIZE * 3],
+            },
         )
         cached_marked = _generate_num_cached_tokens(llm, prompt, sp_marked)
         assert cached_marked == BLOCK_SIZE * 3
@@ -225,9 +229,7 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
             temperature=0.0,
             max_tokens=MAX_TOKENS,
         )
-        llm.generate(
-            {"prompt_token_ids": prompt}, sampling_params=sp_baseline, use_tqdm=False
-        )
+        cached_baseline = _generate_num_cached_tokens(llm, prompt, sp_baseline)
         kv_hashes_after_baseline_req_a = set(_kv_cache_block_hashes(llm, LAYER_IDX))
 
         # <= shows every item in warmup_kv_blocks is also present in
@@ -238,14 +240,13 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
         assert warmup_kv_blocks <= kv_hashes_after_marked, (
             "warmup slot was evicted by the marked run"
         )
-        # Baseline must have added at least one new slot - it can't have
-        # used the warmup slot because its chain-hashed block 2 differs
-        # from the warmup's NONE_HASH-rooted block 2.
-        new_kv_after_baseline = kv_hashes_after_baseline_req_a - kv_hashes_after_marked
-        assert len(new_kv_after_baseline) >= 1, (
-            "baseline run added no new slots - it shouldn't have been "
-            "able to reuse the warmup slot (different hash chain), but "
-            "the snapshots match. Something else cached the prompt."
+        # Baseline hits only the 2 prefix blocks: its chain-hashed block 2
+        # differs from the warmup's NONE_HASH-rooted block 2, so the PIC
+        # chunk slot is unreachable. marked hit 3 blocks; the missing block
+        # is exactly the PIC chunk.
+        assert cached_baseline == BLOCK_SIZE * 2, (
+            f"baseline should hit only the 2 prefix blocks, not the PIC "
+            f"chunk; got {cached_baseline}"
         )
     finally:
         cleanup(llm)
@@ -267,13 +268,6 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
         ground truth.
       * shared - the single block both copies share after the LL-16 gap
         recompute.
-
-    Because the two occurrences sit behind different prefixes their correct
-    K/V differ (phase 2 asserts this - the explicit "is it byte-safe to
-    share one block" verdict). One physical block cannot hold both, so
-    phase 4 pins per-occurrence correctness and FAILS by design against the
-    current implementation: it is a regression gate for the repeated-span
-    clobber bug.
 
     Comparisons use torch.allclose, not byte hashes: the reference prefill
     and the gap recompute take different batch shapes and may differ by
@@ -372,7 +366,6 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     # proved they differ. The two gap recomputes race on the same physical
     # slots, so `shared` may match copy 1, copy 2, or neither; "matches
     # both" is the only correct outcome and the only one this accepts.
-    # Fails by design until the repeated-span clobber is fixed.
     match1 = torch.allclose(shared, correct_copy1, atol=2e-2, rtol=2e-2)
     match2 = torch.allclose(shared, correct_copy2, atol=2e-2, rtol=2e-2)
     assert match1 and match2, (
