@@ -112,9 +112,9 @@ def test_legolink_gap_huge_equals_full_recompute(model, monkeypatch):
     candidate-set equality allows harmless logprob and lower-rank drift.
 
     This test does NOT use a chunk warmup, because warmup would only
-    matter for cross-request PIC fan-in (which is covered by tests 1/3).
-    Here we're just asserting that all "no-real-PIC-fan-in" code paths
-    produce identical numerical output.
+    matter for cross-request PIC chunk re-use (covered by tests 1/3).
+    Here we're just asserting that all code paths with no real
+    cross-request chunk re-use produce identical numerical output.
     """
     prompt_tokens = list(range(0, BLOCK_SIZE * 4))
 

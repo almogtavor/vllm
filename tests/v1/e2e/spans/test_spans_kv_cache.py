@@ -4,14 +4,15 @@
 
 End-to-end tests that hash the worker's KV cache per block (mirroring
 examples/offline_inference/spans/spans_time_and_kv.py) and use set-
-relations between snapshots to pin PIC fan-in, span-boundary hash chain
-reset, cross-prefix chunk reuse, prefix-cache-survives-PIC behavior, and
-the Legolink gap-policy interval bound.
+relations between snapshots to pin shared-chunk cache hits, span-boundary
+hash chain reset, cross-prefix chunk reuse, prefix-cache-survives-PIC
+behavior, and the Legolink gap-policy interval bound.
 """
 
 import hashlib
 
 import pytest
+import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
@@ -30,19 +31,21 @@ LAYER_IDX = 0  # Layer to snapshot. 0 always exists; some example models lack 19
 LAYER_IDX_KV = 1  # Layer for raw K/V comparison; >=1 so K/V is prefix-dependent.
 
 
-def _make_request(
-    prompt_len: int,
-    span_starts: list[int] | None = None,
-) -> Request:
-    extra_args = {"span_starts": span_starts} if span_starts is not None else None
-    sp = SamplingParams(max_tokens=MAX_TOKENS, extra_args=extra_args)
-    sp.update_from_generation_config({}, eos_token_id=100)
-    return Request(
-        request_id="kv_test",
-        prompt_token_ids=list(range(prompt_len)),
-        sampling_params=sp,
-        pooling_params=None,
+def _greedy_sp(extra_args: dict | None = None) -> SamplingParams:
+    """Deterministic greedy SamplingParams shared by the e2e runs."""
+    return SamplingParams.from_optional(
+        seed=SEED,
+        temperature=0.0,
+        max_tokens=MAX_TOKENS,
+        extra_args=extra_args,
     )
+
+
+def _rpc_first(llm, fn):
+    """Run `fn` on the workers via collective_rpc; return rank 0's result."""
+    results = llm.llm_engine.engine_core.collective_rpc(fn)
+    assert results, "collective_rpc returned no worker results"
+    return results[0]
 
 
 def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
@@ -65,9 +68,7 @@ def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
             for i in range(num_blocks)
         ]
 
-    results = llm.llm_engine.engine_core.collective_rpc(_grab)
-    assert results, "collective_rpc returned no worker results"
-    return results[0]
+    return _rpc_first(llm, _grab)
 
 
 def _physical_block_tensor(llm, block_id: int, layer_idx: int):
@@ -82,9 +83,7 @@ def _physical_block_tensor(llm, block_id: int, layer_idx: int):
             cpu = cpu.to(torch.float32)
         return cpu
 
-    results = llm.llm_engine.engine_core.collective_rpc(_grab)
-    assert results, "collective_rpc returned no worker results"
-    return results[0]
+    return _rpc_first(llm, _grab)
 
 
 def _block_id_for_hash(llm, block_hash: BlockHash) -> int:
@@ -95,6 +94,16 @@ def _block_id_for_hash(llm, block_hash: BlockHash) -> int:
     cached = block_pool.get_cached_block(block_hash, [0])
     assert cached is not None, f"block hash {block_hash!r} not in prefix cache"
     return cached[0].block_id
+
+
+def _force_in_process_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run EngineCore in-process.
+
+    `_block_id_for_hash` reads the scheduler-side block pool, which lives
+    in the EngineCore process; running in-process makes it reachable, and
+    makes test-computed block_hashes share the engine's NONE_HASH.
+    """
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
 def _warmup_prompt(
@@ -210,25 +219,16 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
 
         # marked: span_starts=[32] -> block 2 hashed with NONE_HASH parent
         # -> matches warmup slot, hits.
-        sp_marked = SamplingParams.from_optional(
-            seed=SEED,
-            temperature=0.0,
-            max_tokens=MAX_TOKENS,
-            extra_args={
-                "span_starts": [BLOCK_SIZE * 2],
-                "cross_span_starts": [BLOCK_SIZE * 3],
-            },
-        )
+        sp_marked = _greedy_sp({
+            "span_starts": [BLOCK_SIZE * 2],
+            "cross_span_starts": [BLOCK_SIZE * 3],
+        })
         cached_marked = _generate_num_cached_tokens(llm, prompt, sp_marked)
         assert cached_marked == BLOCK_SIZE * 3
         kv_hashes_after_marked = set(_kv_cache_block_hashes(llm, LAYER_IDX))
 
         # baseline: no span_starts -> regular hash chain -> warmup slot NOT reachable.
-        sp_baseline = SamplingParams.from_optional(
-            seed=SEED,
-            temperature=0.0,
-            max_tokens=MAX_TOKENS,
-        )
+        sp_baseline = _greedy_sp()
         cached_baseline = _generate_num_cached_tokens(llm, prompt, sp_baseline)
         kv_hashes_after_baseline_req_a = set(_kv_cache_block_hashes(llm, LAYER_IDX))
 
@@ -274,12 +274,7 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     harmless bf16 drift, while the clobber signal is gross (a whole block of
     wrong-prefix K/V).
     """
-    import torch
-
-    # This test reads scheduler-side state (the KV-cache block pool), which
-    # lives in the EngineCore process. Force the engine core in-process so
-    # llm.llm_engine.engine_core.engine_core.scheduler is reachable.
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    _force_in_process_engine(monkeypatch)
 
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))
     prefix = list(range(0, BLOCK_SIZE))
@@ -293,12 +288,7 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
         "span_starts": span_starts,
         "cross_span_starts": cross_span_starts,
     }
-    sp = SamplingParams.from_optional(
-        seed=SEED,
-        temperature=0.0,
-        max_tokens=MAX_TOKENS,
-        extra_args=extra_args,
-    )
+    sp = _greedy_sp(extra_args)
 
     # A single LL-16 engine serves both runs: in-process vLLM does not fully
     # release GPU memory between engines, so the test must not build a second
@@ -361,7 +351,7 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     finally:
         cleanup(llm)
 
-    # Phase 4: per-occurrence correctness. The single fanned-in block must
+    # Phase 4: per-occurrence correctness. The single shared block must
     # hold correct K/V for BOTH occurrences - impossible, since phase 2
     # proved they differ. The two gap recomputes race on the same physical
     # slots, so `shared` may match copy 1, copy 2, or neither; "matches
@@ -375,7 +365,7 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     )
 
 
-def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
+def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
     """Setup (mode SPANS-PC: spans on, prefix caching on, no gap policy):
       - Warm up by running a one-shot request whose only blocks are the
         2-block chunk. That populates the prefix cache with two entries:
@@ -385,91 +375,92 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
       - req_C = prefix_Y + chunk + suffix              (different prefix)
 
     The decisive checks are:
-      1. The warmup chunk slot survives every subsequent request - it
-         must never be evicted or overwritten.
-      2. req_B reports BLOCK_SIZE * 7 cached tokens (engine itself
-         confirms it reused all of A's prompt via PIC fan-in).
+      1. Chunk re-use: req_A's span-marked chunk blocks hash to the same
+         block_hashes as the standalone warmup chunk (so the lookup hits
+         the warmup slots), and those slots still hold byte-identical K/V
+         after all three requests (the cache hit is read-only).
+      2. req_B reports BLOCK_SIZE * 7 cached tokens - ordinary prefix-cache
+         reuse of A's prompt on a byte-identical re-run.
       3. req_C does not evict any slot req_A wrote.
       4. req_C adds >= 5 new slots (2 prefix_Y + 3 fresh tail);
          this is the correctness pin and currently FAILS by design.
     """
+    _force_in_process_engine(monkeypatch)
+
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))  # 2-block PIC chunk
     suffix = list(range(700, 700 + BLOCK_SIZE * 3))
     prefix_x = list(range(0, BLOCK_SIZE * 2))
     prefix_y = list(range(900, 900 + BLOCK_SIZE * 2))
     cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  # bounds cached count
+    prompt_a = prefix_x + chunk + suffix + cold_suffix
+    prompt_c = prefix_y + chunk + suffix + cold_suffix
 
-    sp = SamplingParams.from_optional(
-        seed=SEED,
-        temperature=0.0,
-        max_tokens=MAX_TOKENS,
-        extra_args={"span_starts": [BLOCK_SIZE * 2]},
-    )
+    sp = _greedy_sp({"span_starts": [BLOCK_SIZE * 2]})
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
-        # Step 0: warm up the 2-block chunk alone.
+        # Step 0: warm up the 2-block chunk alone, then capture the raw
+        # K/V of the two physical slots backing it. Capturing by block id
+        # isolates the 2 chunk slots from the warmup's decode-step block.
         _warmup_prompt(llm, chunk)
-        kv_hashes_warmup = _kv_cache_block_hashes(llm, LAYER_IDX)
-        # The unique non-empty hashes from the warmup. In practice this
-        # is 2 slots (the chunk's two blocks) plus optionally a
-        # decode-step slot from the max_tokens=1 generate call.
-        warmup_blocks = set(kv_hashes_warmup)
+        chunk_hashes = _request_block_hashes(chunk, span_starts=None)
+        warmup_chunk_kv = [
+            _physical_block_tensor(llm, _block_id_for_hash(llm, h), LAYER_IDX_KV)
+            for h in chunk_hashes
+        ]
 
-        # req_A: cold-ish cache (chunk pre-warmed). Prefix + suffix fresh.
+        # 1a. Chunk re-use (structural): req_A's span-marked chunk blocks
+        #     (index 2, 3) must carry the same block_hashes as the
+        #     standalone chunk. The prefix cache is keyed by block_hash,
+        #     so this equality is exactly what makes req_A's chunk lookup
+        #     hit the warmup slots.
+        req_a_hashes = _request_block_hashes(prompt_a, span_starts=[BLOCK_SIZE * 2])
+        assert req_a_hashes[2:4] == chunk_hashes, (
+            "req_A's PIC chunk blocks must hash to the standalone warmup "
+            "chunk's block_hashes; without that equality req_A's chunk "
+            "cannot hit the warmup slots"
+        )
+
+        # req_A: prefix_X + suffix fresh, chunk hits the warmup slots.
         llm.generate(
-            {"prompt_token_ids": prefix_x + chunk + suffix + cold_suffix},
-            sampling_params=sp,
-            use_tqdm=False,
+            {"prompt_token_ids": prompt_a}, sampling_params=sp, use_tqdm=False
         )
         kv_hashes_after_a = _kv_cache_block_hashes(llm, LAYER_IDX)
 
-        # req_B: identical to A. Engine should charge all of A's prompt
+        # 2. req_B: identical to A. The engine charges all of A's prompt
         # (prefix_X + chunk + suffix = 7 blocks) as cached; cold_suffix is
         # the 8th block, bounding cached_b at 7 * BLOCK_SIZE.
-        cached_b = _generate_num_cached_tokens(
-            llm, prefix_x + chunk + suffix + cold_suffix, sp
-        )
-        kv_hashes_after_b = _kv_cache_block_hashes(llm, LAYER_IDX)
+        cached_b = _generate_num_cached_tokens(llm, prompt_a, sp)
         assert cached_b == BLOCK_SIZE * 7, (
-            f"req_B should reuse all of A's prompt via prefix cache "
-            f"(chunk included); got cached_b={cached_b}, "
-            f"expected {BLOCK_SIZE * 7}"
+            f"req_B should reuse all of A's prompt via prefix cache; "
+            f"got cached_b={cached_b}, expected {BLOCK_SIZE * 7}"
         )
 
-        # req_C: different prefix, same chunk + tail. Prefix_Y fresh,
-        # chunk still reused via the warmup-populated PIC slot.
+        # req_C: different prefix, same chunk + tail.
         llm.generate(
-            {"prompt_token_ids": prefix_y + chunk + suffix + cold_suffix},
-            sampling_params=sp,
-            use_tqdm=False,
+            {"prompt_token_ids": prompt_c}, sampling_params=sp, use_tqdm=False
         )
         kv_hashes_after_c = _kv_cache_block_hashes(llm, LAYER_IDX)
 
-        # 1. The warmup-populated K/V slot survives every subsequent
-        #    request. PIC fan-in keeps the chunk reused; the warmup
-        #    put it in the cache and the cache must hand it back
-        #    unchanged.
-        assert warmup_blocks <= set(kv_hashes_after_a), (
-            f"warmup slot(s) were evicted/overwritten by req_A. "
-            f"missing: {warmup_blocks - set(kv_hashes_after_a)}"
-        )
-        assert warmup_blocks <= set(kv_hashes_after_b), (
-            f"warmup slot(s) were evicted/overwritten by req_B. "
-            f"missing: {warmup_blocks - set(kv_hashes_after_b)}"
-        )
-        assert warmup_blocks <= set(kv_hashes_after_c), (
-            f"warmup slot(s) were evicted/overwritten by req_C. "
-            f"missing: {warmup_blocks - set(kv_hashes_after_c)}"
-        )
+        # 1b. The chunk-slot hit is read-only: the two warmup chunk slots
+        #     still hold byte-identical K/V after all three requests -
+        #     no request recomputed or clobbered them.
+        for h, ref in zip(chunk_hashes, warmup_chunk_kv):
+            after = _physical_block_tensor(
+                llm, _block_id_for_hash(llm, h), LAYER_IDX_KV
+            )
+            assert torch.equal(after, ref), (
+                "a warmup chunk K/V slot was overwritten across "
+                "req_A/B/C - the chunk-slot hit must be read-only"
+            )
 
-        # 2. req_C must NOT evict or replace any K/V slot A wrote.
+        # 3. req_C must NOT evict or replace any K/V slot A wrote.
         missing_from_c = set(kv_hashes_after_a) - set(kv_hashes_after_c)
         assert not missing_from_c, (
             f"req_C evicted/overwrote {len(missing_from_c)} slot(s) that req_A wrote."
         )
 
-        # 3. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
+        # 4. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
         #
         # Only the chunk's 2 blocks are marked PIC
         # (span_starts=[32], chunk spans [32, 64)).
@@ -494,40 +485,25 @@ def test_pic_chunk_warmup_then_three_requests(model, monkeypatch):
 
 
 def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
-    """Two-part check that the gap-policy interval bound actually
-    constrains which span-region blocks can be recomputed on a cache hit.
+    """On a cache hit, the gap policy may recompute at most gap_length of
+    span-region blocks - no more.
 
     Layout (mode LL-32, gap_length = 2 * BLOCK_SIZE = 2 blocks):
 
         block index:    0       1       2          3          4       5
         token range: [0..15] [16..31] [32..47]   [48..63]   [64..79] [80..95]
         role:        prefix  prefix   span-start span-chain span-chain span-chain
-                                      ^^^^^^^^^^^^^^^^^^^^^^
-                                      gap interval (32, 64)
-                                      - first 2 of the span region
+                                      ^^^^^^^^^^^^^^^^^^^^^^ gap (32, 64)
 
-    Part 1 (structural): instantiate SpanAwareGapPolicy directly with
-    gap_length=32 and verify get_gaps returns [(32, 64)] for this
-    prompt - i.e. exactly the chunk + first downstream block, not the
-    last 2 tail blocks.
-
-    Part 2 (e2e): run the prompt twice through an LL-32 LLM, assert the
-    replay sees the expected prefix-cache hit, snapshot the KV cache
-    between runs, and bound the byte-diff. With deterministic decoding
-    (temp=0, seed=SEED) any gap-recompute produces byte-identical K/V,
-    so the count of *new* byte-hashes is typically 0; the meaningful
-    assertion is the upper bound (the gap policy can't recompute more
-    than its configured 2 blocks).
+    Part 1: SpanAwareGapPolicy.get_gaps returns exactly [(32, 64)].
+    Part 2: run the prompt twice through an LL-32 LLM; the snapshot
+    byte-diff can never exceed the 2-block gap (plus decode slack), and
+    is usually 0 since temp=0 recompute is deterministic.
     """
     prefix = list(range(0, BLOCK_SIZE * 2))
     span_region = list(range(500, 500 + BLOCK_SIZE * 4))
     prompt_tokens = prefix + span_region
-    sp = SamplingParams.from_optional(
-        seed=SEED,
-        temperature=0.0,
-        max_tokens=MAX_TOKENS,
-        extra_args={"span_starts": [BLOCK_SIZE * 2]},
-    )
+    sp = _greedy_sp({"span_starts": [BLOCK_SIZE * 2]})
 
     # Part 1: pin gap-policy math.
     policy = SpanAwareGapPolicy(gap_length=2 * BLOCK_SIZE, block_size=BLOCK_SIZE)
@@ -555,7 +531,7 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
     )
 
     # Part 2: e2e byte-diff bound. Pre-warm the chunk so the span block
-    # is reachable via PIC fan-in before either main run.
+    # is reachable as a cache hit before either main run.
     chunk_tokens = prompt_tokens[BLOCK_SIZE * 2 : BLOCK_SIZE * 3]
     llm = build_llm(model, "LL-32", monkeypatch)
     try:
