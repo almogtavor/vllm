@@ -16,9 +16,9 @@ pytestmark = pytest.mark.spans
 SEED = 42
 MAX_TOKENS = 16
 LOGPROBS_TOPK = 10
-PLAIN_PROMPT = "Hello world! Please write a short greeting in one sentence."
 
-ALL_MODES = ("FR", "SPANS", "LL-16", "LL-FULL")
+MODES = ("FR", "SPANS", "LL-16", "LL-FULL")
+SPAN_STARTS_VARIANTS = (None, [0])
 
 
 def _greedy_params(extra_args: dict | None = None) -> SamplingParams:
@@ -31,12 +31,6 @@ def _greedy_params(extra_args: dict | None = None) -> SamplingParams:
     )
 
 
-def _run(llm, prompt: str, extra_args: dict | None = None):
-    res = llm.generate(prompt, sampling_params=_greedy_params(extra_args), use_tqdm=False)
-    out = res[0].outputs[0]
-    return out.text, extract_step0_topk(out, LOGPROBS_TOPK)
-
-
 def _run_tokens(llm, prompt_token_ids: list[int], extra_args: dict | None = None):
     res = llm.generate(
         {"prompt_token_ids": prompt_token_ids},
@@ -47,163 +41,77 @@ def _run_tokens(llm, prompt_token_ids: list[int], extra_args: dict | None = None
     return out.text, extract_step0_topk(out, LOGPROBS_TOPK), res[0].num_cached_tokens
 
 
-def _reference_results(model: str, prompt: str, monkeypatch, extra_args=None):
-    """Run the prompt under each mode and return {mode: (text, top10)}.
+def test_all_configs_match_full_recompute(model, monkeypatch):
+    """Every (mode x span_starts) configuration produces next-token output
+    bit-identical to plain full-recompute (FR).
 
-    Each mode gets its own fresh LLM (modes change global env + LLM kwargs)."""
-    out: dict[str, tuple[str, list]] = {}
-    for mode in ALL_MODES:
-        llm = build_llm(model, mode, monkeypatch)
-        try:
-            out[mode] = _run(llm, prompt, extra_args)
-        finally:
-            cleanup(llm)
-    return out
+    Matrix: modes {FR, SPANS, LL-16, LL-FULL} x span_starts {none, [0]}, on a
+    tokenized 4-block prompt. One engine is built per mode (span_starts is a
+    per-request parameter, not an engine one); each (mode, span_starts) runs
+    twice - a cold run and a replay. For the LL modes the replay is a
+    prefix-cache hit, so the gap policy actually fires (LL-FULL re-prefills
+    the whole prompt, LL-16 the first block); the `cached` check pins that
+    the hit happened. FR/SPANS have prefix caching off, so cache nothing.
 
-
-def test_no_pic_all_modes_match(model, monkeypatch):
-    """Plain prompt, no PIC: FR == SPANS == LL-16 == LL-FULL."""
-    results = _reference_results(model, PLAIN_PROMPT, monkeypatch, extra_args=None)
-    fr_text, fr_top = results["FR"]
-    for mode in ALL_MODES:
-        text, top = results[mode]
-        assert text == fr_text, f"{mode} text drifted vs FR"
-        assert top == fr_top, f"{mode} top-{LOGPROBS_TOPK} logprobs drifted vs FR"
-
-
-def test_pic_at_start_all_modes_match(model, monkeypatch):
-    """PIC chunk at position 0 (<= 16 tokens), no preload → no cache hit, so
-    even Legolink modes match FR.
-    """
-    extra_args = {"span_starts": [0]}
-    results = _reference_results(model, PLAIN_PROMPT, monkeypatch, extra_args=extra_args)
-    fr_text, fr_top = results["FR"]
-    for mode in ALL_MODES:
-        text, top = results[mode]
-        assert text == fr_text, f"{mode} text drifted vs FR with PIC at start"
-        assert top == fr_top, f"{mode} top-{LOGPROBS_TOPK} drifted vs FR with PIC at start"
-
-
-def test_legolink_gap_huge_equals_full_recompute(model, monkeypatch):
-    """Verify that 5 ostensibly-equivalent configurations all produce the
-    same next-token text, top-1, and top-K candidate set on the same prompt.
-
-    Modes compared (all on a 4-block, 64-token prompt with no padding):
-
-      1. FR              regular vLLM, no spans, no gap policy.
-      2. SPANS + no_sp   VLLM_V1_SPANS_ENABLED=True but no span_starts on
-                         the request - the PIC code path never fires.
-      3. SPANS + sp[0]   VLLM_V1_SPANS_ENABLED=True with span_starts=[0]
-                         (entire prompt is one span). The PIC reset at
-                         block 0 is a no-op (block 0's parent was already
-                         None), so the hash chain is unchanged.
-      4. LL-FULL+no_sp   gap_policy=span_aware, gap_length=huge, prefix
-                         caching ON, but no span_starts -> gap policy
-                         early-returns []; cold + replay both produce
-                         FR-equivalent K/V.
-      5. LL-FULL+sp[0]   same as 4 but with span_starts=[0]. Cold prefill
-                         is FR-equivalent (PIC at 0 is a no-op). On
-                         replay the gap policy fires gap=(0, num_computed),
-                         re-prefills the entire prompt against the actual
-                         prefix; output must still match FR.
-
-    None of these configurations should actually change the selected token
-    or candidate set. Top-1 token equality pins the chosen token; top-K
-    candidate-set equality allows harmless logprob and lower-rank drift.
-
-    This test does NOT use a chunk warmup, because warmup would only
-    matter for cross-request PIC chunk re-use (covered by tests 1/3).
-    Here we're just asserting that all code paths with no real
-    cross-request chunk re-use produce identical numerical output.
+    None here should change the outputs. Comparison is exact (no drift tolerance):
+    generated text, and the full top-K (token order and logprob floats).
     """
     prompt_tokens = list(range(0, BLOCK_SIZE * 4))
 
-    # Mode 1: FR baseline.
-    fr_llm = build_llm(model, "FR", monkeypatch)
-    try:
-        ref_text, ref_top, _ = _run_tokens(fr_llm, prompt_tokens)
-    finally:
-        cleanup(fr_llm)
-        fr_llm = None
-
-    results: dict[str, tuple[str, list]] = {"FR": (ref_text, ref_top)}
-
-    # Mode 2: SPANS, no span_starts.
-    spans_llm = build_llm(model, "SPANS", monkeypatch)
-    try:
-        text, top, _ = _run_tokens(spans_llm, prompt_tokens)
-        results["SPANS+no_sp"] = (text, top)
-    finally:
-        cleanup(spans_llm)
-        spans_llm = None
-
-    # Mode 3: SPANS, span_starts=[0] (entire prompt is one span).
-    spans_llm = build_llm(model, "SPANS", monkeypatch)
-    try:
-        text, top, _ = _run_tokens(spans_llm, prompt_tokens, {"span_starts": [0]})
-        results["SPANS+sp[0]"] = (text, top)
-    finally:
-        cleanup(spans_llm)
-        spans_llm = None
-
-    # Mode 4: LL-FULL, no span_starts. Cold then replay (gap won't fire
-    # either way, but we run twice to mirror modes 5 + the cache state).
-    ll_llm = build_llm(model, "LL-FULL", monkeypatch)
-    try:
-        _run_tokens(ll_llm, prompt_tokens)  # cold
-        text, top, cached = _run_tokens(ll_llm, prompt_tokens)  # replay
-        assert cached == BLOCK_SIZE * 3, (
-            f"LL-FULL+no_sp replay should cache all non-final prompt blocks "
-            f"({BLOCK_SIZE * 3} tokens), got {cached}"
-        )
-        results["LL-FULL+no_sp"] = (text, top)
-    finally:
-        cleanup(ll_llm)
-        ll_llm = None
-
-    # Mode 5: LL-FULL, span_starts=[0]. Cold + replay; on replay the gap
-    # policy fires gap=(0, num_computed) and re-prefills the entire
-    # prompt against the current prefix.
-    ll_llm = build_llm(model, "LL-FULL", monkeypatch)
-    try:
-        _run_tokens(ll_llm, prompt_tokens, {"span_starts": [0]})  # cold
-        text, top, cached = _run_tokens(
-            ll_llm, prompt_tokens, {"span_starts": [0]}
-        )  # replay
-        assert cached == BLOCK_SIZE * 3, (
-            f"LL-FULL+sp[0] replay should cache all non-final prompt blocks "
-            f"({BLOCK_SIZE * 3} tokens), got {cached}"
-        )
-        results["LL-FULL+sp[0]"] = (text, top)
-    finally:
-        cleanup(ll_llm)
-        ll_llm = None
-
-    # All modes must produce bit-identical text + top-K to FR.
+    ref_text: str | None = None
+    ref_top: list | None = None
     drifts: list[str] = []
-    for mode, (text, top) in results.items():
-        if mode == "FR":
-            continue
-        if text != ref_text:
-            drifts.append(
-                f"{mode} text drift:\n  ref:    {ref_text!r}\n  got:    {text!r}"
-            )
-        if top[0][0] != ref_top[0][0]:
-            drifts.append(
-                f"{mode} top-1 token drift:\n"
-                f"  ref: {ref_top[0]}\n"
-                f"  got: {top[0]}"
-            )
-        ref_ids = [tid for tid, _ in ref_top]
-        got_ids = [tid for tid, _ in top]
-        if set(got_ids) != set(ref_ids):
-            drifts.append(
-                f"{mode} top-{LOGPROBS_TOPK} candidate-set drift:\n"
-                f"  ref ids: {ref_ids}\n"
-                f"  got ids: {got_ids}"
-            )
 
-    assert not drifts, "Mode equivalence failed:\n\n" + "\n\n".join(drifts)
+    for mode in MODES:
+        # One engine per mode: the 4 modes are distinct LLM() configs
+        # (gap_policy, enable_prefix_caching - both construction-time).
+        # span_starts, by contrast, is a per-request parameter, so both
+        # variants run on the same engine.
+        llm = build_llm(model, mode, monkeypatch)
+        try:
+            for span_starts in SPAN_STARTS_VARIANTS:
+                extra = (
+                    {"span_starts": span_starts}
+                    if span_starts is not None else None
+                )
+                cold = _run_tokens(llm, prompt_tokens, extra)
+                replay = _run_tokens(llm, prompt_tokens, extra)
+
+                if ref_text is None:
+                    ref_text, ref_top, _ = cold
+
+                label = (
+                    f"{mode}+{'sp[0]' if span_starts is not None else 'no_sp'}"
+                )
+
+                # LL modes have prefix caching on: the replay must hit 3 of
+                # the 4 blocks (the last is held back), which is what makes
+                # the gap policy actually fire. FR/SPANS have caching off.
+                replay_cached = replay[2]
+                expected_cached = BLOCK_SIZE * 3 if mode.startswith("LL") else 0
+                if replay_cached != expected_cached:
+                    drifts.append(
+                        f"{label}: replay cached={replay_cached}, "
+                        f"expected {expected_cached}"
+                    )
+
+                for run_label, (text, top, _) in (
+                    ("cold", cold), ("replay", replay),
+                ):
+                    if text != ref_text:
+                        drifts.append(
+                            f"{label} {run_label}: text drift\n"
+                            f"  ref: {ref_text!r}\n  got: {text!r}"
+                        )
+                    if top != ref_top:
+                        drifts.append(
+                            f"{label} {run_label}: top-{LOGPROBS_TOPK} drift\n"
+                            f"  ref: {ref_top}\n  got: {top}"
+                        )
+        finally:
+            cleanup(llm)
+
+    assert not drifts, "mode equivalence failed:\n\n" + "\n\n".join(drifts)
 
 
 def test_block_size_constant_matches_conftest():

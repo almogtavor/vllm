@@ -123,6 +123,10 @@ def build_llm(
         tensor_parallel_size=1,
         kv_transfer_config=None,
         gpu_memory_utilization=0.3,
+        # Spans tests use <=~200-token prompts. Capping max_model_len keeps
+        # the KV-cache pool small enough to fit without the engine needing
+        # to be sized for the model's full (e.g. 128K) context window.
+        max_model_len=2048,
         enforce_eager=True,
         block_size=BLOCK_SIZE,
         enable_prefix_caching=enable_prefix_caching,

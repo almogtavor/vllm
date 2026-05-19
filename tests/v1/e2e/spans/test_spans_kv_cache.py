@@ -21,22 +21,26 @@ from vllm.v1.core.kv_cache_utils import BlockHash, get_request_block_hasher
 from vllm.v1.core.sched.gap_policy import SpanAwareGapPolicy
 from vllm.v1.request import Request
 
-from .conftest import BLOCK_SIZE, build_llm, cleanup
+from .conftest import BLOCK_SIZE, build_llm, cleanup, extract_step0_topk
 
 pytestmark = pytest.mark.spans
 
 SEED = 42
 MAX_TOKENS = 16
+LOGPROBS_TOPK = 10
 LAYER_IDX = 0  # Layer to snapshot. 0 always exists; some example models lack 19.
 LAYER_IDX_KV = 1  # Layer for raw K/V comparison; >=1 so K/V is prefix-dependent.
 
 
-def _greedy_sp(extra_args: dict | None = None) -> SamplingParams:
+def _greedy_sp(
+    extra_args: dict | None = None, logprobs: int | None = None
+) -> SamplingParams:
     """Deterministic greedy SamplingParams shared by the e2e runs."""
     return SamplingParams.from_optional(
         seed=SEED,
         temperature=0.0,
         max_tokens=MAX_TOKENS,
+        logprobs=logprobs,
         extra_args=extra_args,
     )
 
@@ -219,10 +223,12 @@ def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
 
         # marked: span_starts=[32] -> block 2 hashed with NONE_HASH parent
         # -> matches warmup slot, hits.
-        sp_marked = _greedy_sp({
-            "span_starts": [BLOCK_SIZE * 2],
-            "cross_span_starts": [BLOCK_SIZE * 3],
-        })
+        sp_marked = _greedy_sp(
+            {
+                "span_starts": [BLOCK_SIZE * 2],
+                "cross_span_starts": [BLOCK_SIZE * 3],
+            }
+        )
         cached_marked = _generate_num_cached_tokens(llm, prompt, sp_marked)
         assert cached_marked == BLOCK_SIZE * 3
         kv_hashes_after_marked = set(_kv_cache_block_hashes(llm, LAYER_IDX))
@@ -278,10 +284,9 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
 
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))
     prefix = list(range(0, BLOCK_SIZE))
-    bridge = list(range(900, 900 + BLOCK_SIZE * 2))
+    mid_text = list(range(900, 900 + BLOCK_SIZE * 2))
     tail = list(range(1200, 1200 + BLOCK_SIZE * 2))
-    cold_suffix = list(range(1500, 1500 + BLOCK_SIZE))
-    prompt = prefix + chunk + bridge + chunk + tail + cold_suffix
+    prompt = prefix + chunk + mid_text + chunk + tail
     span_starts = [BLOCK_SIZE, BLOCK_SIZE * 5]
     cross_span_starts = [BLOCK_SIZE * 3, BLOCK_SIZE * 7]
     extra_args = {
@@ -300,7 +305,7 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     try:
         # Phase 1: per-occurrence ground truth. With no span markers the two
         # chunk copies hash distinctly (copy 1 chains through prefix, copy 2
-        # through prefix+chunk+bridge), so each first block is computed and
+        # through prefix+chunk+separator), so each first block is computed and
         # cached correctly.
         _warmup_prompt(llm, prompt)
         ref_hashes = _request_block_hashes(prompt, span_starts=None)
@@ -338,12 +343,16 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
             "prefix-dependent"
         )
 
+        # Sequential warmup, each request consumed by the next: chunk,
+        # prefix, prefix+chunk+mid. The measured request then reuses
+        # blocks 0-6 and prefills the tail itself.
+        chunk_ea = {"span_starts": [BLOCK_SIZE], "cross_span_starts": [BLOCK_SIZE * 3]}
         _warmup_prompt(llm, chunk)
-        _warmup_prompt(llm, prompt, extra_args=extra_args)
+        _warmup_prompt(llm, prefix)
+        _warmup_prompt(llm, prompt[: BLOCK_SIZE * 5], extra_args=chunk_ea)
         cached_b = _generate_num_cached_tokens(llm, prompt, sp)
-        assert cached_b == BLOCK_SIZE * 9, (
-            f"req_B should report all non-suffix prompt blocks cached "
-            f"({BLOCK_SIZE * 9} tokens), got {cached_b}"
+        assert cached_b == BLOCK_SIZE * 7, (
+            f"req_B should reuse prefix + both chunks + mid (7 blocks), got {cached_b}"
         )
         shared = _physical_block_tensor(
             llm, _block_id_for_hash(llm, prompt_hashes[1]), LAYER_IDX_KV
@@ -399,10 +408,10 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
-        # Step 0: warm up the 2-block chunk alone, then capture the raw
-        # K/V of the two physical slots backing it. Capturing by block id
-        # isolates the 2 chunk slots from the warmup's decode-step block.
+        # Step 0: sequential warmup - chunk, then prefix_X - so req_A
+        # reuses both. Capture the 2 chunk slots' K/V by block id.
         _warmup_prompt(llm, chunk)
+        _warmup_prompt(llm, prefix_x)
         chunk_hashes = _request_block_hashes(chunk, span_starts=None)
         warmup_chunk_kv = [
             _physical_block_tensor(llm, _block_id_for_hash(llm, h), LAYER_IDX_KV)
@@ -422,9 +431,7 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         )
 
         # req_A: prefix_X + suffix fresh, chunk hits the warmup slots.
-        llm.generate(
-            {"prompt_token_ids": prompt_a}, sampling_params=sp, use_tqdm=False
-        )
+        llm.generate({"prompt_token_ids": prompt_a}, sampling_params=sp, use_tqdm=False)
         kv_hashes_after_a = _kv_cache_block_hashes(llm, LAYER_IDX)
 
         # 2. req_B: identical to A. The engine charges all of A's prompt
@@ -437,9 +444,7 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         )
 
         # req_C: different prefix, same chunk + tail.
-        llm.generate(
-            {"prompt_token_ids": prompt_c}, sampling_params=sp, use_tqdm=False
-        )
+        llm.generate({"prompt_token_ids": prompt_c}, sampling_params=sp, use_tqdm=False)
         kv_hashes_after_c = _kv_cache_block_hashes(llm, LAYER_IDX)
 
         # 1b. The chunk-slot hit is read-only: the two warmup chunk slots
@@ -530,13 +535,13 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
         f"Expected gap (32, 64) from gap_length=2 blocks + span at 32, got {gaps}"
     )
 
-    # Part 2: e2e byte-diff bound. Pre-warm the chunk so the span block
-    # is reachable as a cache hit before either main run.
+    # Part 2: e2e byte-diff bound. Sequential warmup - span chunk, then
+    # prefix - so run #1 reuses both; run #2 replays.
     chunk_tokens = prompt_tokens[BLOCK_SIZE * 2 : BLOCK_SIZE * 3]
     llm = build_llm(model, "LL-32", monkeypatch)
     try:
         _warmup_prompt(llm, chunk_tokens)
-
+        _warmup_prompt(llm, prefix)
         cached_1 = _generate_num_cached_tokens(llm, prompt_tokens, sp)
         snap_1 = _kv_cache_block_hashes(llm, LAYER_IDX)
         s1 = set(snap_1)
@@ -562,6 +567,121 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
         )
         assert len(gone_from_1) <= 4, (
             f"|gone_from_1|={len(gone_from_1)} (expected <= 4)"
+        )
+    finally:
+        cleanup(llm)
+
+
+def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatch):
+    """LL gap recompute runs before the cross-tail prefill and the decode.
+
+    The 2-block PIC span is pre-warmed standalone (stale, context-free K/V).
+    The marked LL-32 run hits prefix+span, gap-recomputes the span against the
+    real prefix, then prefills the cross-tail and decodes. The cross-tail K/V
+    and decoded top-K match a no-marker FR reference only if they consumed the
+    recomputed span - proving the ordering by data dependency.
+    """
+    _force_in_process_engine(monkeypatch)
+
+    prefix = list(range(0, BLOCK_SIZE * 2))
+    span = list(range(500, 500 + BLOCK_SIZE * 2))
+    cross_tail = list(range(900, 900 + BLOCK_SIZE * 2))
+    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  
+    prompt = prefix + span + cross_tail + cold_suffix
+    span_starts = [BLOCK_SIZE * 2]
+    cross_span_starts = [BLOCK_SIZE * 4]
+
+    def _block_kv(block_hash: BlockHash):
+        return _physical_block_tensor(
+            llm, _block_id_for_hash(llm, block_hash), LAYER_IDX_KV
+        )
+
+    llm = build_llm(model, "LL-32", monkeypatch)
+    try:
+        # Phase 1: no markers -> gap policy no-op -> FR-equivalent reference.
+        ref_hashes = _request_block_hashes(prompt, span_starts=None)
+        ref_out = llm.generate(
+            {"prompt_token_ids": prompt},
+            sampling_params=_greedy_sp(logprobs=LOGPROBS_TOPK),
+            use_tqdm=False,
+        )
+        ref_top = extract_step0_topk(ref_out[0].outputs[0], LOGPROBS_TOPK)
+        ref_span_kv = [_block_kv(h) for h in ref_hashes[2:4]]
+        ref_cross_tail_kv = [_block_kv(h) for h in ref_hashes[4:6]]
+
+        # Phase 2: warm the span standalone, then the prefix - so Phase 3's
+        # marked request hits prefix+span and the span warmup is consumed.
+        # (The span K/V is context-free/stale, cached at the NONE_HASH-rooted
+        # hash the PIC-marked span block also hits.)
+        standalone_span_hashes = _request_block_hashes(span, span_starts=None)
+        _warmup_prompt(llm, span)
+        _warmup_prompt(llm, prefix)
+        stale_span_kv = [_block_kv(h) for h in standalone_span_hashes]
+
+        # Premise: the span K/V the marked request will hit is genuinely stale -
+        # it differs from the context-aware reference, so the gap recompute has
+        # real work and the assertions below are not vacuous.
+        assert not any(
+            torch.allclose(s, r, atol=2e-2, rtol=2e-2)
+            for s, r in zip(stale_span_kv, ref_span_kv)
+        ), (
+            "warmed span K/V already matches the context-aware span; the gap "
+            "recompute would be a no-op and this test's premise is moot"
+        )
+
+        # Phase 3: the LL marked request. Hits prefix+span; the gap recomputes
+        # the span; cross-tail prefills fresh; decode runs.
+        marked_hashes = _request_block_hashes(
+            prompt, span_starts=span_starts, cross_span_starts=cross_span_starts
+        )
+        marked_out = llm.generate(
+            {"prompt_token_ids": prompt},
+            sampling_params=_greedy_sp(
+                extra_args={
+                    "span_starts": span_starts,
+                    "cross_span_starts": cross_span_starts,
+                },
+                logprobs=LOGPROBS_TOPK,
+            ),
+            use_tqdm=False,
+        )
+        cached_marked = marked_out[0].num_cached_tokens
+        actual_top = extract_step0_topk(marked_out[0].outputs[0], LOGPROBS_TOPK)
+        actual_span_kv = [_block_kv(h) for h in marked_hashes[2:4]]
+        actual_cross_tail_kv = [_block_kv(h) for h in marked_hashes[4:6]]
+
+        # The marked request hit prefix + span (4 blocks): confirms there was a
+        # cached (stale) span entry for the gap to recompute.
+        assert cached_marked == BLOCK_SIZE * 4, (
+            f"marked request should hit prefix + span (4 blocks); "
+            f"got cached={cached_marked}"
+        )
+
+        # The gap recompute produced context-aware span K/V.
+        for a, r in zip(actual_span_kv, ref_span_kv):
+            assert torch.allclose(a, r, atol=2e-2, rtol=2e-2), (
+                "gap recompute did not restore the context-aware span K/V"
+            )
+
+        # (a) post-cross prefill happened AFTER the recompute: the cross-tail
+        # K/V attends over the span, so it matches the context-aware reference
+        # only if the cross-tail prefill observed the recomputed span. If it
+        # had run before the recompute it would reflect the stale span.
+        for a, r in zip(actual_cross_tail_kv, ref_cross_tail_kv):
+            assert torch.allclose(a, r, atol=2e-2, rtol=2e-2), (
+                "cross-tail K/V differs from the context-aware reference - the "
+                "post-cross prefill read the stale span K/V, i.e. it ran "
+                "before the gap recompute"
+            )
+
+        # (b) decode happened AFTER the recompute: the first-token top-K
+        # matches the reference only if decode observed the recomputed K/V.
+        assert actual_top[0][0] == ref_top[0][0], (
+            f"decoded top-1 token drift: ref={ref_top[0]}, got={actual_top[0]}"
+        )
+        assert {t for t, _ in actual_top} == {t for t, _ in ref_top}, (
+            "decoded top-K candidate set drifted from the reference - decode "
+            "read stale (pre-recompute) K/V"
         )
     finally:
         cleanup(llm)
