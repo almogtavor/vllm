@@ -75,7 +75,7 @@ def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
     return _rpc_first(llm, _grab)
 
 
-def _physical_block_tensor(llm, block_id: int, layer_idx: int):
+def _physical_block_tensor(llm, block_id: int, layer_idx: int = LAYER_IDX_KV):
     """Raw K/V tensor of one physical KV-cache block, on CPU as float32."""
 
     def _grab(worker_self):
@@ -263,16 +263,17 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
 
     The same 2-block chunk appears twice, at different positions and behind
     different prefixes. With span_starts the two copies share one
-    block_hash, hence one physical KV block. LL-16's gap policy recomputes
-    the first block of each copy, but both virtual gap requests share the
-    parent block table and write that single physical block in place.
+    block_hash, hence one physical KV block. LL-32's gap policy recomputes
+    both blocks of each copy (gap_length = 2 blocks = the chunk exactly),
+    but both virtual gap requests share the parent block table and write
+    those two physical blocks in place.
 
     The test reads the actual physical K/V bytes:
       * correct_copy1 / correct_copy2 - each occurrence's first block under a
         plain prefix-cached run with no span markers, where the two copies
         hash distinctly and are each computed correctly: the per-occurrence
         ground truth.
-      * shared - the single block both copies share after the LL-16 gap
+      * shared - the single block both copies share after the LL-32 gap
         recompute.
 
     Comparisons use torch.allclose, not byte hashes: the reference prefill
@@ -295,13 +296,13 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     }
     sp = _greedy_sp(extra_args)
 
-    # A single LL-16 engine serves both runs: in-process vLLM does not fully
+    # A single LL-32 engine serves both runs: in-process vLLM does not fully
     # release GPU memory between engines, so the test must not build a second
-    # one. An LL-16 engine handling a request with no span_starts makes the
+    # one. An LL-32 engine handling a request with no span_starts makes the
     # gap policy a no-op, so the no-span run below is a plain prefix-cached,
     # FR-equivalent reference. All block hashes are computed against this
     # engine, so they share its NONE_HASH (re-randomized per engine).
-    llm = build_llm(model, "LL-16", monkeypatch)
+    llm = build_llm(model, "LL-32", monkeypatch)
     try:
         # Phase 1: per-occurrence ground truth. With no span markers the two
         # chunk copies hash distinctly (copy 1 chains through prefix, copy 2
@@ -313,23 +314,15 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
             "without span markers the two chunk copies must hash to distinct blocks"
         )
         correct_copy1 = _physical_block_tensor(
-            llm, _block_id_for_hash(llm, ref_hashes[1]), LAYER_IDX_KV
+            llm, _block_id_for_hash(llm, ref_hashes[1])
         )
         correct_copy2 = _physical_block_tensor(
-            llm, _block_id_for_hash(llm, ref_hashes[5]), LAYER_IDX_KV
+            llm, _block_id_for_hash(llm, ref_hashes[5])
         )
 
-        # Phase 2: sharing verdict. Different prefixes -> different attention
-        # context -> the two occurrences genuinely need different K/V, so one
-        # shared physical block cannot serve both.
-        assert not torch.allclose(correct_copy1, correct_copy2, atol=2e-2, rtol=2e-2), (
-            "the two chunk occurrences produced byte-equal K/V; sharing one "
-            "physical block would then be safe and this test's premise is moot"
-        )
-
-        # Phase 3: spans run on the same engine. The two copies share one
-        # physical block; LL-16 recomputes the first block of each, both
-        # writing that one block in place.
+        # Phase 2: spans run on the same engine. The two copies share two
+        # physical blocks (chunk[0], chunk[1]); LL-32 recomputes both
+        # blocks of each copy in place.
         chunk_hashes = _request_block_hashes(chunk, span_starts=None)
         prompt_hashes = _request_block_hashes(
             prompt,
@@ -354,17 +347,16 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
         assert cached_b == BLOCK_SIZE * 7, (
             f"req_B should reuse prefix + both chunks + mid (7 blocks), got {cached_b}"
         )
-        shared = _physical_block_tensor(
-            llm, _block_id_for_hash(llm, prompt_hashes[1]), LAYER_IDX_KV
-        )
+        shared = _physical_block_tensor(llm, _block_id_for_hash(llm, prompt_hashes[1]))
     finally:
         cleanup(llm)
 
-    # Phase 4: per-occurrence correctness. The single shared block must
-    # hold correct K/V for BOTH occurrences - impossible, since phase 2
-    # proved they differ. The two gap recomputes race on the same physical
-    # slots, so `shared` may match copy 1, copy 2, or neither; "matches
-    # both" is the only correct outcome and the only one this accepts.
+    # Phase 3: per-occurrence correctness. The single shared block must
+    # hold correct K/V for BOTH occurrences - impossible, since RoPE
+    # position and prefix-dependent attention make their correct K/V
+    # differ. The two gap recomputes race on the same physical slots, so
+    # `shared` may match copy 1, copy 2, or neither; "matches both" is
+    # the only correct outcome and the only one this accepts.
     match1 = torch.allclose(shared, correct_copy1, atol=2e-2, rtol=2e-2)
     match2 = torch.allclose(shared, correct_copy2, atol=2e-2, rtol=2e-2)
     assert match1 and match2, (
@@ -451,9 +443,7 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         #     still hold byte-identical K/V after all three requests -
         #     no request recomputed or clobbered them.
         for h, ref in zip(chunk_hashes, warmup_chunk_kv):
-            after = _physical_block_tensor(
-                llm, _block_id_for_hash(llm, h), LAYER_IDX_KV
-            )
+            after = _physical_block_tensor(llm, _block_id_for_hash(llm, h))
             assert torch.equal(after, ref), (
                 "a warmup chunk K/V slot was overwritten across "
                 "req_A/B/C - the chunk-slot hit must be read-only"
@@ -586,15 +576,13 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
     prefix = list(range(0, BLOCK_SIZE * 2))
     span = list(range(500, 500 + BLOCK_SIZE * 2))
     cross_tail = list(range(900, 900 + BLOCK_SIZE * 2))
-    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  
+    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))
     prompt = prefix + span + cross_tail + cold_suffix
     span_starts = [BLOCK_SIZE * 2]
     cross_span_starts = [BLOCK_SIZE * 4]
 
     def _block_kv(block_hash: BlockHash):
-        return _physical_block_tensor(
-            llm, _block_id_for_hash(llm, block_hash), LAYER_IDX_KV
-        )
+        return _physical_block_tensor(llm, _block_id_for_hash(llm, block_hash))
 
     llm = build_llm(model, "LL-32", monkeypatch)
     try:
