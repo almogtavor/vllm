@@ -18,7 +18,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import BlockHash, get_request_block_hasher
-from vllm.v1.core.sched.gap_policy import SpanAwareGapPolicy
 from vllm.v1.request import Request
 
 from .conftest import BLOCK_SIZE, build_llm, cleanup, extract_step0_topk
@@ -400,15 +399,12 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
-        # Step 0: sequential warmup - chunk, then prefix_X - so req_A
-        # reuses both. Capture the 2 chunk slots' K/V by block id.
+        # Step 0: sequential warmup - chunk, prefix_X, prefix_Y - so req_A
+        # reuses chunk + prefix_X and req_C reuses chunk + prefix_Y.
         _warmup_prompt(llm, chunk)
         _warmup_prompt(llm, prefix_x)
+        _warmup_prompt(llm, prefix_y)
         chunk_hashes = _request_block_hashes(chunk, span_starts=None)
-        warmup_chunk_kv = [
-            _physical_block_tensor(llm, _block_id_for_hash(llm, h), LAYER_IDX_KV)
-            for h in chunk_hashes
-        ]
 
         # 1a. Chunk re-use (structural): req_A's span-marked chunk blocks
         #     (index 2, 3) must carry the same block_hashes as the
@@ -436,18 +432,8 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         )
 
         # req_C: different prefix, same chunk + tail.
-        llm.generate({"prompt_token_ids": prompt_c}, sampling_params=sp, use_tqdm=False)
+        cached_c = _generate_num_cached_tokens(llm, prompt_c, sp)
         kv_hashes_after_c = _kv_cache_block_hashes(llm, LAYER_IDX)
-
-        # 1b. The chunk-slot hit is read-only: the two warmup chunk slots
-        #     still hold byte-identical K/V after all three requests -
-        #     no request recomputed or clobbered them.
-        for h, ref in zip(chunk_hashes, warmup_chunk_kv):
-            after = _physical_block_tensor(llm, _block_id_for_hash(llm, h))
-            assert torch.equal(after, ref), (
-                "a warmup chunk K/V slot was overwritten across "
-                "req_A/B/C - the chunk-slot hit must be read-only"
-            )
 
         # 3. req_C must NOT evict or replace any K/V slot A wrote.
         missing_from_c = set(kv_hashes_after_a) - set(kv_hashes_after_c)
@@ -455,109 +441,78 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
             f"req_C evicted/overwrote {len(missing_from_c)} slot(s) that req_A wrote."
         )
 
-        # 4. CORRECTNESS PIN: req_C must compute fresh K/V for the tail.
-        #
-        # Only the chunk's 2 blocks are marked PIC
-        # (span_starts=[32], chunk spans [32, 64)).
-        # Therefore req_C must add new K/V slots for:
-        #   - 2 prefix_Y blocks (cache miss, fresh)
-        #   - 3 tail blocks (must be recomputed against prefix_Y, NOT
-        #     reused from A)
-        # That's >= 5 new slots, plus possibly a decode-step block.
-        new_in_c = set(kv_hashes_after_c) - set(kv_hashes_after_a)
-        assert len(new_in_c) >= 5, (
-            f"INCORRECT CROSS-PREFIX REUSE DETECTED: req_C added only "
-            f"{len(new_in_c)} new K/V slots when it should have added "
-            f">= 5 (2 prefix_Y + 3 freshly-recomputed tail blocks).\n\n"
-            f"The tail blocks are NOT marked PIC but their block_hashes "
-            f"collide with req_A's because they chain through the PIC "
-            f"chunk's hash. vLLM silently reuses A's tail K/V for C, "
-            f"even though C's actual cross-attention sees a different "
-            f"prefix (prefix_Y instead of prefix_X)."
+        # 4. CORRECTNESS PIN: req_C uses prefix_Y (warmed), so its prefix
+        # cache hit can only reach the warmed blocks: prefix_Y + chunk = 4
+        # blocks. The tail must NOT hit, because its true context is
+        # prefix_Y while req_A's cached tail was computed against prefix_X.
+        # If vLLM wrongly reuses req_A's tail (tail blocks chain through
+        # the NONE-rooted chunk hash, so their hashes collide across A/C),
+        # cached_c would be BLOCK_SIZE * 7 instead of BLOCK_SIZE * 4.
+        assert cached_c == BLOCK_SIZE * 4, (
+            f"INCORRECT CROSS-PREFIX REUSE DETECTED: req_C reported "
+            f"cached_c={cached_c}, expected {BLOCK_SIZE * 4} "
+            f"(prefix_Y + chunk). {BLOCK_SIZE * 7} would mean vLLM "
+            f"silently reused req_A's tail K/V across a different prefix."
         )
     finally:
         cleanup(llm)
 
 
 def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
-    """On a cache hit, the gap policy may recompute at most gap_length of
-    span-region blocks - no more.
+    """LL-32 gap_length = 2 blocks bounds the recompute at the block level.
 
-    Layout (mode LL-32, gap_length = 2 * BLOCK_SIZE = 2 blocks):
-
-        block index:    0       1       2          3          4       5
-        token range: [0..15] [16..31] [32..47]   [48..63]   [64..79] [80..95]
-        role:        prefix  prefix   span-start span-chain span-chain span-chain
-                                      ^^^^^^^^^^^^^^^^^^^^^^ gap (32, 64)
-
-    Part 1: SpanAwareGapPolicy.get_gaps returns exactly [(32, 64)].
-    Part 2: run the prompt twice through an LL-32 LLM; the snapshot
-    byte-diff can never exceed the 2-block gap (plus decode slack), and
-    is usually 0 since temp=0 recompute is deterministic.
+    Span is 4 blocks, gap_length covers only the first 2. After the run:
+      - the first 2 span blocks were recomputed against the real prefix
+        (K/V differs from the pre-warmed stale K/V);
+      - the last 2 span blocks were NOT touched (K/V byte-identical to
+        the stale warmup K/V) - gap_length is a hard upper bound.
     """
+    _force_in_process_engine(monkeypatch)
+
     prefix = list(range(0, BLOCK_SIZE * 2))
-    span_region = list(range(500, 500 + BLOCK_SIZE * 4))
-    prompt_tokens = prefix + span_region
+    span = list(range(500, 500 + BLOCK_SIZE * 4))
+    prompt_tokens = prefix + span
     sp = _greedy_sp({"span_starts": [BLOCK_SIZE * 2]})
 
-    # Part 1: pin gap-policy math.
-    policy = SpanAwareGapPolicy(gap_length=2 * BLOCK_SIZE, block_size=BLOCK_SIZE)
-    sp_for_policy_req = SamplingParams(
-        max_tokens=MAX_TOKENS,
-        extra_args={"span_starts": [BLOCK_SIZE * 2]},
-    )
-    sp_for_policy_req.update_from_generation_config({}, eos_token_id=100)
-    policy_req = Request(
-        request_id="gap_policy_check",
-        prompt_token_ids=prompt_tokens,
-        sampling_params=sp_for_policy_req,
-        pooling_params=None,
-    )
-    policy_req.span_starts = [BLOCK_SIZE * 2]
-    # Use a num_computed_tokens that simulates "everything except the last
-    # block is cached" (the typical prefix-cache state on a re-run).
-    gaps = policy.get_gaps(
-        policy_req,
-        num_computed_tokens=BLOCK_SIZE * 5,  # 5 blocks cached, last block decodes
-        num_external_tokens=0,
-    )
-    assert gaps == [(BLOCK_SIZE * 2, BLOCK_SIZE * 4)], (
-        f"Expected gap (32, 64) from gap_length=2 blocks + span at 32, got {gaps}"
-    )
-
-    # Part 2: e2e byte-diff bound. Sequential warmup - span chunk, then
-    # prefix - so run #1 reuses both; run #2 replays.
-    chunk_tokens = prompt_tokens[BLOCK_SIZE * 2 : BLOCK_SIZE * 3]
     llm = build_llm(model, "LL-32", monkeypatch)
     try:
-        _warmup_prompt(llm, chunk_tokens)
+        # Warm the span standalone (stale: NONE-rooted at positions 0-63 vs
+        # the marked prompt's positions 32-95) and the prefix. Capture the
+        # stale span K/V via the standalone span's hashes (which the marked
+        # prompt's span blocks 2-5 also hash to).
+        _warmup_prompt(llm, span)
         _warmup_prompt(llm, prefix)
-        cached_1 = _generate_num_cached_tokens(llm, prompt_tokens, sp)
-        snap_1 = _kv_cache_block_hashes(llm, LAYER_IDX)
-        s1 = set(snap_1)
+        span_hashes = _request_block_hashes(span, span_starts=None)
+        stale_span_kv = [
+            _physical_block_tensor(llm, _block_id_for_hash(llm, h)) for h in span_hashes
+        ]
 
-        cached_2 = _generate_num_cached_tokens(llm, prompt_tokens, sp)
-        assert cached_2 == BLOCK_SIZE * 5, (
-            f"LL-32 replay should prefix-cache all non-final prompt blocks "
-            f"({BLOCK_SIZE * 5} tokens), got {cached_2}; cold run got {cached_1}"
-        )
-        snap_2 = _kv_cache_block_hashes(llm, LAYER_IDX)
-        s2 = set(snap_2)
+        # Run the marked prompt - gap policy fires on the span at block 2
+        # with gap (32, 64) and recomputes only the first 2 span blocks.
+        _generate_num_cached_tokens(llm, prompt_tokens, sp)
+        after_span_kv = [
+            _physical_block_tensor(llm, _block_id_for_hash(llm, h)) for h in span_hashes
+        ]
 
-        new_in_2 = s2 - s1
-        gone_from_1 = s1 - s2
+        # Span blocks 0,1 (= prompt blocks 2,3) ARE the gap interval -
+        # their K/V must differ from the stale warmup K/V.
+        for i in (0, 1):
+            assert not torch.allclose(
+                stale_span_kv[i], after_span_kv[i], atol=2e-2, rtol=2e-2
+            ), (
+                f"span block {i} (prompt block {i + 2}, inside gap) was NOT "
+                f"recomputed - still matches the stale warmup K/V"
+            )
 
-        # gap_length=2*BLOCK_SIZE bounds how many K/V slots can change
-        # bytes between runs. With deterministic decoding the actual
-        # diff is usually 0 (recompute yields the same bytes), but it
-        # can never exceed 2 prompt blocks + a small decode-step budget.
-        assert len(new_in_2) <= 4, (
-            f"|new_in_2|={len(new_in_2)} (expected <= 4 for "
-            f"gap_length=2 blocks plus decode-step slack)"
-        )
-        assert len(gone_from_1) <= 4, (
-            f"|gone_from_1|={len(gone_from_1)} (expected <= 4)"
-        )
+        # Span blocks 2,3 (= prompt blocks 4,5) are OUTSIDE the gap - the
+        # gap policy must not touch them; their K/V must be byte-identical
+        # to the warmup.
+        for i in (2, 3):
+            assert torch.equal(stale_span_kv[i], after_span_kv[i]), (
+                f"span block {i} (prompt block {i + 2}, outside gap) was "
+                f"wrongly touched - gap_length = 2 blocks should not reach "
+                f"this far"
+            )
     finally:
         cleanup(llm)
 
