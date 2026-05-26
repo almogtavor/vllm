@@ -837,8 +837,6 @@ def kernel_unified_attention_3d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    span_off = 0  # SPANS unused on the decode-only 3d path (prefill uses 2d)
-
     # iterate through tiles (now limited to the sliding window range)
     for j in range(
         max(segm_idx * tiles_per_segment, tile_start),
@@ -942,11 +940,11 @@ def kernel_unified_attention_3d(
                     ),
                 )
                 cos_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    seq_offset[None, :] * stride_cs_cache_0
                     + cos_idx[:, None] * stride_cs_cache_1
                 )
                 sin_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    seq_offset[None, :] * stride_cs_cache_0
                     + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -972,11 +970,11 @@ def kernel_unified_attention_3d(
                 K_rot_b = K_b
             else:
                 cos_cache_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    seq_offset[None, :] * stride_cs_cache_0
                     + offs_d_new[:, None] * stride_cs_cache_1
                 )
                 sin_cache_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    seq_offset[None, :] * stride_cs_cache_0
                     + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(

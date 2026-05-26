@@ -6,7 +6,6 @@ import os
 # SPANS: bit-exact K/V comparison across batch shapes needs batch-invariant
 # matmuls. Must be set before vLLM is imported (read at import).
 os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
-
 import gc
 import hashlib
 

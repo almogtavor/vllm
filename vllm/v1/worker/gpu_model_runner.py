@@ -1762,9 +1762,7 @@ class GPUModelRunner(
             sa.fill(0)
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
-                # Legolink gap-recompute must stay context-aware (attend the real
-                # prefix), so do not make its span prefix-free.
-                if req.is_gap_recompute:
+                if req.is_gap_recompute:  # stays context-aware (attend the real prefix)
                     continue
                 ea = req.sampling_params.extra_args if req.sampling_params else None
                 spans = ea.get("span_starts") if ea else None
