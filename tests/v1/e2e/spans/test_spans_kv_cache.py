@@ -1,179 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""KV-cache and gap-policy assertions for the spans / Legolink machinery.
+"""KV-cache assertions for the PIC "spans" machinery.
 
 End-to-end tests that hash the worker's KV cache per block (mirroring
 examples/offline_inference/spans/spans_time_and_kv.py) and use set-
 relations between snapshots to pin shared-chunk cache hits, span-boundary
-hash chain reset, cross-prefix chunk reuse, prefix-cache-survives-PIC
-behavior, and the Legolink gap-policy interval bound.
+hash chain reset, cross-prefix chunk reuse, and prefix-cache-survives-PIC
+behavior. Shared helpers live in conftest.py; gap-policy / Legolink tests
+live in test_legolink_gap_policy.py.
 """
-
-import hashlib
-import threading
 
 import pytest
 import torch
 
-from vllm.sampling_params import SamplingParams
-from vllm.utils.hashing import get_hash_fn_by_name
-from vllm.v1.core import kv_cache_utils
-from vllm.v1.core.kv_cache_utils import BlockHash, get_request_block_hasher
-from vllm.v1.request import Request
+from vllm.v1.core.kv_cache_utils import BlockHash
 
 from .conftest import (
     BLOCK_SIZE,
-    LOGPROBS_TOPK,
+    LAYER_IDX,
+    _block_kv,
+    _capture_request_block_ids,
+    _force_in_process_engine,
+    _generate_num_cached_tokens,
+    _kv_cache_block_hashes,
+    _physical_block_tensor,
+    _request_block_hashes,
+    _warmup_prompt,
     build_llm,
     cleanup,
-    extract_step0_topk,
     generate_single_output,
     greedy_sp,
 )
 
 pytestmark = pytest.mark.spans
-
-LAYER_IDX = 0  # Layer to snapshot. 0 always exists; some example models lack 19.
-LAYER_IDX_KV = 1  # Layer for raw K/V comparison; >=1 so K/V is prefix-dependent.
-
-
-def _rpc_first(llm, fn):
-    """Run `fn` on the workers via collective_rpc; return rank 0's result."""
-    results = llm.llm_engine.engine_core.collective_rpc(fn)
-    assert results, "collective_rpc returned no worker results"
-    return results[0]
-
-
-def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
-    """Per-block SHA-256 of layer `layer_idx` in the worker's KV cache.
-
-    Mirrors examples/offline_inference/spans/spans_time_and_kv.py:
-    _get_kv_cache_info_from_worker.
-    """
-
-    def _grab(worker_self):
-        import torch
-
-        kv = worker_self.model_runner.kv_caches[layer_idx]
-        cpu = kv.detach().cpu()
-        if cpu.dtype == torch.bfloat16:
-            cpu = cpu.to(torch.float32)
-        num_blocks = cpu.shape[0] if cpu.ndim > 0 else 1
-        return [
-            hashlib.sha256(cpu[i].numpy().tobytes()).hexdigest()
-            for i in range(num_blocks)
-        ]
-
-    return _rpc_first(llm, _grab)
-
-
-def _physical_block_tensor(llm, block_id: int, layer_idx: int = LAYER_IDX_KV):
-    """Raw K/V tensor of one physical KV-cache block, on CPU as float32."""
-
-    def _grab(worker_self):
-        import torch
-
-        kv = worker_self.model_runner.kv_caches[layer_idx][block_id]
-        cpu = kv.detach().cpu()
-        if cpu.dtype == torch.bfloat16:
-            cpu = cpu.to(torch.float32)
-        return cpu
-
-    return _rpc_first(llm, _grab)
-
-
-def _block_id_for_hash(llm, block_hash: BlockHash) -> int:
-    """Physical block id currently backing `block_hash` in the prefix cache."""
-    block_pool = (
-        llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_manager.block_pool
-    )
-    cached = block_pool.get_cached_block(block_hash, [0])
-    assert cached is not None, f"block hash {block_hash!r} not in prefix cache"
-    return cached[0].block_id
-
-
-def _block_kv(llm, block_hash: BlockHash):
-    """Raw K/V tensor of the physical block currently backing `block_hash`."""
-    return _physical_block_tensor(llm, _block_id_for_hash(llm, block_hash))
-
-
-def _capture_request_block_ids(monkeypatch, llm) -> dict[str, list[int]]:
-    """Snapshot each request's per-position physical block ids, keyed by id.
-
-    PIC occurrences collide in the block *hash*, so per-occurrence K/V can
-    only be read by logical position from the request's block table. That
-    table is popped on free, so snapshot it just before the free runs.
-    """
-    kcm = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
-    captured: dict[str, list[int]] = {}
-
-    def _free(request):
-        captured[request.request_id] = kcm.get_block_ids(request.request_id)[0]
-        return type(kcm).free(kcm, request)  # original method off the class
-
-    monkeypatch.setattr(kcm, "free", _free)
-    return captured
-
-
-def _force_in_process_engine(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run EngineCore in-process.
-
-    `_block_id_for_hash` reads the scheduler-side block pool, which lives
-    in the EngineCore process; running in-process makes it reachable, and
-    makes test-computed block_hashes share the engine's NONE_HASH.
-    """
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-
-def _warmup_prompt(
-    llm,
-    prompt_token_ids: list[int],
-    extra_args: dict | None = None,
-) -> None:
-    """Populate prefix cache entries for the given full-block prompt.
-
-    When the prompt is exactly the PIC chunk, this creates the same
-    NONE_HASH-rooted block entry that a later span-start block should hit.
-    """
-    generate_single_output(llm, prompt_token_ids, greedy_sp(extra_args, max_tokens=1))
-
-
-def _generate_num_cached_tokens(
-    llm,
-    prompt_token_ids: list[int],
-    sampling_params: SamplingParams,
-) -> int:
-    out = generate_single_output(llm, prompt_token_ids, sampling_params)
-    num_cached_tokens = out.num_cached_tokens
-    assert num_cached_tokens is not None
-    return num_cached_tokens
-
-
-def _request_block_hashes(
-    prompt_token_ids: list[int],
-    span_starts: list[int] | None,
-    cross_span_starts: list[int] | None = None,
-) -> list[BlockHash]:
-    hash_fn = get_hash_fn_by_name("sha256")
-    if not hasattr(kv_cache_utils, "NONE_HASH"):
-        kv_cache_utils.init_none_hash(hash_fn)
-
-    extra_args = {}
-    if span_starts is not None:
-        extra_args["span_starts"] = span_starts
-    if cross_span_starts is not None:
-        extra_args["cross_span_starts"] = cross_span_starts
-    extra_args = extra_args or None
-    sp = greedy_sp(extra_args)
-    sp.update_from_generation_config({}, eos_token_id=100)
-    req = Request(
-        request_id="hash_probe",
-        prompt_token_ids=prompt_token_ids,
-        sampling_params=sp,
-        pooling_params=None,
-        block_hasher=get_request_block_hasher(BLOCK_SIZE, hash_fn),
-    )
-    return req.block_hashes
 
 
 def test_span_boundary_resets_block_hash_chain_e2e(model, monkeypatch):
@@ -515,166 +374,6 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
             f"cached_c={cached_c}, expected {BLOCK_SIZE * 4} "
             f"(prefix_Y + chunk). {BLOCK_SIZE * 7} would mean vLLM "
             f"silently reused req_A's tail K/V across a different prefix."
-        )
-    finally:
-        cleanup(llm)
-
-
-def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
-    """LL-32 gap_length = 2 blocks bounds the recompute at the block level.
-
-    Span is 4 blocks, gap_length covers only the first 2. After the run:
-      - the first 2 span blocks were recomputed against the real prefix
-        (K/V differs from the pre-warmed stale K/V);
-      - the last 2 span blocks were NOT touched (K/V byte-identical to
-        the stale warmup K/V) - gap_length is a hard upper bound.
-    """
-    _force_in_process_engine(monkeypatch)
-
-    prefix = list(range(0, BLOCK_SIZE * 2))
-    span = list(range(500, 500 + BLOCK_SIZE * 4))
-    prompt_tokens = prefix + span
-    sp = greedy_sp({"span_starts": [BLOCK_SIZE * 2]})
-
-    llm = build_llm(model, "LL-32", monkeypatch)
-    try:
-        # Warm the span standalone (stale: NONE-rooted at positions 0-63 vs
-        # the marked prompt's positions 32-95) and the prefix. Capture the
-        # stale span K/V via the standalone span's hashes (which the marked
-        # prompt's span blocks 2-5 also hash to).
-        _warmup_prompt(llm, span)
-        _warmup_prompt(llm, prefix)
-        span_hashes = _request_block_hashes(span, span_starts=None)
-        stale_span_kv = [_block_kv(llm, h) for h in span_hashes]
-
-        # Run the marked prompt - gap policy fires on the span at block 2
-        # with gap (32, 64) and recomputes only the first 2 span blocks.
-        _generate_num_cached_tokens(llm, prompt_tokens, sp)
-        after_span_kv = [_block_kv(llm, h) for h in span_hashes]
-
-        # Span blocks 0,1 (= prompt blocks 2,3) ARE the gap interval -
-        # their K/V must differ from the stale warmup K/V.
-        for i in (0, 1):
-            assert not torch.allclose(
-                stale_span_kv[i], after_span_kv[i], atol=2e-2, rtol=2e-2
-            ), (
-                f"span block {i} (prompt block {i + 2}, inside gap) was NOT "
-                f"recomputed - still matches the stale warmup K/V"
-            )
-
-        # Span blocks 2,3 (= prompt blocks 4,5) are OUTSIDE the gap - the
-        # gap policy must not touch them; their K/V must be byte-identical
-        # to the warmup.
-        for i in (2, 3):
-            assert torch.equal(stale_span_kv[i], after_span_kv[i]), (
-                f"span block {i} (prompt block {i + 2}, outside gap) was "
-                f"wrongly touched - gap_length = 2 blocks should not reach "
-                f"this far"
-            )
-    finally:
-        cleanup(llm)
-
-
-def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatch):
-    """LL gap recompute runs before the cross-tail prefill and the decode.
-    The 2-block PIC span is pre-warmed standalone (stale, context-free K/V).
-    The marked LL-32 run hits prefix+span, gap-recomputes the span against the
-    real prefix, then prefills the cross-tail and decodes. The cross-tail K/V
-    and decoded top-K match a no-marker FR reference only if they consumed the
-    recomputed span - proving the ordering by data dependency.
-    """
-    _force_in_process_engine(monkeypatch)
-    prefix = list(range(0, BLOCK_SIZE * 2))
-    span = list(range(500, 500 + BLOCK_SIZE * 2))
-    cross_tail = list(range(900, 900 + BLOCK_SIZE * 2))
-    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))
-    prompt = prefix + span + cross_tail + cold_suffix
-    span_starts = [BLOCK_SIZE * 2]
-    cross_span_starts = [BLOCK_SIZE * 4]
-
-    llm = build_llm(model, "LL-32", monkeypatch)
-    try:
-        # Phase 1: no markers -> gap policy no-op -> FR-equivalent reference.
-        ref_hashes = _request_block_hashes(prompt, span_starts=None)
-        ref_out = generate_single_output(llm, prompt, greedy_sp(logprobs=LOGPROBS_TOPK))
-        ref_top = extract_step0_topk(ref_out.outputs[0], LOGPROBS_TOPK)
-        ref_span_kv = [_block_kv(llm, h) for h in ref_hashes[2:4]]
-        ref_cross_tail_kv = [_block_kv(llm, h) for h in ref_hashes[4:6]]
-
-        # Phase 2: warm span (standalone, stale) then prefix, so Phase 3 hits both.
-        standalone_span_hashes = _request_block_hashes(span, span_starts=None)
-        _warmup_prompt(llm, span)
-        _warmup_prompt(llm, prefix)
-        stale_span_kv = [_block_kv(llm, h) for h in standalone_span_hashes]
-
-        # Premise: the span K/V to be hit is stale, so the recompute isn't a no-op.
-        assert not any(
-            torch.allclose(s, r, atol=2e-2, rtol=2e-2)
-            for s, r in zip(stale_span_kv, ref_span_kv)
-        ), "warmed span K/V already matches the reference; recompute is a no-op"
-
-        # Phase 3: marked LL request hits prefix+span, recomputes, prefills, decodes.
-        marked_hashes = _request_block_hashes(
-            prompt, span_starts=span_starts, cross_span_starts=cross_span_starts
-        )
-        marked_out = generate_single_output(
-            llm,
-            prompt,
-            greedy_sp(
-                extra_args={
-                    "span_starts": span_starts,
-                    "cross_span_starts": cross_span_starts,
-                },
-                logprobs=LOGPROBS_TOPK,
-            ),
-        )
-        cached_marked = marked_out.num_cached_tokens
-        actual_top = extract_step0_topk(marked_out.outputs[0], LOGPROBS_TOPK)
-        actual_span_kv = [_block_kv(llm, h) for h in marked_hashes[2:4]]
-        actual_cross_tail_kv = [_block_kv(llm, h) for h in marked_hashes[4:6]]
-
-        assert cached_marked == BLOCK_SIZE * 4, (
-            f"marked request should hit prefix + span (4 blocks); "
-            f"got cached={cached_marked}"
-        )
-        for a, r in zip(actual_span_kv, ref_span_kv):
-            assert torch.allclose(a, r, atol=2e-2, rtol=2e-2), (
-                "gap recompute did not restore the context-aware span K/V"
-            )
-        # Ordering proof: cross-tail K/V matches the reference only if the
-        # post-cross prefill ran after the recompute (else it sees stale span).
-        for a, r in zip(actual_cross_tail_kv, ref_cross_tail_kv):
-            assert torch.allclose(a, r, atol=2e-2, rtol=2e-2), (
-                "cross-tail K/V differs from reference - prefill ran before recompute"
-            )
-        # ...and the decoded top-K matches only if decode ran after the recompute.
-        assert actual_top[0][0] == ref_top[0][0], (
-            f"decoded top-1 token drift: ref={ref_top[0]}, got={actual_top[0]}"
-        )
-        assert {t for t, _ in actual_top} == {t for t, _ in ref_top}, (
-            "decoded top-K candidate set drifted - decode read stale K/V"
-        )
-    finally:
-        cleanup(llm)
-
-
-def test_large_gap_length_does_not_livelock_e2e(model, monkeypatch):
-    """When gap_overhead >= max_num_batched_tokens the scheduler run num_new_tokens <= 0
-    every step (req never schedules). Red if generate does not return within a timeout.
-    """
-    prompt = list(range(1024))  # 64 blocks, > the 512-token batch budget
-    sp = greedy_sp({"span_starts": [0]})  # LL-FULL gap spans the whole prefix
-    llm = build_llm(model, "LL-FULL", monkeypatch, max_num_batched_tokens=512)
-    try:
-        _warmup_prompt(llm, prompt)  # cold prefill caches all blocks
-        done = threading.Event()
-        threading.Thread(
-            target=lambda: (_generate_num_cached_tokens(llm, prompt, sp), done.set()),
-            daemon=True,
-        ).start()
-        assert done.wait(timeout=60), (
-            "engine livelocked: large gap_length tiled the cached prefix so "
-            "gap_overhead >= max_num_batched_tokens and the request never ran"
         )
     finally:
         cleanup(llm)
