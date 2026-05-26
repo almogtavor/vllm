@@ -96,6 +96,23 @@ def _block_kv(llm, block_hash: BlockHash):
     return _physical_block_tensor(llm, _block_id_for_hash(llm, block_hash))
 
 
+def _capture_request_block_ids(monkeypatch, llm) -> dict[str, list[int]]:
+    """Snapshot each request's per-position physical block ids, keyed by id.
+
+    PIC occurrences collide in the block *hash*, so per-occurrence K/V can
+    only be read by logical position from the request's block table. That
+    table is popped on free, so snapshot it just before the free runs.
+    """
+    kcm = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
+    captured: dict[str, list[int]] = {}
+    def _free(request):
+        captured[request.request_id] = kcm.get_block_ids(request.request_id)[0]
+        return type(kcm).free(kcm, request)  # original method off the class
+
+    monkeypatch.setattr(kcm, "free", _free)
+    return captured
+
+
 def _force_in_process_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run EngineCore in-process.
 
@@ -260,8 +277,8 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
         plain prefix-cached run with no span markers, where the two copies
         hash distinctly and are each computed correctly: the per-occurrence
         ground truth.
-      * shared - the single block both copies share after the LL-32 gap
-        recompute.
+      * occ1_kv / occ2_kv - the physical block each occurrence actually lands on.
+        occ1_first == occ2_first would mean both were wrongly deduped onto one slot.
 
     Comparisons use torch.allclose, not byte hashes: the reference prefill
     and the gap recompute take different batch shapes and may differ by
@@ -326,26 +343,32 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
         _warmup_prompt(llm, chunk)
         _warmup_prompt(llm, prefix)
         _warmup_prompt(llm, prompt[: BLOCK_SIZE * 5], extra_args=chunk_ea)
+        # Read each occurrence's physical block by logical position (block 1 =
+        # occurrence 1, block 5 = occurrence 2).
+        captured = _capture_request_block_ids(monkeypatch, llm)
         cached_b = _generate_num_cached_tokens(llm, prompt, sp)
         assert cached_b == BLOCK_SIZE * 7, (
             f"req_B should reuse prefix + both chunks + mid (7 blocks), got {cached_b}"
         )
-        shared = _block_kv(llm, prompt_hashes[1])
+        block_ids = max(captured.values(), key=len) # request with longest block table
+        occ1_first, occ2_first = block_ids[1], block_ids[5]
+        occ1_kv = _physical_block_tensor(llm, occ1_first)
+        occ2_kv = _physical_block_tensor(llm, occ2_first)
     finally:
         cleanup(llm)
 
-    # Phase 3: per-occurrence correctness. The single shared block must
-    # hold correct K/V for BOTH occurrences - impossible, since RoPE
-    # position and prefix-dependent attention make their correct K/V
-    # differ. The two gap recomputes race on the same physical slots, so
-    # `shared` may match copy 1, copy 2, or neither; "matches both" is
-    # the only correct outcome and the only one this accepts.
-    match1 = torch.allclose(shared, correct_copy1, atol=2e-2, rtol=2e-2)
-    match2 = torch.allclose(shared, correct_copy2, atol=2e-2, rtol=2e-2)
+    # Phase 3: per-occurrence correctness. Each occurrence's gap recompute
+    # must produce its own prefix-aware K/V, and that needs its own physical block.
+    assert occ1_first != occ2_first, (
+        "the two PIC occurrences were deduped onto one physical block; "
+        "distinct per-occurrence K/V is impossible while they share a slot"
+    )
+    match1 = torch.allclose(occ1_kv, correct_copy1, atol=2e-2, rtol=2e-2)
+    match2 = torch.allclose(occ2_kv, correct_copy2, atol=2e-2, rtol=2e-2)
     assert match1 and match2, (
-        "repeated PIC span served wrong K/V: the two occurrences need "
-        "distinct K/V but share one physical block; the gap recompute "
-        f"clobbers it (matches copy1={match1}, copy2={match2})"
+        "repeated PIC span served wrong K/V: each occurrence's recomputed "
+        "K/V must match its own prefix-aware ground truth "
+        f"(copy1={match1}, copy2={match2})"
     )
 
 
