@@ -14,7 +14,7 @@ from .conftest import (
 
 pytestmark = pytest.mark.spans
 
-MODES = ("FR", "SPANS", "LL-16", "LL-FULL")
+MODES = ("FR", "SPANS", "LL-32", "LL-FULL")
 SPAN_STARTS_VARIANTS = (None, [0])
 
 
@@ -22,12 +22,12 @@ def test_all_configs_match_full_recompute(model, monkeypatch):
     """Every (mode x span_starts) configuration produces next-token output
     bit-identical to plain full-recompute (FR).
 
-    Matrix: modes {FR, SPANS, LL-16, LL-FULL} x span_starts {none, [0]}, on a
+    Matrix: modes {FR, SPANS, LL-32, LL-FULL} x span_starts {none, [0]}, on a
     tokenized 4-block prompt. One engine is built per mode (span_starts is a
     per-request parameter, not an engine one); each (mode, span_starts) runs
     twice - a cold run and a replay. For the LL modes the replay is a
     prefix-cache hit, so the gap policy actually fires (LL-FULL re-prefills
-    the whole prompt, LL-16 the first block); the `cached` check pins that
+    the whole prompt, LL-32 the first two blocks); the `cached` check pins that
     the hit happened. FR/SPANS have prefix caching off, so cache nothing.
 
     None here should change the outputs. Comparison is exact (no drift tolerance):

@@ -232,10 +232,11 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
 
 
 def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
-    """Unwarmed PIC chunk, span in the middle (SPANS-PC, one engine, 3 requests).
-    A: cold prompt prefills fully and stores the chunk under its NONE_HASH hash.
+    """Unwarmed PIC chunk, span in the middle (SPANS-PC, 3 requests A/B/C).
+    A: cold prompt prefills fully and stores the chunk NONE_HASH-rooted; the
+       span's K/V must be bit-identical to the chunk computed standalone.
     B: a new-prefix request run as-is reuses nothing (block 0 misses, run halts).
-    C: a third-prefix request with its prefix warmed reuses both prefix and chunk."""
+    C: a third-prefix request with its prefix warmed reuses both prefix+chunk."""
     _force_in_process_engine(monkeypatch)
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))
     tail = list(range(1200, 1200 + BLOCK_SIZE))
@@ -245,6 +246,16 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
     sp = greedy_sp(
         {"span_starts": [BLOCK_SIZE * 2], "cross_span_starts": [BLOCK_SIZE * 4]}
     )
+    # Standalone reference (separate engine): the in-prompt span and a standalone chunk 
+    # collide on one NONE-rooted slot, so a second engine is the only way to compare.
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
+    try:
+        _warmup_prompt(llm, chunk)
+        standalone_chunk_kv = [
+            _block_kv(llm, h) for h in _request_block_hashes(chunk, span_starts=None)
+        ]
+    finally:
+        cleanup(llm)
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
         # A: cold run - the whole prompt prefills, chunk stored NONE_HASH-rooted.
@@ -261,6 +272,8 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
         chunk_none_rooted = all(cached(h) for h in stored[2:4]) and not cached(
             chained_chunk
         )
+        # Span K/V as computed inside A's cold prefill (positions 32..63).
+        inprompt_chunk_kv = [_block_kv(llm, h) for h in stored[2:4]]
 
         # B: different prefix, run as-is (unwarmed) - block 0 misses, no reuse.
         cached_b = _generate_num_cached_tokens(llm, prefix_b + chunk + tail, sp)
@@ -277,6 +290,12 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
     assert cached_c == BLOCK_SIZE * 4, (
         f"warmed prefix should reuse prefix + chunk, got {cached_c}"
     )
+    # 4th check: A's in-prompt span K/V must be bit-identical to standalone.
+    for i, (ip, st) in enumerate(zip(inprompt_chunk_kv, standalone_chunk_kv)):
+        assert torch.equal(ip, st), (
+            f"span block {i} K/V from A's in-prompt prefill is not bit-identical "
+            f"to the standalone chunk - the PIC span is not position-invariant"
+        )
 
 
 def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
