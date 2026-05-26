@@ -1,14 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gap-policy / Legolink assertions for the spans machinery.
-
-End-to-end tests that pin the Legolink span-aware gap policy: the gap
-interval bounds the partial recompute at the block level, the recompute
-runs before the post-cross prefill and the decode, and a huge gap_length
-must not livelock the scheduler. Shared helpers live in conftest.py; the
-PIC span / KV-cache tests live in test_spans_kv_cache.py.
-"""
-
 import threading
 
 import pytest

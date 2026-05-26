@@ -1,15 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""KV-cache assertions for the PIC "spans" machinery.
-
-End-to-end tests that hash the worker's KV cache per block (mirroring
-examples/offline_inference/spans/spans_time_and_kv.py) and use set-
-relations between snapshots to pin shared-chunk cache hits, span-boundary
-hash chain reset, cross-prefix chunk reuse, and prefix-cache-survives-PIC
-behavior. Shared helpers live in conftest.py; gap-policy / Legolink tests
-live in test_legolink_gap_policy.py.
-"""
-
 import pytest
 import torch
 
@@ -246,7 +236,7 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
     sp = greedy_sp(
         {"span_starts": [BLOCK_SIZE * 2], "cross_span_starts": [BLOCK_SIZE * 4]}
     )
-    # Standalone reference (separate engine): the in-prompt span and a standalone chunk 
+    # Standalone reference (separate engine): the in-prompt span and a standalone chunk
     # collide on one NONE-rooted slot, so a second engine is the only way to compare.
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
@@ -263,6 +253,7 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
         cached_a = _generate_num_cached_tokens(llm, prompt_a, sp)
         scheduler = llm.llm_engine.engine_core.engine_core.scheduler
         pool = scheduler.kv_cache_manager.block_pool
+
         def cached(h):
             return pool.get_cached_block(h, [0]) is not None
 

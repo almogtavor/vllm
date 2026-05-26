@@ -1,16 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared fixtures and helpers for spans / Legolink e2e tests.
-
-Mode names:
-    FR      - VLLM_V1_SPANS_ENABLED=False, no gap policy (full recompute baseline).
-    SPANS   - VLLM_V1_SPANS_ENABLED=True, no gap policy.
-    LL-16   - Legolink: span-aware gap policy with gap_length == block_size,
-              prefix caching enabled.
-    LL-FULL - Legolink: span-aware gap policy with gap_length >> prompt length,
-              prefix caching enabled. On a cache hit this forces a full
-              recompute of the cached prefix, which means run #2 ≡ FR.
-"""
 import gc
 import hashlib
 
@@ -62,6 +51,7 @@ def generate_single_output(llm, prompt_token_ids, sampling_params):
     )
     assert len(outputs) == 1
     return outputs[0]
+
 
 MODELS = ["Qwen/Qwen3-0.6B", "NousResearch/Meta-Llama-3.1-8B-Instruct"]
 LARGE_MODELS = {"NousResearch/Meta-Llama-3.1-8B-Instruct"}
