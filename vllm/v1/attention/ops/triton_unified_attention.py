@@ -182,6 +182,8 @@ def kernel_unified_attention_2d(
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    span_attn_start_ptr=None,  # [num_actual_tokens] - SPANS causal lower bound
+    USE_SPAN: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -326,6 +328,18 @@ def kernel_unified_attention_2d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
+    # SPANS: per-block span start (min over the query block). Skip leading tiles
+    # fully before it (masked for every query in the block) and use it to shift
+    # the key RoPE index, so the span is computed at span-relative positions.
+    span_off = 0
+    if USE_SPAN:
+        span_lb_vec = tl.load(
+            span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=2147483647
+        )
+        span_off = tl.min(span_lb_vec)
+        span_off = tl.where(span_off > num_tiles * TILE_SIZE, 0, span_off)
+        tile_start = tl.maximum(tile_start, span_off // TILE_SIZE)
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
@@ -422,11 +436,11 @@ def kernel_unified_attention_2d(
                     ),
                 )
                 cos_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + cos_idx[:, None] * stride_cs_cache_1
                 )
                 sin_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -452,11 +466,11 @@ def kernel_unified_attention_2d(
                 K_rot_b = K_b
             else:
                 cos_cache_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + offs_d_new[:, None] * stride_cs_cache_1
                 )
                 sin_cache_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -675,6 +689,8 @@ def kernel_unified_attention_3d(
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
     ROTARY_DIM: tl.constexpr = 0,  # int, 0 means rotary_dim == head_size
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
+    span_attn_start_ptr=None,  # [num_actual_tokens] - SPANS causal lower bound
+    USE_SPAN: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -823,6 +839,17 @@ def kernel_unified_attention_3d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
+    # SPANS: per-block span start (min over the query block); skip leading tiles
+    # before it and shift the key RoPE index (span-relative positions).
+    span_off = 0
+    if USE_SPAN:
+        span_lb_vec = tl.load(
+            span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=2147483647
+        )
+        span_off = tl.min(span_lb_vec)
+        span_off = tl.where(span_off > num_tiles * TILE_SIZE, 0, span_off)
+        tile_start = tl.maximum(tile_start, span_off // TILE_SIZE)
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(
         max(segm_idx * tiles_per_segment, tile_start),
@@ -926,11 +953,11 @@ def kernel_unified_attention_3d(
                     ),
                 )
                 cos_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + cos_idx[:, None] * stride_cs_cache_1
                 )
                 sin_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -956,11 +983,11 @@ def kernel_unified_attention_3d(
                 K_rot_b = K_b
             else:
                 cos_cache_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + offs_d_new[:, None] * stride_cs_cache_1
                 )
                 sin_cache_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
                     + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -1277,8 +1304,10 @@ def unified_attention(
     use_alibi_sqrt=False,
     cos_sin_cache=None,
     rotary_dim=0,
+    span_attn_start=None,
 ):
     assert causal, "Only causal attention is supported"
+    use_span = span_attn_start is not None
     assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
@@ -1437,6 +1466,8 @@ def unified_attention(
             USE_FP8=output_scale is not None,
             ROTARY_DIM=rotary_dim,
             KV_COMPUTE_DTYPE=kv_compute_dtype,
+            span_attn_start_ptr=span_attn_start,
+            USE_SPAN=use_span,
         )
     else:
         kernel_unified_attention_3d[
@@ -1496,6 +1527,8 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             ROTARY_DIM=rotary_dim,
             KV_COMPUTE_DTYPE=kv_compute_dtype,
+            span_attn_start_ptr=span_attn_start,
+            USE_SPAN=use_span,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

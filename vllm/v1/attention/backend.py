@@ -347,6 +347,11 @@ class CommonAttentionMetadata:
     cos_sin_cache: torch.Tensor | None = None
     rotary_dim: int = 0
 
+    # SPANS: per-token lower bound on the causal window. For a token inside a
+    # span region [span_start, cross_start) this holds span_start, so the token
+    # attends only to keys within its span (prefix-independent); 0 otherwise.
+    span_attn_start: torch.Tensor | None = None
+
     causal: bool = True
 
     # Needed by FastPrefillAttentionBuilder

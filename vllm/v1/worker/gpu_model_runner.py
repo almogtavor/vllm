@@ -702,6 +702,11 @@ class GPUModelRunner(
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS: per-token causal-window lower bound (see CommonAttentionMetadata).
+            self.span_attn_start = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1170,6 +1175,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1749,6 +1755,30 @@ class GPUModelRunner(
             out=positions_np,
         )
 
+        # SPANS: each token inside a span region [span_start, cross_start) gets
+        # span_start as its causal-window lower bound, so it attends only within
+        # its span (prefix-independent). Tokens elsewhere keep 0 (full prefix).
+        if envs.VLLM_V1_SPANS_ENABLED:
+            sa = self.span_attn_start.np[:total_num_scheduled_tokens]
+            sa.fill(0)
+            for i in range(num_reqs):
+                req = self.requests[self.input_batch.req_ids[i]]
+                # Legolink gap-recompute must stay context-aware (attend the real
+                # prefix), so do not make its span prefix-free.
+                if req.is_gap_recompute:
+                    continue
+                ea = req.sampling_params.extra_args if req.sampling_params else None
+                spans = ea.get("span_starts") if ea else None
+                if not spans:
+                    continue
+                lo = int(cu_num_tokens[i] - num_scheduled_tokens[i])
+                hi = int(cu_num_tokens[i])
+                ps = positions_np[lo:hi]
+                crosses = (ea.get("cross_span_starts") if ea else None) or []
+                for j, st in enumerate(spans):
+                    cr = crosses[j] if j < len(crosses) else int(ps[-1]) + 1
+                    sa[lo:hi][(ps >= st) & (ps < cr)] = st
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1827,6 +1857,13 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
+        # SPANS: now that slot_mapping is computed from absolute positions, shift
+        # span tokens to span-relative positions so the layer's query RoPE matches
+        # the standalone chunk (key RoPE is shifted in the attention kernel). Only
+        # affects the positions the model forward sees, not KV-cache storage.
+        if envs.VLLM_V1_SPANS_ENABLED:
+            positions_np -= self.span_attn_start.np[:total_num_scheduled_tokens]
+
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -1875,6 +1912,9 @@ class GPUModelRunner(
         else:
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
+
+        if envs.VLLM_V1_SPANS_ENABLED:
+            self.span_attn_start.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -2060,6 +2100,11 @@ class GPUModelRunner(
             causal=True,
             cos_sin_cache=self._cos_sin_cache,
             rotary_dim=self._rotary_dim,
+            span_attn_start=(
+                self.span_attn_start.gpu[:num_tokens_padded]
+                if envs.VLLM_V1_SPANS_ENABLED
+                else None
+            ),
         )
 
         if self.dcp_world_size > 1:
