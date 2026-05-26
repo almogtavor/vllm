@@ -278,7 +278,7 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
         # B: different prefix, run as-is (unwarmed) - block 0 misses, no reuse.
         cached_b = _generate_num_cached_tokens(llm, prefix_b + chunk + tail, sp)
 
-        # C: third prefix, warmed first - prefix + chunk both hit.
+        # C: third prefix, warmed first -> prefix + chunk both hit.
         _warmup_prompt(llm, prefix_c)
         cached_c = _generate_num_cached_tokens(llm, prefix_c + chunk + tail, sp)
     finally:
@@ -326,7 +326,7 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
     suffix = list(range(700, 700 + BLOCK_SIZE * 3))
     prefix_x = list(range(0, BLOCK_SIZE * 2))
     prefix_y = list(range(900, 900 + BLOCK_SIZE * 2))
-    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  # bounds cached count
+    cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  # 8th block, the last
     prompt_a = prefix_x + chunk + suffix + cold_suffix
     prompt_c = prefix_y + chunk + suffix + cold_suffix
     sp = greedy_sp(
@@ -362,9 +362,8 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         generate_single_output(llm, prompt_a, sp)
         kv_hashes_after_a = _kv_cache_block_hashes(llm, LAYER_IDX)
 
-        # 2. req_B: identical to A. The engine charges all of A's prompt
-        # (prefix_X + chunk + suffix = 7 blocks) as cached; cold_suffix is
-        # the 8th block, bounding cached_b at 7 * BLOCK_SIZE.
+        # 2. req_B: identical to A; all 8 blocks are cached, but the lookup caps
+        # the hit at num_tokens - 1 (block-aligned), dropping the last block -> 7.
         cached_b = _generate_num_cached_tokens(llm, prompt_a, sp)
         assert cached_b == BLOCK_SIZE * 7, (
             f"req_B should reuse all of A's prompt via prefix cache; "
