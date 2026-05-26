@@ -94,6 +94,7 @@ def build_llm(
     model: str,
     mode: str,
     monkeypatch: pytest.MonkeyPatch,
+    max_num_batched_tokens: int | None = None,
 ) -> LLM:
     """Construct an LLM configured for one of FR / SPANS / SPANS-PC / LL-16 / LL-FULL.
 
@@ -147,10 +148,19 @@ def build_llm(
 
     _set_spans_env(monkeypatch, spans_enabled)
 
+    # KV-cache snapshot helpers send a function to the workers via
+    # collective_rpc; on a multiprocessing engine that payload must be
+    # serializable. Set both ways: the env var is inherited by the spawned
+    # engine-core/workers, the attr covers the in-process path.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setattr(envs, "VLLM_ALLOW_INSECURE_SERIALIZATION", True)
+
     extra: dict = {}
     if gap_policy_name is not None:
         extra["gap_policy_name"] = gap_policy_name
         extra["gap_policy_config"] = gap_policy_config
+    if max_num_batched_tokens is not None:
+        extra["max_num_batched_tokens"] = max_num_batched_tokens
 
     return LLM(
         model=model,

@@ -10,6 +10,7 @@ behavior, and the Legolink gap-policy interval bound.
 """
 
 import hashlib
+import threading
 
 import pytest
 import torch
@@ -105,6 +106,7 @@ def _capture_request_block_ids(monkeypatch, llm) -> dict[str, list[int]]:
     """
     kcm = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
     captured: dict[str, list[int]] = {}
+
     def _free(request):
         captured[request.request_id] = kcm.get_block_ids(request.request_id)[0]
         return type(kcm).free(kcm, request)  # original method off the class
@@ -133,9 +135,7 @@ def _warmup_prompt(
     When the prompt is exactly the PIC chunk, this creates the same
     NONE_HASH-rooted block entry that a later span-start block should hit.
     """
-    generate_single_output(
-        llm, prompt_token_ids, greedy_sp(extra_args, max_tokens=1)
-    )
+    generate_single_output(llm, prompt_token_ids, greedy_sp(extra_args, max_tokens=1))
 
 
 def _generate_num_cached_tokens(
@@ -350,7 +350,7 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
         assert cached_b == BLOCK_SIZE * 7, (
             f"req_B should reuse prefix + both chunks + mid (7 blocks), got {cached_b}"
         )
-        block_ids = max(captured.values(), key=len) # request with longest block table
+        block_ids = max(captured.values(), key=len)  # request with longest block table
         occ1_first, occ2_first = block_ids[1], block_ids[5]
         occ1_kv = _physical_block_tensor(llm, occ1_first)
         occ2_kv = _physical_block_tensor(llm, occ2_first)
@@ -372,12 +372,61 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     )
 
 
+def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
+    """Unwarmed PIC chunk, span in the middle (SPANS-PC, one engine, 3 requests).
+    A: cold prompt prefills fully and stores the chunk under its NONE_HASH hash.
+    B: a new-prefix request run as-is reuses nothing (block 0 misses, run halts).
+    C: a third-prefix request with its prefix warmed reuses both prefix and chunk."""
+    _force_in_process_engine(monkeypatch)
+    chunk = list(range(500, 500 + BLOCK_SIZE * 2))
+    tail = list(range(1200, 1200 + BLOCK_SIZE))
+    prefix_a = list(range(0, BLOCK_SIZE * 2))
+    prefix_b = list(range(3000, 3000 + BLOCK_SIZE * 2))
+    prefix_c = list(range(6000, 6000 + BLOCK_SIZE * 2))
+    sp = greedy_sp(
+        {"span_starts": [BLOCK_SIZE * 2], "cross_span_starts": [BLOCK_SIZE * 4]}
+    )
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
+    try:
+        # A: cold run - the whole prompt prefills, chunk stored NONE_HASH-rooted.
+        prompt_a = prefix_a + chunk + tail
+        cached_a = _generate_num_cached_tokens(llm, prompt_a, sp)
+        scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+        pool = scheduler.kv_cache_manager.block_pool
+        def cached(h):
+            return pool.get_cached_block(h, [0]) is not None
+
+        stored = _request_block_hashes(prompt_a, [BLOCK_SIZE * 2], [BLOCK_SIZE * 4])
+        chained_chunk = _request_block_hashes(prompt_a, span_starts=None)[2]
+        full_prefill = all(cached(h) for h in stored)
+        chunk_none_rooted = all(cached(h) for h in stored[2:4]) and not cached(
+            chained_chunk
+        )
+
+        # B: different prefix, run as-is (unwarmed) - block 0 misses, no reuse.
+        cached_b = _generate_num_cached_tokens(llm, prefix_b + chunk + tail, sp)
+
+        # C: third prefix, warmed first - prefix + chunk both hit.
+        _warmup_prompt(llm, prefix_c)
+        cached_c = _generate_num_cached_tokens(llm, prefix_c + chunk + tail, sp)
+    finally:
+        cleanup(llm)
+    assert cached_a == 0, f"cold run should reuse nothing, got {cached_a}"
+    assert full_prefill, "cold run did not fully prefill the prompt"
+    assert chunk_none_rooted, "chunk not stored under its NONE_HASH-rooted hash"
+    assert cached_b == 0, f"unwarmed new prefix must halt at block 0, got {cached_b}"
+    assert cached_c == BLOCK_SIZE * 4, (
+        f"warmed prefix should reuse prefix + chunk, got {cached_c}"
+    )
+
+
 def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
     """Setup (mode SPANS-PC: spans on, prefix caching on, no gap policy):
       - Warm up by running a one-shot request whose only blocks are the
         2-block chunk. That populates the prefix cache with two entries:
         hash(NONE_HASH, chunk[0..16]) and hash(prev, chunk[16..32]).
-      - req_A = prefix_X + chunk(2 blocks) + suffix    (span_starts=[32])
+      - req_A = prefix_X + chunk(2 blocks) + suffix
+        (span_starts=[32], cross_span_starts=[64])
       - req_B identical to A, different request_id
       - req_C = prefix_Y + chunk + suffix              (different prefix)
 
@@ -389,8 +438,9 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
       2. req_B reports BLOCK_SIZE * 7 cached tokens - ordinary prefix-cache
          reuse of A's prompt on a byte-identical re-run.
       3. req_C does not evict any slot req_A wrote.
-      4. req_C adds >= 5 new slots (2 prefix_Y + 3 fresh tail);
-         this is the correctness pin and currently FAILS by design.
+      4. req_C reuses only prefix_Y + chunk (4 blocks): the cross-anchored
+         suffix hashes against prefix_Y, misses req_A's prefix_X-rooted
+         tail, and is recomputed - so no cross-prefix tail reuse.
     """
     _force_in_process_engine(monkeypatch)
 
@@ -401,8 +451,9 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
     cold_suffix = list(range(2000, 2000 + BLOCK_SIZE))  # bounds cached count
     prompt_a = prefix_x + chunk + suffix + cold_suffix
     prompt_c = prefix_y + chunk + suffix + cold_suffix
-
-    sp = greedy_sp({"span_starts": [BLOCK_SIZE * 2]})
+    sp = greedy_sp(
+        {"span_starts": [BLOCK_SIZE * 2], "cross_span_starts": [BLOCK_SIZE * 4]}
+    )
 
     llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
@@ -418,7 +469,11 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         #     standalone chunk. The prefix cache is keyed by block_hash,
         #     so this equality is exactly what makes req_A's chunk lookup
         #     hit the warmup slots.
-        req_a_hashes = _request_block_hashes(prompt_a, span_starts=[BLOCK_SIZE * 2])
+        req_a_hashes = _request_block_hashes(
+            prompt_a,
+            span_starts=[BLOCK_SIZE * 2],
+            cross_span_starts=[BLOCK_SIZE * 4],
+        )
         assert req_a_hashes[2:4] == chunk_hashes, (
             "req_A's PIC chunk blocks must hash to the standalone warmup "
             "chunk's block_hashes; without that equality req_A's chunk "
@@ -449,12 +504,12 @@ def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
         )
 
         # 4. CORRECTNESS PIN: req_C uses prefix_Y (warmed), so its prefix
-        # cache hit can only reach the warmed blocks: prefix_Y + chunk = 4
-        # blocks. The tail must NOT hit, because its true context is
-        # prefix_Y while req_A's cached tail was computed against prefix_X.
-        # If vLLM wrongly reuses req_A's tail (tail blocks chain through
-        # the NONE-rooted chunk hash, so their hashes collide across A/C),
-        # cached_c would be BLOCK_SIZE * 7 instead of BLOCK_SIZE * 4.
+        # cache hit reaches prefix_Y + chunk = 4 blocks. The tail must NOT
+        # hit: cross_span_starts re-anchors the first suffix block to the
+        # full prefix, so req_C's suffix hashes against prefix_Y and misses
+        # req_A's prefix_X-rooted tail. Without that cross boundary the tail
+        # would chain through the NONE-rooted chunk hash, collide across
+        # A/C, and cached_c would be BLOCK_SIZE * 7 instead of BLOCK_SIZE * 4.
         assert cached_c == BLOCK_SIZE * 4, (
             f"INCORRECT CROSS-PREFIX REUSE DETECTED: req_C reported "
             f"cached_c={cached_c}, expected {BLOCK_SIZE * 4} "
@@ -522,7 +577,6 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
 
 def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatch):
     """LL gap recompute runs before the cross-tail prefill and the decode.
-
     The 2-block PIC span is pre-warmed standalone (stale, context-free K/V).
     The marked LL-32 run hits prefix+span, gap-recomputes the span against the
     real prefix, then prefills the cross-tail and decodes. The cross-tail K/V
@@ -530,7 +584,6 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
     recomputed span - proving the ordering by data dependency.
     """
     _force_in_process_engine(monkeypatch)
-
     prefix = list(range(0, BLOCK_SIZE * 2))
     span = list(range(500, 500 + BLOCK_SIZE * 2))
     cross_tail = list(range(900, 900 + BLOCK_SIZE * 2))
@@ -543,35 +596,24 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
     try:
         # Phase 1: no markers -> gap policy no-op -> FR-equivalent reference.
         ref_hashes = _request_block_hashes(prompt, span_starts=None)
-        ref_out = generate_single_output(
-            llm, prompt, greedy_sp(logprobs=LOGPROBS_TOPK)
-        )
+        ref_out = generate_single_output(llm, prompt, greedy_sp(logprobs=LOGPROBS_TOPK))
         ref_top = extract_step0_topk(ref_out.outputs[0], LOGPROBS_TOPK)
         ref_span_kv = [_block_kv(llm, h) for h in ref_hashes[2:4]]
         ref_cross_tail_kv = [_block_kv(llm, h) for h in ref_hashes[4:6]]
 
-        # Phase 2: warm the span standalone, then the prefix - so Phase 3's
-        # marked request hits prefix+span and the span warmup is consumed.
-        # (The span K/V is context-free/stale, cached at the NONE_HASH-rooted
-        # hash the PIC-marked span block also hits.)
+        # Phase 2: warm span (standalone, stale) then prefix, so Phase 3 hits both.
         standalone_span_hashes = _request_block_hashes(span, span_starts=None)
         _warmup_prompt(llm, span)
         _warmup_prompt(llm, prefix)
         stale_span_kv = [_block_kv(llm, h) for h in standalone_span_hashes]
 
-        # Premise: the span K/V the marked request will hit is genuinely stale -
-        # it differs from the context-aware reference, so the gap recompute has
-        # real work and the assertions below are not vacuous.
+        # Premise: the span K/V to be hit is stale, so the recompute isn't a no-op.
         assert not any(
             torch.allclose(s, r, atol=2e-2, rtol=2e-2)
             for s, r in zip(stale_span_kv, ref_span_kv)
-        ), (
-            "warmed span K/V already matches the context-aware span; the gap "
-            "recompute would be a no-op and this test's premise is moot"
-        )
+        ), "warmed span K/V already matches the reference; recompute is a no-op"
 
-        # Phase 3: the LL marked request. Hits prefix+span; the gap recomputes
-        # the span; cross-tail prefills fresh; decode runs.
+        # Phase 3: marked LL request hits prefix+span, recomputes, prefills, decodes.
         marked_hashes = _request_block_hashes(
             prompt, span_starts=span_starts, cross_span_starts=cross_span_starts
         )
@@ -591,38 +633,48 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
         actual_span_kv = [_block_kv(llm, h) for h in marked_hashes[2:4]]
         actual_cross_tail_kv = [_block_kv(llm, h) for h in marked_hashes[4:6]]
 
-        # The marked request hit prefix + span (4 blocks): confirms there was a
-        # cached (stale) span entry for the gap to recompute.
         assert cached_marked == BLOCK_SIZE * 4, (
             f"marked request should hit prefix + span (4 blocks); "
             f"got cached={cached_marked}"
         )
-
-        # The gap recompute produced context-aware span K/V.
         for a, r in zip(actual_span_kv, ref_span_kv):
             assert torch.allclose(a, r, atol=2e-2, rtol=2e-2), (
                 "gap recompute did not restore the context-aware span K/V"
             )
-
-        # (a) post-cross prefill happened AFTER the recompute: the cross-tail
-        # K/V attends over the span, so it matches the context-aware reference
-        # only if the cross-tail prefill observed the recomputed span. If it
-        # had run before the recompute it would reflect the stale span.
+        # Ordering proof: cross-tail K/V matches the reference only if the
+        # post-cross prefill ran after the recompute (else it sees stale span).
         for a, r in zip(actual_cross_tail_kv, ref_cross_tail_kv):
             assert torch.allclose(a, r, atol=2e-2, rtol=2e-2), (
-                "cross-tail K/V differs from the context-aware reference - the "
-                "post-cross prefill read the stale span K/V, i.e. it ran "
-                "before the gap recompute"
+                "cross-tail K/V differs from reference - prefill ran before recompute"
             )
-
-        # (b) decode happened AFTER the recompute: the first-token top-K
-        # matches the reference only if decode observed the recomputed K/V.
+        # ...and the decoded top-K matches only if decode ran after the recompute.
         assert actual_top[0][0] == ref_top[0][0], (
             f"decoded top-1 token drift: ref={ref_top[0]}, got={actual_top[0]}"
         )
         assert {t for t, _ in actual_top} == {t for t, _ in ref_top}, (
-            "decoded top-K candidate set drifted from the reference - decode "
-            "read stale (pre-recompute) K/V"
+            "decoded top-K candidate set drifted - decode read stale K/V"
+        )
+    finally:
+        cleanup(llm)
+
+
+def test_large_gap_length_does_not_livelock_e2e(model, monkeypatch):
+    """When gap_overhead >= max_num_batched_tokens the scheduler run num_new_tokens <= 0
+    every step (req never schedules). Red if generate does not return within a timeout.
+    """
+    prompt = list(range(1024))  # 64 blocks, > the 512-token batch budget
+    sp = greedy_sp({"span_starts": [0]})  # LL-FULL gap spans the whole prefix
+    llm = build_llm(model, "LL-FULL", monkeypatch, max_num_batched_tokens=512)
+    try:
+        _warmup_prompt(llm, prompt)  # cold prefill caches all blocks
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (_generate_num_cached_tokens(llm, prompt, sp), done.set()),
+            daemon=True,
+        ).start()
+        assert done.wait(timeout=60), (
+            "engine livelocked: large gap_length tiled the cached prefix so "
+            "gap_overhead >= max_num_batched_tokens and the request never ran"
         )
     finally:
         cleanup(llm)
