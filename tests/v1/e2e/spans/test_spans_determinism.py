@@ -2,43 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 
-from vllm import SamplingParams
-
 from .conftest import (
     BLOCK_SIZE,
+    LOGPROBS_TOPK,
     build_llm,
     cleanup,
     extract_step0_topk,
+    generate_single_output,
+    greedy_sp,
 )
 
 pytestmark = pytest.mark.spans
 
-SEED = 42
-MAX_TOKENS = 16
-LOGPROBS_TOPK = 10
-
 MODES = ("FR", "SPANS", "LL-16", "LL-FULL")
 SPAN_STARTS_VARIANTS = (None, [0])
-
-
-def _greedy_params(extra_args: dict | None = None) -> SamplingParams:
-    return SamplingParams.from_optional(
-        seed=SEED,
-        temperature=0.0,
-        max_tokens=MAX_TOKENS,
-        logprobs=LOGPROBS_TOPK,
-        extra_args=extra_args,
-    )
-
-
-def _run_tokens(llm, prompt_token_ids: list[int], extra_args: dict | None = None):
-    res = llm.generate(
-        {"prompt_token_ids": prompt_token_ids},
-        sampling_params=_greedy_params(extra_args),
-        use_tqdm=False,
-    )
-    out = res[0].outputs[0]
-    return out.text, extract_step0_topk(out, LOGPROBS_TOPK), res[0].num_cached_tokens
 
 
 def test_all_configs_match_full_recompute(model, monkeypatch):
@@ -74,8 +51,20 @@ def test_all_configs_match_full_recompute(model, monkeypatch):
                     {"span_starts": span_starts}
                     if span_starts is not None else None
                 )
-                cold = _run_tokens(llm, prompt_tokens, extra)
-                replay = _run_tokens(llm, prompt_tokens, extra)
+                # cold run, then a replay that hits the prefix cache (for LL
+                # modes); each yields (text, top-K, num_cached_tokens).
+                runs = {}
+                for run_label in ("cold", "replay"):
+                    out = generate_single_output(
+                        llm, prompt_tokens, greedy_sp(extra, logprobs=LOGPROBS_TOPK)
+                    )
+                    o = out.outputs[0]
+                    runs[run_label] = (
+                        o.text,
+                        extract_step0_topk(o, LOGPROBS_TOPK),
+                        out.num_cached_tokens,
+                    )
+                cold, replay = runs["cold"], runs["replay"]
 
                 if ref_text is None:
                     ref_text, ref_top, _ = cold

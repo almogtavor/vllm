@@ -17,12 +17,46 @@ import pytest
 import torch
 
 import vllm.envs as envs
-from vllm import LLM
+from vllm import LLM, SamplingParams
 
 BLOCK_SIZE = 16
 SPAN_TOKEN_PLUS = 10
 SPAN_TOKEN_CROSS = 31
 HUGE_GAP_LENGTH = 1_000_000
+
+SEED = 42
+MAX_TOKENS = 16
+LOGPROBS_TOPK = 10
+
+
+def greedy_sp(
+    extra_args: dict | None = None,
+    logprobs: int | None = None,
+    max_tokens: int = MAX_TOKENS,
+) -> SamplingParams:
+    """Deterministic greedy SamplingParams shared by the spans e2e runs.
+
+    `max_tokens` defaults to MAX_TOKENS; pass 1 for cache-warming runs that
+    only need the prefill, not a full decode.
+    """
+    return SamplingParams.from_optional(
+        seed=SEED,
+        temperature=0.0,
+        max_tokens=max_tokens,
+        logprobs=logprobs,
+        extra_args=extra_args,
+    )
+
+
+def generate_single_output(llm, prompt_token_ids, sampling_params):
+    """Generate from one token-id prompt; return the single RequestOutput."""
+    outputs = llm.generate(
+        {"prompt_token_ids": prompt_token_ids},
+        sampling_params=sampling_params,
+        use_tqdm=False,
+    )
+    assert len(outputs) == 1
+    return outputs[0]
 
 MODELS = ["Qwen/Qwen3-0.6B", "NousResearch/Meta-Llama-3.1-8B-Instruct"]
 LARGE_MODELS = {"NousResearch/Meta-Llama-3.1-8B-Instruct"}
