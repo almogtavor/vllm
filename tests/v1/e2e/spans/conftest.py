@@ -3,10 +3,8 @@
 # ruff: noqa: E402  (VLLM_BATCH_INVARIANT must be set before vLLM is imported)
 import os
 
-# SPANS: some tests compare K/V across different batch shapes (e.g. an in-prompt
-# span vs the same chunk computed standalone). Those are only bit-identical when
-# matmuls/attention are batch-shape-invariant, so enable vLLM's batch-invariant
-# mode for the spans suite. Must be set before vLLM is imported (read at import).
+# SPANS: bit-exact K/V comparison across batch shapes needs batch-invariant
+# matmuls. Must be set before vLLM is imported (read at import).
 os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 
 import gc

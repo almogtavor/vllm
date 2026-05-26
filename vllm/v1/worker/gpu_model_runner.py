@@ -1755,9 +1755,8 @@ class GPUModelRunner(
             out=positions_np,
         )
 
-        # SPANS: each token inside a span region [span_start, cross_start) gets
-        # span_start as its causal-window lower bound, so it attends only within
-        # its span (prefix-independent). Tokens elsewhere keep 0 (full prefix).
+        # SPANS: per-token causal lower bound = span_start inside [span_start,
+        # cross_start), else 0 (full prefix). Drives the kernel's span masking.
         if envs.VLLM_V1_SPANS_ENABLED:
             sa = self.span_attn_start.np[:total_num_scheduled_tokens]
             sa.fill(0)
@@ -1857,10 +1856,8 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
-        # SPANS: now that slot_mapping is computed from absolute positions, shift
-        # span tokens to span-relative positions so the layer's query RoPE matches
-        # the standalone chunk (key RoPE is shifted in the attention kernel). Only
-        # affects the positions the model forward sees, not KV-cache storage.
+        # SPANS: shift span tokens to span-relative positions (after slot_mapping
+        # used absolute) so the layer's query RoPE matches the standalone chunk.
         if envs.VLLM_V1_SPANS_ENABLED:
             positions_np -= self.span_attn_start.np[:total_num_scheduled_tokens]
 

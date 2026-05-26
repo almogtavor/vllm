@@ -689,8 +689,6 @@ def kernel_unified_attention_3d(
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
     ROTARY_DIM: tl.constexpr = 0,  # int, 0 means rotary_dim == head_size
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
-    span_attn_start_ptr=None,  # [num_actual_tokens] - SPANS causal lower bound
-    USE_SPAN: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -839,16 +837,7 @@ def kernel_unified_attention_3d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    # SPANS: per-block span start (min over the query block); skip leading tiles
-    # before it and shift the key RoPE index (span-relative positions).
-    span_off = 0
-    if USE_SPAN:
-        span_lb_vec = tl.load(
-            span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=2147483647
-        )
-        span_off = tl.min(span_lb_vec)
-        span_off = tl.where(span_off > num_tiles * TILE_SIZE, 0, span_off)
-        tile_start = tl.maximum(tile_start, span_off // TILE_SIZE)
+    span_off = 0  # SPANS unused on the decode-only 3d path (prefill uses 2d)
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(
@@ -1527,8 +1516,6 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             ROTARY_DIM=rotary_dim,
             KV_COMPUTE_DTYPE=kv_compute_dtype,
-            span_attn_start_ptr=span_attn_start,
-            USE_SPAN=use_span,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

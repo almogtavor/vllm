@@ -46,9 +46,8 @@ class CachedRequestState:
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
 
-    # SPANS: True for Legolink virtual gap-recompute requests. Their span must be
-    # recomputed context-aware (attending the real prefix), so the span-local
-    # attention (prefix-free) is NOT applied to them.
+    # SPANS: Legolink gap-recompute requests must stay context-aware, so the
+    # prefix-free span-local attention is NOT applied to them.
     is_gap_recompute: bool = False
 
     # Used when both async_scheduling and spec_decode are enabled.
