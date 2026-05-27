@@ -10,7 +10,11 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.serve.disagg.protocol import GenerateRequest
-from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+from vllm.entrypoints.serve.render.serving import (
+    OpenAIServingRender,
+    ParseRequest,
+    ParseResponse,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -69,6 +73,38 @@ async def render_completion(request: CompletionRequest, raw_request: Request):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
 
     return JSONResponse(content=[item.model_dump() for item in result])
+
+
+@router.post(
+    "/v1/chat/completions/parse",
+    dependencies=[Depends(validate_json_request)],
+    response_model=ParseResponse,
+    responses={
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_IMPLEMENTED.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def parse_chat_completion(request: ParseRequest, raw_request: Request):
+    """Postprocess raw model output into structured reasoning/tool_calls.
+
+    The output-side counterpart to /v1/chat/completions/render: takes the text
+    a caller already generated (e.g. via raw /v1/completions for the spans
+    pipeline) and runs the server's configured reasoning + tool-call parsers.
+    """
+    handler = render(raw_request)
+    if handler is None:
+        raise NotImplementedError(
+            "The model does not support Chat Completions Parse API"
+        )
+
+    result = await handler.parse_chat_output(request)
+
+    if isinstance(result, ErrorResponse):
+        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+
+    return JSONResponse(content=result.model_dump())
 
 
 def attach_router(app: FastAPI) -> None:
