@@ -17,7 +17,7 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
-INT32_MAX = torch.iinfo(torch.int32).max
+INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
 
 
 @triton.jit
