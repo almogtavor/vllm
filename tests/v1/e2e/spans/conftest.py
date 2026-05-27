@@ -3,8 +3,7 @@
 # ruff: noqa: E402  (VLLM_BATCH_INVARIANT must be set before vLLM is imported)
 import os
 
-# SPANS: bit-exact K/V comparison across batch shapes needs batch-invariant
-# matmuls. Must be set before vLLM is imported (read at import).
+# bit-exact K/V comparison across batch shapes needs batch-invariant matmuls
 os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 import gc
 import hashlib
