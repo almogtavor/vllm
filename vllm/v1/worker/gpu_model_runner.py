@@ -702,8 +702,7 @@ class GPUModelRunner(
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
-        if envs.VLLM_V1_SPANS_ENABLED:
-            # SPANS: per-token causal-window lower bound (see CommonAttentionMetadata).
+        if envs.VLLM_V1_SPANS_ENABLED: # a per-token causal-window lower bound
             self.span_attn_start = self._make_buffer(
                 self.max_num_tokens, dtype=torch.int32
             )
@@ -1758,8 +1757,8 @@ class GPUModelRunner(
         # SPANS: per-token causal lower bound = span_start inside [span_start,
         # cross_start), else 0 (full prefix). Drives the kernel's span masking.
         if envs.VLLM_V1_SPANS_ENABLED:
-            sa = self.span_attn_start.np[:total_num_scheduled_tokens]
-            sa.fill(0)
+            sp_att = self.span_attn_start.np[:total_num_scheduled_tokens] # lower bounds
+            sp_att.fill(0) # default: full-prefix (no span lower bound)
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 if req.is_gap_recompute:  # stays context-aware (attend the real prefix)
@@ -1767,14 +1766,14 @@ class GPUModelRunner(
                 ea = req.sampling_params.extra_args if req.sampling_params else None
                 spans = ea.get("span_starts") if ea else None
                 if not spans:
-                    continue
+                    continue # no spans -> leave at 0
                 lo = int(cu_num_tokens[i] - num_scheduled_tokens[i])
                 hi = int(cu_num_tokens[i])
-                ps = positions_np[lo:hi]
-                crosses = (ea.get("cross_span_starts") if ea else None) or []
-                for j, st in enumerate(spans):
-                    cr = crosses[j] if j < len(crosses) else int(ps[-1]) + 1
-                    sa[lo:hi][(ps >= st) & (ps < cr)] = st
+                pos_seq = positions_np[lo:hi]
+                crosses = (ea.get("cross_span_starts") if ea else None) or [] # span end
+                for j, span_start in enumerate(spans):
+                    cr = crosses[j] if j < len(crosses) else int(pos_seq[-1]) + 1
+                    sp_att[lo:hi][(pos_seq >= span_start) & (pos_seq < cr)] = span_start
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)

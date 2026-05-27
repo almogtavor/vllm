@@ -328,9 +328,8 @@ def kernel_unified_attention_2d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    # SPANS: per-block span start (min over the query block). Skip leading tiles
-    # fully before it (masked for every query in the block) and use it to shift
-    # the key RoPE index, so the span is computed at span-relative positions.
+    # SPANS: per-block span start (min over the Q block). Skip tiles before it (masked)
+    # and shift the key RoPE index, so the span is computed at span-relative positions.
     span_offset = 0
     if USE_SPAN:
         span_lb_vec = tl.load(
