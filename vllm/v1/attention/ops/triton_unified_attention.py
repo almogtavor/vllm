@@ -17,6 +17,7 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
+INT32_MAX = torch.iinfo(torch.int32).max
 
 
 @triton.jit
@@ -333,11 +334,11 @@ def kernel_unified_attention_2d(
     span_offset = 0
     if USE_SPAN:
         span_lb_vec = tl.load(
-            span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=2147483647
+            span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=INT32_MAX
         )
         span_offset = tl.min(span_lb_vec)
         span_offset = tl.where(span_offset > num_tiles * TILE_SIZE, 0, span_offset)
-        tile_start = tl.maximum(tile_start, span_offset // TILE_SIZE)
+        tile_start = tl.maximum(tile_start, span_offset // TILE_SIZE) # the tile index
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
