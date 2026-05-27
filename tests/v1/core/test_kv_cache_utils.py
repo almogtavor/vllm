@@ -2172,6 +2172,7 @@ def test_unify_hybrid_kv_cache_specs():
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
 
 
+@pytest.mark.spans
 def test_request_span_metadata_extracted():
     """span_starts/cross_span_starts extracted from extra_args when SPANS_ENABLED."""
     import vllm.envs as envs
@@ -2199,6 +2200,7 @@ def test_request_span_metadata_extracted():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_span_metadata_ignored_when_disabled():
     """span_starts/cross_span_starts are None when SPANS_ENABLED is False."""
     import vllm.envs as envs
@@ -2226,6 +2228,7 @@ def test_request_span_metadata_ignored_when_disabled():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_span_metadata_none_when_no_extra_args():
     """span_starts/cross_span_starts are None when extra_args is absent."""
     import vllm.envs as envs
@@ -2247,6 +2250,7 @@ def test_request_span_metadata_none_when_no_extra_args():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_block_hasher_span_start_resets_hash():
     """Block at a span_start position gets NONE_HASH as parent."""
     import vllm.envs as envs
@@ -2285,6 +2289,7 @@ def test_request_block_hasher_span_start_resets_hash():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_block_hasher_validates_alignment():
     """span_starts not aligned to block_size raises ValueError."""
     import vllm.envs as envs
@@ -2311,6 +2316,7 @@ def test_request_block_hasher_validates_alignment():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_block_hasher_cross_span_folds_tokens():
     """Block at a cross_span_starts position folds preceding tokens into extra_keys."""
     import vllm.envs as envs
