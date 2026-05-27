@@ -331,14 +331,14 @@ def kernel_unified_attention_2d(
     # SPANS: per-block span start (min over the query block). Skip leading tiles
     # fully before it (masked for every query in the block) and use it to shift
     # the key RoPE index, so the span is computed at span-relative positions.
-    span_off = 0
+    span_offset = 0
     if USE_SPAN:
         span_lb_vec = tl.load(
             span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=2147483647
         )
-        span_off = tl.min(span_lb_vec)
-        span_off = tl.where(span_off > num_tiles * TILE_SIZE, 0, span_off)
-        tile_start = tl.maximum(tile_start, span_off // TILE_SIZE)
+        span_offset = tl.min(span_lb_vec)
+        span_offset = tl.where(span_offset > num_tiles * TILE_SIZE, 0, span_offset)
+        tile_start = tl.maximum(tile_start, span_offset // TILE_SIZE)
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
@@ -436,11 +436,11 @@ def kernel_unified_attention_2d(
                     ),
                 )
                 cos_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    (seq_offset[None, :] - span_offset) * stride_cs_cache_0
                     + cos_idx[:, None] * stride_cs_cache_1
                 )
                 sin_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    (seq_offset[None, :] - span_offset) * stride_cs_cache_0
                     + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -466,11 +466,11 @@ def kernel_unified_attention_2d(
                 K_rot_b = K_b
             else:
                 cos_cache_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    (seq_offset[None, :] - span_offset) * stride_cs_cache_0
                     + offs_d_new[:, None] * stride_cs_cache_1
                 )
                 sin_cache_offset = (
-                    (seq_offset[None, :] - span_off) * stride_cs_cache_0
+                    (seq_offset[None, :] - span_offset) * stride_cs_cache_0
                     + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
