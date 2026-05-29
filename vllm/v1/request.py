@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from typing_extensions import deprecated
 
+from vllm import envs
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -95,6 +95,10 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
+        # SPANS: Per-request span boundary metadata
+        self.span_starts: list[int] | None = None
+        self.cross_span_starts: list[int] | None = None
+
         if pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
@@ -109,6 +113,11 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                if envs.VLLM_V1_SPANS_ENABLED:
+                    self.span_starts = sampling_params.extra_args.get("span_starts")
+                    self.cross_span_starts = sampling_params.extra_args.get(
+                        "cross_span_starts"
+                    )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -176,17 +185,6 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
-
-    @property
-    @deprecated(
-        "Request.eos_token_id will be removed in v0.18. "
-        "Please use Request.sampling_params.eos_token_id instead."
-    )
-    def eos_token_id(self) -> int | None:
-        if self.sampling_params is None:
-            return None
-
-        return self.sampling_params.eos_token_id
 
     @classmethod
     def from_engine_core_request(

@@ -33,6 +33,74 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def ptx_bf16_rope(K_a, K_b, cos, sin):
+    """
+    RoPE rotation on a pair of key halves using inline PTX scalar bf16
+    mul/sub/add. Each op rounds to bf16 once, matching
+    csrc/pos_encoding_kernels.cu's __hmul/__hsub/__hadd pattern bit-for-bit.
+
+    Source-level Triton arithmetic (K_a * cos - K_b * sin) promotes bf16
+    to fp32 and emits FMA, diverging from the CUDA kernel by ~1 bf16 ULP.
+    Requires SM_90+ (Hopper) for native scalar bf16 PTX ops; callers must
+    gate on device capability before invoking this helper.
+
+    Inputs: K_a, K_b, cos, sin all bf16 tiles of matching shape.
+    Returns: (K_rot_a, K_rot_b) both bf16, where
+        K_rot_a = K_a * cos - K_b * sin
+        K_rot_b = K_b * cos + K_a * sin
+    """
+    ka_cos = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_a, cos],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    kb_sin = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_b, sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    kb_cos = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_b, cos],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    ka_sin = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_a, sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    K_rot_a = tl.inline_asm_elementwise(
+        asm="sub.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[ka_cos, kb_sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    K_rot_b = tl.inline_asm_elementwise(
+        asm="add.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[kb_cos, ka_sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    return K_rot_a, K_rot_b
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -66,6 +134,7 @@ def kernel_unified_attention_2d(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
+    cos_sin_cache_ptr,  # [max_model_len, head_size]
     scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
@@ -89,6 +158,8 @@ def kernel_unified_attention_2d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    FUSE_ROPE: tl.constexpr,  # bool
+    USE_PTX_BF16_ROPE: tl.constexpr,  # bool
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
@@ -100,11 +171,15 @@ def kernel_unified_attention_2d(
     stride_v_cache_1: tl.int64,  # int
     stride_v_cache_2: tl.int64,  # int
     stride_v_cache_3: tl.constexpr,  # int
+    stride_cs_cache_0: tl.int64,  # int
+    stride_cs_cache_1: tl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    ROTARY_DIM: tl.constexpr = 0,  # int, 0 means rotary_dim == head_size
+    KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -134,22 +209,44 @@ def kernel_unified_attention_2d(
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    query_offset = (
+    offs_d_new = tl.arange(0, HEAD_SIZE_PADDED // 2)
+
+    query_offset_a = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
-        + offs_d[None, :]
+        + offs_d_new[None, :]
+    )
+
+    query_offset_b = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d_new[None, :]
+        + HEAD_SIZE_PADDED // 2
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
+
+    dim_mask_a = tl.where(offs_d_new < HEAD_SIZE, 1, 0).to(tl.int1)
+    dim_mask_b = tl.where((HEAD_SIZE_PADDED // 2 + offs_d_new) < HEAD_SIZE, 1, 0).to(
+        tl.int1
+    )
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    # Q_a : (BLOCK_M, HEAD_SIZE_PADDED // 2)
+    Q_a = tl.load(
+        query_ptr + query_offset_a,
+        mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(KV_COMPUTE_DTYPE)
+
+    # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
+    Q_b = tl.load(
+        query_ptr + query_offset_b,
+        mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+    ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -245,27 +342,144 @@ def kernel_unified_attention_2d(
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
-        k_offset = (
+        k_offset_a = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
+            + offs_d_new[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
+        k_offset_b = (
+            physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_k_cache_3
+            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
+
+        # K_a : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
+        K_a_load = tl.load(
+            key_cache_ptr + k_offset_a,
+            mask=dim_mask_a[:, None] & tile_mask[None, :],
             other=0.0,
         )
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+        if K_a_load.dtype.is_fp8():
+            K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
         else:
-            K = K_load
+            K_a = K_a_load.to(KV_COMPUTE_DTYPE)
+
+        # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
+        K_b_load = tl.load(
+            key_cache_ptr + k_offset_b,
+            mask=dim_mask_b[:, None] & tile_mask[None, :],
+            other=0.0,
+        )
+
+        if K_b_load.dtype.is_fp8():
+            K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
+        else:
+            K_b = K_b_load.to(KV_COMPUTE_DTYPE)
+
+        if FUSE_ROPE:
+            if ROTARY_DIM > 0 and ROTARY_DIM < HEAD_SIZE:
+                HALF_ROT: tl.constexpr = ROTARY_DIM // 2
+                partner_dim = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new + HALF_ROT,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        offs_d_new,
+                    ),
+                )
+                rot_mask = (offs_d_new[:, None] < ROTARY_DIM) & tile_mask[None, :]
+
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + partner_dim[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                )
+                if K_partner_load.dtype.is_fp8():
+                    K_partner = (K_partner_load.to(tl.float32) * tl.load(k_scale)).to(
+                        KV_COMPUTE_DTYPE
+                    )
+                else:
+                    K_partner = K_partner_load.to(KV_COMPUTE_DTYPE)
+
+                cos_idx = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        0,
+                    ),
+                )
+                cos_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
+                )
+                sin_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset,
+                    mask=rot_mask,
+                    other=1.0,
+                ).to(KV_COMPUTE_DTYPE)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                ).to(KV_COMPUTE_DTYPE)
+
+                K_rot_a = tl.where(
+                    offs_d_new[:, None] < HALF_ROT,
+                    K_a * cos - K_partner * sin,
+                    tl.where(
+                        offs_d_new[:, None] < ROTARY_DIM,
+                        K_a * cos + K_partner * sin,
+                        K_a,
+                    ),
+                )
+                K_rot_b = K_b
+            else:
+                cos_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + offs_d_new[:, None] * stride_cs_cache_1
+                )
+                sin_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_cache_offset,
+                    mask=dim_mask_a[:, None] & tile_mask[None, :],
+                    other=0.0,
+                ).to(K_a.dtype)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_cache_offset,
+                    mask=dim_mask_b[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                cos = cos.to(KV_COMPUTE_DTYPE)
+                sin = sin.to(KV_COMPUTE_DTYPE)
+
+                if USE_PTX_BF16_ROPE:
+                    K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+                else:
+                    K_rot_a = K_a * cos - K_b * sin
+                    K_rot_b = K_b * cos + K_a * sin
+        else:
+            K_rot_a = K_a
+            K_rot_b = K_b
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -275,10 +489,10 @@ def kernel_unified_attention_2d(
         )
 
         if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if Q_a.dtype.is_fp8():
                 V = V_load
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
         else:
             V = V_load
 
@@ -318,7 +532,8 @@ def kernel_unified_attention_2d(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
-        S += scale * tl.dot(Q, K)
+        S += scale * tl.dot(Q_a, K_rot_a)
+        S += scale * tl.dot(Q_b, K_rot_b)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -417,6 +632,7 @@ def kernel_unified_attention_3d(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
+    cos_sin_cache_ptr,
     scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
@@ -437,6 +653,8 @@ def kernel_unified_attention_3d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    FUSE_ROPE: tl.constexpr,  # bool
+    USE_PTX_BF16_ROPE: tl.constexpr,  # bool
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
@@ -445,6 +663,8 @@ def kernel_unified_attention_3d(
     stride_v_cache_1: tl.int64,  # int
     stride_v_cache_2: tl.int64,  # int
     stride_v_cache_3: tl.constexpr,  # int
+    stride_cs_cache_0: tl.int64,  # int
+    stride_cs_cache_1: tl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
@@ -453,6 +673,8 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+    ROTARY_DIM: tl.constexpr = 0,  # int, 0 means rotary_dim == head_size
+    KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -491,22 +713,42 @@ def kernel_unified_attention_3d(
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    query_offset = (
+    offs_d_new = tl.arange(0, HEAD_SIZE_PADDED // 2)
+
+    query_offset_a = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
-        + offs_d[None, :]
+        + offs_d_new[None, :]
+    )
+
+    query_offset_b = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d_new[None, :]
+        + HEAD_SIZE_PADDED // 2
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
+    dim_mask_a = tl.where(offs_d_new < HEAD_SIZE, 1, 0).to(tl.int1)
+    dim_mask_b = tl.where((HEAD_SIZE_PADDED // 2 + offs_d_new) < HEAD_SIZE, 1, 0).to(
+        tl.int1
+    )
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
-    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    # Q_a : (BLOCK_M, HEAD_SIZE_PADDED // 2)
+    Q_a = tl.load(
+        query_ptr + query_offset_a,
+        mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(KV_COMPUTE_DTYPE)
+
+    # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
+    Q_b = tl.load(
+        query_ptr + query_offset_b,
+        mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+    ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -600,27 +842,148 @@ def kernel_unified_attention_3d(
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
-        k_offset = (
+        k_offset_a = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
+            + offs_d_new[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
+        k_offset_b = (
+            physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_k_cache_3
+            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
+
+        # K_a : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
+        # Cast to KV_COMPUTE_DTYPE (model compute dtype, e.g. bfloat16) so the
+        # in-kernel RoPE multiply below uses the same dtype as the layer-side
+        # RoPE in rotary_embedding/common.py. With this, the fused-RoPE path
+        # is bit-equivalent to the layer-rotated-then-cached path.
+        K_a_load = tl.load(
+            key_cache_ptr + k_offset_a,
+            mask=dim_mask_a[:, None] & tile_mask[None, :],
             other=0.0,
         )
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+        if K_a_load.dtype.is_fp8():
+            K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
         else:
-            K = K_load
+            K_a = K_a_load.to(KV_COMPUTE_DTYPE)
+
+        # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
+        K_b_load = tl.load(
+            key_cache_ptr + k_offset_b,
+            mask=dim_mask_b[:, None] & tile_mask[None, :],
+            other=0.0,
+        )
+
+        if K_b_load.dtype.is_fp8():
+            K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
+        else:
+            K_b = K_b_load.to(KV_COMPUTE_DTYPE)
+
+        if FUSE_ROPE:
+            if ROTARY_DIM > 0 and ROTARY_DIM < HEAD_SIZE:
+                HALF_ROT: tl.constexpr = ROTARY_DIM // 2
+                partner_dim = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new + HALF_ROT,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        offs_d_new,
+                    ),
+                )
+                rot_mask = (offs_d_new[:, None] < ROTARY_DIM) & tile_mask[None, :]
+
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + partner_dim[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                )
+                if K_partner_load.dtype.is_fp8():
+                    K_partner = (K_partner_load.to(tl.float32) * tl.load(k_scale)).to(
+                        KV_COMPUTE_DTYPE
+                    )
+                else:
+                    K_partner = K_partner_load.to(KV_COMPUTE_DTYPE)
+
+                cos_idx = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        0,
+                    ),
+                )
+                cos_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
+                )
+                sin_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset,
+                    mask=rot_mask,
+                    other=1.0,
+                ).to(KV_COMPUTE_DTYPE)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                ).to(KV_COMPUTE_DTYPE)
+
+                K_rot_a = tl.where(
+                    offs_d_new[:, None] < HALF_ROT,
+                    K_a * cos - K_partner * sin,
+                    tl.where(
+                        offs_d_new[:, None] < ROTARY_DIM,
+                        K_a * cos + K_partner * sin,
+                        K_a,
+                    ),
+                )
+                K_rot_b = K_b
+            else:
+                cos_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + offs_d_new[:, None] * stride_cs_cache_1
+                )
+                sin_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_cache_offset,
+                    mask=dim_mask_a[:, None] & tile_mask[None, :],
+                    other=0.0,
+                ).to(K_a.dtype)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_cache_offset,
+                    mask=dim_mask_b[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                cos = cos.to(KV_COMPUTE_DTYPE)
+                sin = sin.to(KV_COMPUTE_DTYPE)
+
+                if USE_PTX_BF16_ROPE:
+                    K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+                else:
+                    K_rot_a = K_a * cos - K_b * sin
+                    K_rot_b = K_b * cos + K_a * sin
+        else:
+            K_rot_a = K_a
+            K_rot_b = K_b
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -630,10 +993,10 @@ def kernel_unified_attention_3d(
         )
 
         if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if Q_a.dtype.is_fp8():
                 V = V_load
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
         else:
             V = V_load
 
@@ -672,7 +1035,8 @@ def kernel_unified_attention_3d(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+        S += scale * tl.dot(Q_a, K_rot_a)
+        S += scale * tl.dot(Q_b, K_rot_b)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -911,6 +1275,8 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    cos_sin_cache=None,
+    rotary_dim=0,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -931,7 +1297,31 @@ def unified_attention(
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
-
+    fuse_rope = cos_sin_cache is not None
+    # The in-kernel RoPE matches the CUDA RoPE kernel bit-for-bit only when
+    # it uses inline PTX scalar bf16 mul/sub/add, which requires SM_90+
+    # (Hopper) and bf16 operands. Otherwise we fall back to source-level
+    # Triton arithmetic, which is correct but ~1 bf16 ULP off the CUDA path.
+    _device_cap = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    use_ptx_bf16_rope = (
+        fuse_rope
+        and k.dtype == torch.bfloat16
+        and _device_cap is not None
+        and _device_cap >= (9, 0)
+    )
+    # Select the compute dtype for in-kernel RoPE + key cast so it matches
+    # the layer-side RoPE dtype (x.dtype inside rotary_embedding/common.py).
+    # For fp8 caches we keep fp16 (the existing dequant path lands there).
+    if k.dtype == torch.bfloat16:
+        kv_compute_dtype = tl.bfloat16
+    elif k.dtype == torch.float16:
+        kv_compute_dtype = tl.float16
+    elif k.dtype == torch.float32:
+        kv_compute_dtype = tl.float32
+    else:
+        kv_compute_dtype = tl.float16
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
@@ -1001,6 +1391,7 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
+            cos_sin_cache_ptr=cos_sin_cache,
             scale=softmax_scale,
             k_scale=k_descale,
             v_scale=v_descale,
@@ -1027,6 +1418,8 @@ def unified_attention(
             MAX_MM_RANGES=max_mm_ranges,
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
+            FUSE_ROPE=fuse_rope,
+            USE_PTX_BF16_ROPE=use_ptx_bf16_rope,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
@@ -1035,11 +1428,15 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_cs_cache_0=cos_sin_cache.stride(0) if fuse_rope else 0,
+            stride_cs_cache_1=cos_sin_cache.stride(1) if fuse_rope else 0,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            ROTARY_DIM=rotary_dim,
+            KV_COMPUTE_DTYPE=kv_compute_dtype,
         )
     else:
         kernel_unified_attention_3d[
@@ -1056,6 +1453,7 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
+            cos_sin_cache_ptr=cos_sin_cache,
             scale=softmax_scale,
             k_scale=k_descale,
             v_scale=v_descale,
@@ -1079,6 +1477,8 @@ def unified_attention(
             MAX_MM_RANGES=max_mm_ranges,
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
+            FUSE_ROPE=fuse_rope,
+            USE_PTX_BF16_ROPE=use_ptx_bf16_rope,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
@@ -1087,11 +1487,15 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_cs_cache_0=cos_sin_cache.stride(0) if fuse_rope else 0,
+            stride_cs_cache_1=cos_sin_cache.stride(1) if fuse_rope else 0,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            ROTARY_DIM=rotary_dim,
+            KV_COMPUTE_DTYPE=kv_compute_dtype,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
