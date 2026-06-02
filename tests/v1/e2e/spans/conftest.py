@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import hashlib
+import os
 
 import pytest
 import torch
@@ -53,9 +54,24 @@ def generate_single_output(llm, prompt_token_ids, sampling_params):
     return outputs[0]
 
 
-MODELS = ["Qwen/Qwen3-0.6B", "NousResearch/Meta-Llama-3.1-8B-Instruct"]
+# SPANS_TEST_MODEL overrides the model matrix (e.g. google/gemma-4-31B) so the
+# same suite can run against a single large model on a big GPU without editing
+# this file. Comma-separated for multiple.
+_ENV_MODELS = os.environ.get("SPANS_TEST_MODEL")
+if _ENV_MODELS:
+    MODELS = [m.strip() for m in _ENV_MODELS.split(",") if m.strip()]
+else:
+    MODELS = ["Qwen/Qwen3-0.6B", "NousResearch/Meta-Llama-3.1-8B-Instruct"]
 LARGE_MODELS = {"NousResearch/Meta-Llama-3.1-8B-Instruct"}
 LARGE_MODEL_MIN_GIB = 24
+
+
+def _model_id(name: str) -> str:
+    known = {
+        "Qwen/Qwen3-0.6B": "qwen3_0_6b",
+        "NousResearch/Meta-Llama-3.1-8B-Instruct": "llama3_1_8b",
+    }
+    return known.get(name, name.split("/")[-1].replace("-", "_").replace(".", "_"))
 
 
 def _has_enough_gpu_for(model: str) -> bool:
@@ -67,7 +83,7 @@ def _has_enough_gpu_for(model: str) -> bool:
     return total_gib >= LARGE_MODEL_MIN_GIB
 
 
-@pytest.fixture(params=MODELS, ids=["qwen3_0_6b", "llama3_1_8b"])
+@pytest.fixture(params=MODELS, ids=[_model_id(m) for m in MODELS])
 def model(request) -> str:
     name = request.param
     if not torch.cuda.is_available():
@@ -159,9 +175,11 @@ def build_llm(
 
     return LLM(
         model=model,
-        tensor_parallel_size=1,
+        # Large models (e.g. gemma-4-31B) need more GPU headroom / sharding;
+        # override via SPANS_TP and SPANS_GPU_MEM_UTIL without editing this file.
+        tensor_parallel_size=int(os.environ.get("SPANS_TP", "1")),
         kv_transfer_config=None,
-        gpu_memory_utilization=0.3,
+        gpu_memory_utilization=float(os.environ.get("SPANS_GPU_MEM_UTIL", "0.3")),
         # Spans tests use <=~200-token prompts. Capping max_model_len keeps
         # the KV-cache pool small enough to fit without the engine needing
         # to be sized for the model's full (e.g. 128K) context window.
