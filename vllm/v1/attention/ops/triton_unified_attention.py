@@ -183,7 +183,7 @@ def kernel_unified_attention_2d(
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
-    span_attn_start_ptr=None,  # [num_actual_tokens] - SPANS causal lower bound
+    span_attn_start_ptr: torch.Tensor | None = None, # [num_actual_tokens] lower bounds
     USE_SPAN: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
@@ -331,7 +331,7 @@ def kernel_unified_attention_2d(
 
     # SPANS: per-block span start (min over the Q block). Skip tiles before it (masked)
     # and shift the key RoPE index, so the span is computed at span-relative positions.
-    span_offset = 0
+    span_offset: tl.int32 = 0
     if USE_SPAN:
         span_lb_vec = tl.load(
             span_attn_start_ptr + query_offset_0, mask=query_mask_0, other=INT32_MAX
