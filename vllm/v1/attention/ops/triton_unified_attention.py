@@ -176,74 +176,6 @@ def _store_output_td(
 
 
 @triton.jit
-def ptx_bf16_rope(K_a, K_b, cos, sin):
-    """
-    RoPE rotation on a pair of key halves using inline PTX scalar bf16
-    mul/sub/add. Each op rounds to bf16 once, matching
-    csrc/pos_encoding_kernels.cu's __hmul/__hsub/__hadd pattern bit-for-bit.
-
-    Source-level Triton arithmetic (K_a * cos - K_b * sin) promotes bf16
-    to fp32 and emits FMA, diverging from the CUDA kernel by ~1 bf16 ULP.
-    Requires SM_90+ (Hopper) for native scalar bf16 PTX ops; callers must
-    gate on device capability before invoking this helper.
-
-    Inputs: K_a, K_b, cos, sin all bf16 tiles of matching shape.
-    Returns: (K_rot_a, K_rot_b) both bf16, where
-        K_rot_a = K_a * cos - K_b * sin
-        K_rot_b = K_b * cos + K_a * sin
-    """
-    ka_cos = tl.inline_asm_elementwise(
-        asm="mul.rn.bf16 $0, $1, $2;",
-        constraints="=h,h,h",
-        args=[K_a, cos],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    kb_sin = tl.inline_asm_elementwise(
-        asm="mul.rn.bf16 $0, $1, $2;",
-        constraints="=h,h,h",
-        args=[K_b, sin],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    kb_cos = tl.inline_asm_elementwise(
-        asm="mul.rn.bf16 $0, $1, $2;",
-        constraints="=h,h,h",
-        args=[K_b, cos],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    ka_sin = tl.inline_asm_elementwise(
-        asm="mul.rn.bf16 $0, $1, $2;",
-        constraints="=h,h,h",
-        args=[K_a, sin],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    K_rot_a = tl.inline_asm_elementwise(
-        asm="sub.rn.bf16 $0, $1, $2;",
-        constraints="=h,h,h",
-        args=[ka_cos, kb_sin],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    K_rot_b = tl.inline_asm_elementwise(
-        asm="add.rn.bf16 $0, $1, $2;",
-        constraints="=h,h,h",
-        args=[kb_cos, ka_sin],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    return K_rot_a, K_rot_b
-
-
-@triton.jit
 def kernel_unified_attention(
     # Output destination for the 2D path.  In 3D mode per-segment partials
     # go to the ``segm_*`` tensors (see bottom of signature) and
@@ -348,7 +280,6 @@ def kernel_unified_attention(
     stride_cs_cache_0: tl.int64 = 0,
     stride_cs_cache_1: tl.constexpr = 0,
     FUSE_ROPE: tl.constexpr = False,
-    USE_PTX_BF16_ROPE: tl.constexpr = False,
     ROTARY_DIM: tl.constexpr = 0,  # 0 means rotary_dim == head_size
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
 ):
@@ -430,32 +361,6 @@ def kernel_unified_attention(
             mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
             other=0.0,
         )
-
-    if FUSE_ROPE:
-        # Span-relative RoPE rotates K in-kernel, so the score is computed as
-        # the sum of two head-dim half dots. Load Q in the matching halves.
-        offs_d_new = tl.arange(0, HEAD_SIZE_PADDED // 2)
-        dim_mask_a = tl.where(offs_d_new < HEAD_SIZE, 1, 0).to(tl.int1)
-        dim_mask_b = tl.where(
-            (HEAD_SIZE_PADDED // 2 + offs_d_new) < HEAD_SIZE, 1, 0
-        ).to(tl.int1)
-        query_offset_a = (
-            query_offset_0[:, None] * query_stride_0
-            + query_offset_1[:, None] * query_stride_1
-            + offs_d_new[None, :]
-        )
-        query_offset_b = query_offset_a + HEAD_SIZE_PADDED // 2
-        # Q_a / Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
-        Q_a = tl.load(
-            query_ptr + query_offset_a,
-            mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-            other=0.0,
-        ).to(KV_COMPUTE_DTYPE)
-        Q_b = tl.load(
-            query_ptr + query_offset_b,
-            mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-            other=0.0,
-        ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -555,135 +460,74 @@ def kernel_unified_attention(
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
             if FUSE_ROPE:
-                # K stored un-rotated: load both head-dim halves and apply
-                # span-relative RoPE here. K_a/K_b : (HEAD_SIZE_PADDED//2, TILE)
-                k_offset_a = (
+                # K is stored un-rotated. Rotate the FULL K tile in fp32 here to
+                # match the FR CUDA rotary kernel
+                # (csrc/libtorch_stable/pos_encoding_kernels.cu), which upcasts
+                # to float, rotates, and rounds to the cache dtype once. Then use
+                # a single full dot (matching FR's tl.dot(Q, K)) so the fp32
+                # accumulation order is identical. ROTARY_DIM <= 0 (or >= head)
+                # means rotary covers the whole head; otherwise only [0,
+                # ROTARY_DIM) rotates and the rest passes through (cos -> 1.0,
+                # sin -> 0.0 outside the rotary span).
+                ROT: tl.constexpr = (
+                    HEAD_SIZE
+                    if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE)
+                    else ROTARY_DIM
+                )
+                HALF_ROT: tl.constexpr = ROT // 2
+                k_offset = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + offs_d_new[:, None] * stride_k_cache_3
+                    + offs_d[:, None] * stride_k_cache_3
                     + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
                 )
-                k_offset_b = (
+                K_raw_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                # neox pairing: x-part (d < HALF_ROT) pairs with d + HALF_ROT,
+                # y-part ([HALF_ROT, ROT)) pairs with d - HALF_ROT.
+                x_part = offs_d < HALF_ROT
+                partner_d = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
+                k_partner_offset = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_k_cache_3
+                    + partner_d[:, None] * stride_k_cache_3
                     + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
                 )
-                K_a_load = tl.load(
-                    key_cache_ptr + k_offset_a,
-                    mask=dim_mask_a[:, None] & tile_mask[None, :],
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
                     other=0.0,
                 )
-                if K_a_load.dtype.is_fp8():
-                    K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(
-                        KV_COMPUTE_DTYPE
-                    )
-                else:
-                    K_a = K_a_load.to(KV_COMPUTE_DTYPE)
-                K_b_load = tl.load(
-                    key_cache_ptr + k_offset_b,
-                    mask=dim_mask_b[:, None] & tile_mask[None, :],
-                    other=0.0,
+                rope_mask = (offs_d[:, None] < ROT) & tile_mask[None, :]
+                cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
+                cos_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
                 )
-                if K_b_load.dtype.is_fp8():
-                    K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(
-                        KV_COMPUTE_DTYPE
-                    )
+                sin_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset, mask=rope_mask, other=1.0
+                ).to(tl.float32)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset, mask=rope_mask, other=0.0
+                ).to(tl.float32)
+                rope_sign = tl.where(x_part, -1.0, 1.0)
+                if K_raw_load.dtype.is_fp8():
+                    k_sc = tl.load(k_scale)
+                    K_raw_f = K_raw_load.to(tl.float32) * k_sc
+                    K_partner_f = K_partner_load.to(tl.float32) * k_sc
                 else:
-                    K_b = K_b_load.to(KV_COMPUTE_DTYPE)
-
-                if ROTARY_DIM > 0 and ROTARY_DIM < HEAD_SIZE:
-                    # Partial rotary: only [0, ROTARY_DIM) dims are rotated;
-                    # the rest pass through. Rotation pairs dim d with its
-                    # half-offset partner within the rotary span.
-                    HALF_ROT: tl.constexpr = ROTARY_DIM // 2
-                    partner_dim = tl.where(
-                        offs_d_new < HALF_ROT,
-                        offs_d_new + HALF_ROT,
-                        tl.where(
-                            offs_d_new < ROTARY_DIM,
-                            offs_d_new - HALF_ROT,
-                            offs_d_new,
-                        ),
-                    )
-                    rot_mask = (offs_d_new[:, None] < ROTARY_DIM) & tile_mask[None, :]
-                    k_partner_offset = (
-                        physical_block_idx[None, :] * stride_k_cache_0
-                        + kv_head_idx * stride_k_cache_2
-                        + partner_dim[:, None] * stride_k_cache_3
-                        + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-                    )
-                    K_partner_load = tl.load(
-                        key_cache_ptr + k_partner_offset,
-                        mask=rot_mask,
-                        other=0.0,
-                    )
-                    if K_partner_load.dtype.is_fp8():
-                        K_partner = (
-                            K_partner_load.to(tl.float32) * tl.load(k_scale)
-                        ).to(KV_COMPUTE_DTYPE)
-                    else:
-                        K_partner = K_partner_load.to(KV_COMPUTE_DTYPE)
-                    cos_idx = tl.where(
-                        offs_d_new < HALF_ROT,
-                        offs_d_new,
-                        tl.where(
-                            offs_d_new < ROTARY_DIM,
-                            offs_d_new - HALF_ROT,
-                            0,
-                        ),
-                    )
-                    cos_offset = (
-                        seq_offset[None, :] * stride_cs_cache_0
-                        + cos_idx[:, None] * stride_cs_cache_1
-                    )
-                    sin_offset = (
-                        seq_offset[None, :] * stride_cs_cache_0
-                        + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
-                    )
-                    cos = tl.load(
-                        cos_sin_cache_ptr + cos_offset, mask=rot_mask, other=1.0
-                    ).to(KV_COMPUTE_DTYPE)
-                    sin = tl.load(
-                        cos_sin_cache_ptr + sin_offset, mask=rot_mask, other=0.0
-                    ).to(KV_COMPUTE_DTYPE)
-                    K_rot_a = tl.where(
-                        offs_d_new[:, None] < HALF_ROT,
-                        K_a * cos - K_partner * sin,
-                        tl.where(
-                            offs_d_new[:, None] < ROTARY_DIM,
-                            K_a * cos + K_partner * sin,
-                            K_a,
-                        ),
-                    )
-                    K_rot_b = K_b
-                else:
-                    # Full rotary: rotate the two head halves against each
-                    # other. cos/sin laid out as [pos, head_size].
-                    cos_cache_offset = (
-                        seq_offset[None, :] * stride_cs_cache_0
-                        + offs_d_new[:, None] * stride_cs_cache_1
-                    )
-                    sin_cache_offset = (
-                        seq_offset[None, :] * stride_cs_cache_0
-                        + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None])
-                        * stride_cs_cache_1
-                    )
-                    cos = tl.load(
-                        cos_sin_cache_ptr + cos_cache_offset,
-                        mask=dim_mask_a[:, None] & tile_mask[None, :],
-                        other=0.0,
-                    ).to(KV_COMPUTE_DTYPE)
-                    sin = tl.load(
-                        cos_sin_cache_ptr + sin_cache_offset,
-                        mask=dim_mask_b[:, None] & tile_mask[None, :],
-                        other=0.0,
-                    ).to(KV_COMPUTE_DTYPE)
-                    if USE_PTX_BF16_ROPE:
-                        K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
-                    else:
-                        K_rot_a = K_a * cos - K_b * sin
-                        K_rot_b = K_b * cos + K_a * sin
+                    K_raw_f = K_raw_load.to(tl.float32)
+                    K_partner_f = K_partner_load.to(tl.float32)
+                K_rot = (
+                    K_raw_f * cos + rope_sign[:, None] * K_partner_f * sin
+                ).to(KV_COMPUTE_DTYPE)
             else:
                 k_offset = (
                     physical_block_idx[None, :] * stride_k_cache_0
@@ -742,9 +586,7 @@ def kernel_unified_attention(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if FUSE_ROPE:
-            # Q·K_rot split over head-dim halves (RoPE rotates K in halves).
-            S += score_scale * tl.dot(Q_a, K_rot_a)
-            S += score_scale * tl.dot(Q_b, K_rot_b)
+            S += score_scale * tl.dot(Q, K_rot)
         elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
@@ -1055,19 +897,6 @@ def unified_attention(
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
     fuse_rope = cos_sin_cache is not None
-    # The in-kernel RoPE matches the CUDA RoPE kernel bit-for-bit only when it
-    # uses inline PTX scalar bf16 mul/sub/add, which requires SM_90+ (Hopper)
-    # and bf16 operands. Otherwise fall back to source-level Triton arithmetic,
-    # which is correct but ~1 bf16 ULP off the CUDA path.
-    _device_cap = (
-        current_platform.get_device_capability() if current_platform.is_cuda() else None
-    )
-    use_ptx_bf16_rope = (
-        fuse_rope
-        and k.dtype == torch.bfloat16
-        and _device_cap is not None
-        and _device_cap >= (9, 0)
-    )
     # Compute dtype for in-kernel RoPE + key cast, matching the layer-side RoPE
     # dtype. For fp8 caches keep fp16 (the dequant path lands there).
     if k.dtype == torch.bfloat16:
@@ -1310,7 +1139,6 @@ def unified_attention(
         stride_cs_cache_0=cos_sin_cache.stride(0) if fuse_rope else 0,
         stride_cs_cache_1=cos_sin_cache.stride(1) if fuse_rope else 0,
         FUSE_ROPE=fuse_rope,
-        USE_PTX_BF16_ROPE=use_ptx_bf16_rope,
         ROTARY_DIM=rotary_dim,
         KV_COMPUTE_DTYPE=kv_compute_dtype,
     )
