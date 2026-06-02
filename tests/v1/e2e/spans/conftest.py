@@ -95,6 +95,7 @@ def build_llm(
     mode: str,
     monkeypatch: pytest.MonkeyPatch,
     max_num_batched_tokens: int | None = None,
+    block_size: int = BLOCK_SIZE,
 ) -> LLM:
     """Construct an LLM configured for one of FR / SPANS / SPANS-PC / LL-16 / LL-FULL.
 
@@ -172,7 +173,7 @@ def build_llm(
         # to be sized for the model's full (e.g. 128K) context window.
         max_model_len=2048,
         enforce_eager=True,
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         enable_prefix_caching=enable_prefix_caching,
         async_scheduling=False,
         attention_backend="TRITON_ATTN",
@@ -319,6 +320,7 @@ def _request_block_hashes(
     prompt_token_ids: list[int],
     span_starts: list[int] | None,
     cross_span_starts: list[int] | None = None,
+    block_size: int = BLOCK_SIZE,
 ) -> list[BlockHash]:
     hash_fn = get_hash_fn_by_name("sha256")
     if not hasattr(kv_cache_utils, "NONE_HASH"):
@@ -337,6 +339,6 @@ def _request_block_hashes(
         prompt_token_ids=prompt_token_ids,
         sampling_params=sp,
         pooling_params=None,
-        block_hasher=get_request_block_hasher(BLOCK_SIZE, hash_fn),
+        block_hasher=get_request_block_hasher(block_size, hash_fn),
     )
     return req.block_hashes

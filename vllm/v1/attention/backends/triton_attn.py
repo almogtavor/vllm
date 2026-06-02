@@ -77,7 +77,8 @@ class TritonAttentionMetadata:
 
     cos_sin_cache: torch.Tensor | None = None
     rotary_dim: int = 0
-    span_attn_start: torch.Tensor | None = None
+    attn_lower_bounds: torch.Tensor | None = None
+    cu_kv_lens: torch.Tensor | None = None
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -239,11 +240,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         if envs.VLLM_V1_SPANS_ENABLED:
             cos_sin_cache = common_attn_metadata.cos_sin_cache
             rotary_dim = common_attn_metadata.rotary_dim
-            span_attn_start = common_attn_metadata.span_attn_start
+            attn_lower_bounds = common_attn_metadata.attn_lower_bounds
+            cu_kv_lens = common_attn_metadata.cu_kv_lens
         else:
             cos_sin_cache = None
             rotary_dim = 0
-            span_attn_start = None
+            attn_lower_bounds = None
+            cu_kv_lens = None
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -266,7 +269,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_expsum=self.softmax_segm_expsum,
             cos_sin_cache=cos_sin_cache,
             rotary_dim=rotary_dim,
-            span_attn_start=span_attn_start,
+            attn_lower_bounds=attn_lower_bounds,
+            cu_kv_lens=cu_kv_lens,
         )
         return attn_metadata
 
@@ -512,7 +516,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         cos_sin_cache = attn_metadata.cos_sin_cache
         rotary_dim = attn_metadata.rotary_dim
-        span_attn_start = attn_metadata.span_attn_start
+        attn_lower_bounds = attn_metadata.attn_lower_bounds
+        cu_kv_lens = attn_metadata.cu_kv_lens
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
@@ -545,7 +550,8 @@ class TritonAttentionImpl(AttentionImpl):
             cos_sin_cache=cos_sin_cache,
             mm_prefix_range=mm_prefix_range_tensor,
             rotary_dim=rotary_dim,
-            span_attn_start=span_attn_start,
+            attn_lower_bounds=attn_lower_bounds,
+            cu_kv_lens=cu_kv_lens,
         )
 
         return output

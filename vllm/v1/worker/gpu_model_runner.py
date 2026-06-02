@@ -702,10 +702,12 @@ class GPUModelRunner(
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
-        if envs.VLLM_V1_SPANS_ENABLED: # a per-token causal-window lower bound
-            self.span_attn_start = self._make_buffer(
-                self.max_num_tokens, dtype=torch.int32
-            )
+        if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS: a flat per-KV-position causal-window lower bound, indexed
+            # by `cu_kv_lens[req] + kv_position_within_request`. Built per
+            # forward (size is batch-dependent). No cap on spans per request.
+            self._attn_lower_bounds_gpu: torch.Tensor | None = None
+            self._cu_kv_lens_gpu: torch.Tensor | None = None
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1754,26 +1756,47 @@ class GPUModelRunner(
             out=positions_np,
         )
 
-        # SPANS: per-token causal lower bound = span_start inside [span_start,
-        # cross_start), else 0 (full prefix). Drives the kernel's span masking.
+        # SPANS: build a single flat per-KV-position causal lower bound array
+        # for this batch. Length = sum(total_seq_len_i); indexed by
+        # `cu_kv[req] + kv_position`. The kernel uses it for both the Q-side
+        # mask (gather at this token's KV position) and the K-side per-key
+        # RoPE shift (gather at each tile-key's KV position). The same array
+        # also drives the host's Q-RoPE shift further down.
         if envs.VLLM_V1_SPANS_ENABLED:
-            sp_att = self.span_attn_start.np[:total_num_scheduled_tokens] # lower bounds
-            sp_att.fill(0) # default: full-prefix (no span lower bound)
+            seq_lens_arr = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                + num_scheduled_tokens
+            )
+            cu_kv = np.zeros(num_reqs + 1, dtype=np.int32)
+            np.cumsum(seq_lens_arr, out=cu_kv[1:])
+            total_kv = int(cu_kv[-1])
+            attn_lb = np.zeros(total_kv, dtype=np.int32)
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
-                if req.is_gap_recompute:  # stays context-aware (attend the real prefix)
+                if req.is_gap_recompute: # context-aware (attends full prefix)
                     continue
                 ea = req.sampling_params.extra_args if req.sampling_params else None
                 spans = ea.get("span_starts") if ea else None
                 if not spans:
-                    continue # no spans -> leave at 0
-                lo = int(cu_num_tokens[i] - num_scheduled_tokens[i])
-                hi = int(cu_num_tokens[i])
-                pos_seq = positions_np[lo:hi]
-                crosses = (ea.get("cross_span_starts") if ea else None) or [] # span end
+                    continue
+                crosses = (ea.get("cross_span_starts") if ea else None) or []
+                req_start = int(cu_kv[i])
+                req_len = int(seq_lens_arr[i])
                 for j, span_start in enumerate(spans):
-                    cr = crosses[j] if j < len(crosses) else int(pos_seq[-1]) + 1
-                    sp_att[lo:hi][(pos_seq >= span_start) & (pos_seq < cr)] = span_start
+                    cr = crosses[j] if j < len(crosses) else req_len
+                    attn_lb[req_start + int(span_start) : req_start + int(cr)] = (
+                        span_start
+                    )
+            # Stash the numpy view so the post-slot-mapping Q-position shift
+            # below can reuse it without rebuilding.
+            self._attn_lb_np = attn_lb
+            self._cu_kv_np = cu_kv
+            self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
+                self.device, non_blocking=True
+            )
+            self._cu_kv_lens_gpu = torch.from_numpy(cu_kv).to(
+                self.device, non_blocking=True
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1855,8 +1878,16 @@ class GPUModelRunner(
 
         # SPANS: shift span tokens to span-relative positions (after slot_mapping
         # used absolute) so the layer's query RoPE matches the standalone chunk.
+        # Gather each scheduled token's lower bound from the flat per-KV-position
+        # array using (this token's request kv-start + its absolute position).
         if envs.VLLM_V1_SPANS_ENABLED:
-            positions_np -= self.span_attn_start.np[:total_num_scheduled_tokens]
+            sched_kv_indices = (
+                self._cu_kv_np[req_indices]
+                + positions_np[:total_num_scheduled_tokens]
+            )
+            positions_np[:total_num_scheduled_tokens] -= self._attn_lb_np[
+                sched_kv_indices
+            ]
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1907,8 +1938,9 @@ class GPUModelRunner(
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
-        if envs.VLLM_V1_SPANS_ENABLED:
-            self.span_attn_start.copy_to_gpu(total_num_scheduled_tokens)
+        # SPANS: attn_lower_bounds / cu_kv_lens are already on GPU (shipped
+        # via torch.from_numpy().to(..., non_blocking=True) in the spans
+        # build block above).
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -2094,11 +2126,10 @@ class GPUModelRunner(
             causal=True,
             cos_sin_cache=self._cos_sin_cache,
             rotary_dim=self._rotary_dim,
-            span_attn_start=(
-                self.span_attn_start.gpu[:num_tokens_padded]
-                if envs.VLLM_V1_SPANS_ENABLED
-                else None
-            ),
+            # SPANS attrs only exist when VLLM_V1_SPANS_ENABLED; the conftest's
+            # FR (full-recompute) mode flips that off mid-test, so use getattr.
+            attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
+            cu_kv_lens=getattr(self, "_cu_kv_lens_gpu", None),
         )
 
         if self.dcp_world_size > 1:
