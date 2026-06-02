@@ -159,6 +159,15 @@ def build_llm(
 
     _set_spans_env(monkeypatch, spans_enabled)
 
+    # The spans / Legolink RoPE + gap-policy plumbing (in-kernel cos_sin_cache,
+    # span block hashing, gap scheduler) lives in the V1 GPU model runner
+    # (vllm/v1/worker/gpu_model_runner.py). Upstream's newer V2 runner
+    # (vllm/v1/worker/gpu/model_runner.py) does not carry it yet, so force the
+    # V1 runner; otherwise cos_sin_cache never reaches the attention kernel and
+    # spans silently degrades to plain (unrotated-K) attention.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+
     # KV-cache snapshot helpers send a function to the workers via
     # collective_rpc; on a multiprocessing engine that payload must be
     # serializable. Set both ways: the env var is inherited by the spawned

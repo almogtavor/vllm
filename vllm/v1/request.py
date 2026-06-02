@@ -153,6 +153,10 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # External (connector/offload) computed tokens. Upstream tracks this as
+        # a local in the scheduler, but the spans gap-policy path reads it back
+        # off the request (sched/scheduler.py); keep the attribute initialized.
+        self.num_external_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
