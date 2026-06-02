@@ -166,9 +166,21 @@ class OpenAIServingRender:
 
         if self.reasoning_parser_cls is not None:
             reasoning_parser = self.reasoning_parser_cls(tokenizer)
-            reasoning_content, content = reasoning_parser.extract_reasoning(
-                request.text, request=parser_request
+            start_tok = getattr(reasoning_parser, "start_token", None)
+            end_tok = getattr(reasoning_parser, "end_token", None)
+            start_tok = start_tok if isinstance(start_tok, str) else None
+            end_tok = end_tok if isinstance(end_tok, str) else None
+            # Skip the parser when neither marker is in the text: a thinking
+            # parser would otherwise claim plain content as reasoning. A lone
+            # <think> still runs the parser (truncated mid-thought -> reasoning).
+            has_markers = start_tok is not None or end_tok is not None
+            text_has_marker = (start_tok and start_tok in request.text) or (
+                end_tok and end_tok in request.text
             )
+            if not has_markers or text_has_marker:
+                reasoning_content, content = reasoning_parser.extract_reasoning(
+                    request.text, request=parser_request
+                )
 
         tool_calls: list[ToolCall] = []
         tools_called = False

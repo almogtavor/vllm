@@ -87,3 +87,20 @@ async def test_reasoning_only_no_tool_parser():
     assert resp.reasoning_content == "my reasoning"
     assert resp.content == "the answer"
     assert resp.tools_called is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,ret,exp_r,exp_c,called",
+    [
+        ("how are you today?", ("x", None), None, "how are you today?", False),
+        ("ponder</think>reply", ("ponder", "reply"), "ponder", "reply", True),
+    ],
+)
+async def test_thinking_parser_marker_gate(text, ret, exp_r, exp_c, called):
+    rp = Mock(start_token="<think>", end_token="</think>")
+    rp.extract_reasoning.return_value = ret
+    h = _handler(Mock(return_value=rp))
+    resp = await h.parse_chat_output(ParseRequest(text=text))
+    assert (resp.reasoning_content, resp.content) == (exp_r, exp_c)
+    assert rp.extract_reasoning.called is called
