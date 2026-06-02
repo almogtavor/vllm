@@ -349,11 +349,11 @@ class CommonAttentionMetadata:
 
     # SPANS: per-KV-position causal lower bound. Flat int32 tensor sized by
     # sum(seq_lens) across this batch's requests. Indexed by
-    # `cu_kv_lens[seq_idx] + kv_position_within_request`. The attention kernel
+    # `req_kv_starts[seq_idx] + kv_position_within_request`. The attention kernel
     # uses it both Q-side (per-lane causal-window clamp) and K-side (per-key
     # RoPE shift so in-span K rotates at span-relative positions).
     attn_lower_bounds: torch.Tensor | None = None
-    cu_kv_lens: torch.Tensor | None = None
+    req_kv_starts: torch.Tensor | None = None
 
     causal: bool = True
 

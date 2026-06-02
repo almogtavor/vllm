@@ -183,14 +183,8 @@ def kernel_unified_attention_2d(
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
-    # SPANS: per-KV-position causal lower bound. Flat int32 array sized by
-    # sum(seq_lens) across requests in this batch. Indexed by
-    # `cu_kv_lens[seq_idx] + kv_position_within_request`. The Q-side load
-    # uses `context_len + query_pos` as the in-request KV position; the K-side
-    # load uses `seq_offset` directly. Used both for the per-lane attention
-    # clamp and for the per-key K-RoPE shift.
-    attn_lower_bounds_ptr: torch.Tensor | None = None,
-    cu_kv_lens_ptr: torch.Tensor | None = None,
+    attn_lower_bounds_ptr: torch.Tensor | None = None,  # SPANS: per-KV-pos lb
+    req_kv_starts_ptr: torch.Tensor | None = None,  # SPANS: per-req KV start
     USE_SPAN: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
@@ -336,30 +330,23 @@ def kernel_unified_attention_2d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    # SPANS: per-Q-lane lower bound. We shift the KV-tile iteration *base* to
-    # span_offset (the Q-block's smallest lower bound) — for an all-in-span
-    # Q-block this gives `seq_offset = span_offset + j*TILE_SIZE + offs_t`,
-    # so tile 0 covers `[span_offset, span_offset+TILE_SIZE)` instead of the
-    # absolute `[0, TILE_SIZE)`. Result: standalone (no-span) and in-prompt
-    # in-span Q-blocks iterate the SAME number of tiles, with the SAME merge
-    # pattern in online softmax — bit-exact across batch shapes regardless of
-    # whether span_start aligns with TILE_SIZE.
-    # For boundary Q-blocks (mixed lanes), tl.min collapses to 0 → no shift,
-    # falls back to per-lane seq_mask clamp.
+    # SPANS: re-base the KV-tile loop at the Q-block's smallest lower bound
+    # so tile 0 covers `[span_offset, +TILE_SIZE)` instead of absolute
+    # `[0, TILE_SIZE)`. Keeps the iteration shape (tile count + merge
+    # pattern) identical to the standalone reference even when span_start
+    # is mid-tile.
     span_offset: tl.int32 = 0
     if USE_SPAN:
-        req_kv_start = tl.load(cu_kv_lens_ptr + seq_idx)
+        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
         span_lb_vec = tl.load(
             attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
             mask=query_mask_0,
             other=INT32_MAX,
         )
+        # tl.min returns INT32_MAX (the `other=`) when all lanes are masked;
+        # guard with the seq prefix len so we don't iterate past valid keys.
         span_offset = tl.min(span_lb_vec)
-        # Guard: if every Q lane was masked, tl.min returns INT32_MAX (the
-        # `other=` value). That's not a valid base; fall back to 0.
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
-        # Re-base the tile grid relative to span_offset. tile indices now
-        # count up from span_offset, not from absolute 0.
         num_tiles = cdiv_fn(max_seq_prefix_len - span_offset, TILE_SIZE)
         tile_start = 0
         tile_end = num_tiles
@@ -369,9 +356,7 @@ def kernel_unified_attention_2d(
         seq_offset = span_offset + j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        # K-side per-key lower bound: same flat array indexed by this request's
-        # KV-position. Used by the per-key K-RoPE shift below so in-span keys
-        # rotate at span-relative positions even on a mid-tile boundary.
+        # SPANS: per-key K-RoPE shift via the same flat array.
         if USE_SPAN:
             key_span_lb = tl.load(
                 attn_lower_bounds_ptr + req_kv_start + seq_offset,
@@ -469,8 +454,6 @@ def kernel_unified_attention_2d(
                         0,
                     ),
                 )
-                # SPANS: per-key shift (key_span_lb has 0 outside spans);
-                # falls back to scalar span_offset (=0) when USE_SPAN is off.
                 key_pos_shift = key_span_lb[None, :] if USE_SPAN else span_offset
                 cos_offset = (
                     (seq_offset[None, :] - key_pos_shift) * stride_cs_cache_0
@@ -557,11 +540,8 @@ def kernel_unified_attention_2d(
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
-        # SPANS: per-lane span lower bound. A Q-block can carry mixed lanes
-        # (some prefix, some in-span) when a span boundary lands mid-tile; the
-        # cheap tile_start skip above takes tl.min over the block and collapses
-        # to the widest window, so this per-lane clamp is what guarantees each
-        # in-span lane only attends to keys at positions >= its own span_start.
+        # SPANS: per-lane clamp for boundary Q-blocks where span_offset
+        # collapsed to 0 via tl.min — keeps in-span lanes from seeing prefix.
         if USE_SPAN:
             seq_mask = seq_mask & (seq_offset[None, :] >= span_lb_vec[:, None])
 
@@ -1339,9 +1319,9 @@ def unified_attention(
     rotary_dim=0,
     # SPANS: per-KV-position causal lower bound. Flat int32 sized by
     # sum(seq_lens). Indexed inside the kernel as
-    # `cu_kv_lens[seq_idx] + kv_position_within_request`.
+    # `req_kv_starts[seq_idx] + kv_position_within_request`.
     attn_lower_bounds=None,
-    cu_kv_lens=None,
+    req_kv_starts=None,
 ):
     assert causal, "Only causal attention is supported"
     use_span = attn_lower_bounds is not None
@@ -1504,7 +1484,7 @@ def unified_attention(
             ROTARY_DIM=rotary_dim,
             KV_COMPUTE_DTYPE=kv_compute_dtype,
             attn_lower_bounds_ptr=attn_lower_bounds,
-            cu_kv_lens_ptr=cu_kv_lens,
+            req_kv_starts_ptr=req_kv_starts,
             USE_SPAN=use_span,
         )
     else:

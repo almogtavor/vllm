@@ -222,52 +222,28 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "prefix_blocks,block_size,force_tile_size,alignment_label",
+    "prefix_blocks,block_size,force_tile_size",
     [
-        # span_start = BLOCK_SIZE * 2 = 32 → multiple of TILE_SIZE_PREFILL (32).
-        # The KV boundary lands ON a tile boundary; a coarse tile_start skip is
-        # sufficient.
-        (2, 16, None, "tile-aligned"),
-        # span_start = BLOCK_SIZE = 16 → block-aligned but NOT a multiple of
-        # TILE_SIZE_PREFILL (32). A KV tile straddles the span boundary; even
-        # with the per-key K-RoPE shift, online-softmax tile-merge ordering
-        # differs from the standalone reference, so bit-exact fails by ULP.
-        (1, 16, None, "tile-unaligned"),
-        # block_size=32, TILE_SIZE_PREFILL forced to 16. Now blocks are *bigger*
-        # than tiles, so every block-aligned span_start is automatically
-        # tile-aligned (32 is a multiple of 16). Standalone and in-prompt should
-        # iterate the same tile count, and bit-exact should hold.
-        (1, 32, 16, "block-bigger-than-tile"),
+        (2, 16, None), # span_start=32 -> tile-aligned to TILE_SIZE_PREFILL=32
+        (1, 16, None), # span_start=16 -> block-aligned but mid-tile
+        (1, 32, 16), # block > tile: block-aligned span_start (tile-aligned)
     ],
     ids=["aligned", "unaligned", "block-bigger-than-tile"],
 )
 def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
-    model, monkeypatch, prefix_blocks, block_size, force_tile_size, alignment_label
+    model, monkeypatch, prefix_blocks, block_size, force_tile_size
 ):
     """Unwarmed PIC chunk, span in the middle (SPANS-PC, 3 requests A/B/C).
     A: cold prompt prefills fully and stores the chunk NONE_HASH-rooted; the
        span's K/V must be bit-identical to the chunk computed standalone.
     B: a new-prefix request run as-is reuses nothing (block 0 misses, run halts).
-    C: a third-prefix request with its prefix warmed reuses both prefix+chunk.
-
-    Three alignment regimes (see parametrize comments above): tile-aligned,
-    tile-unaligned (within a single block), and block-bigger-than-tile. The
-    bit-exact span K/V check hinges on standalone and in-prompt iterating the
-    same number of KV tiles in the kernel."""
+    C: a third-prefix request with its prefix warmed reuses both prefix+chunk."""
     _force_in_process_engine(monkeypatch)
     if force_tile_size is not None:
-        # Pin TILE_SIZE_PREFILL for this run (e.g. force a smaller tile than
-        # the kernel would default to, so block boundaries land on tile
-        # boundaries even when BLOCK_SIZE > default TILE_SIZE).
-        import vllm.v1.attention.ops.triton_unified_attention as _kernel_mod
+        import vllm.v1.attention.ops.triton_unified_attention as _kmod
         monkeypatch.setattr(
-            _kernel_mod, "_get_tile_size",
-            lambda head_size, sliding_window, element_size, is_prefill: (
-                force_tile_size if is_prefill else
-                _kernel_mod._is_gemma3_attention(head_size, sliding_window)
-                and 32
-                or (16 if element_size >= 2 else 32)
-            ),
+            _kmod, "_get_tile_size",
+            lambda head_size, sliding_window, element_size, is_prefill: force_tile_size,
         )
     prefix_len = block_size * prefix_blocks
     chunk = list(range(500, 500 + block_size * 2))
@@ -277,18 +253,16 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
     prefix_c = list(range(6000, 6000 + prefix_len))
     span_start = prefix_len
     cross_start = prefix_len + block_size * 2
-    sp = greedy_sp(
-        {"span_starts": [span_start], "cross_span_starts": [cross_start]}
-    )
+    sp = greedy_sp({"span_starts": [span_start], "cross_span_starts": [cross_start]})
     # Standalone reference (separate engine): the in-prompt span and a standalone chunk
     # collide on one NONE-rooted slot, so a second engine is the only way to compare.
     llm = build_llm(model, "SPANS-PC", monkeypatch, block_size=block_size)
     try:
         _warmup_prompt(llm, chunk)
-        standalone_hashes = _request_block_hashes(
-            chunk, span_starts=None, block_size=block_size
-        )
-        standalone_chunk_kv = [_block_kv(llm, h) for h in standalone_hashes]
+        standalone_chunk_kv = [
+            _block_kv(llm, h)
+            for h in _request_block_hashes(chunk, None, block_size=block_size)
+        ]
     finally:
         cleanup(llm)
     llm = build_llm(model, "SPANS-PC", monkeypatch, block_size=block_size)
@@ -306,15 +280,14 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
             prompt_a, [span_start], [cross_start], block_size=block_size
         )
         chained_chunk = _request_block_hashes(
-            prompt_a, span_starts=None, block_size=block_size
+            prompt_a, None, block_size=block_size
         )[prefix_blocks]
         full_prefill = all(cached(h) for h in stored)
-        # Span occupies blocks [prefix_blocks, prefix_blocks + 2).
-        span_block_slice = slice(prefix_blocks, prefix_blocks + 2)
-        chunk_none_rooted = all(
-            cached(h) for h in stored[span_block_slice]
-        ) and not cached(chained_chunk)
-        inprompt_chunk_kv = [_block_kv(llm, h) for h in stored[span_block_slice]]
+        span_blocks = slice(prefix_blocks, prefix_blocks + 2)
+        chunk_none_rooted = all(cached(h) for h in stored[span_blocks]) and not cached(
+            chained_chunk
+        )
+        inprompt_chunk_kv = [_block_kv(llm, h) for h in stored[span_blocks]]
 
         # B: different prefix, run as-is (unwarmed) - block 0 misses, no reuse.
         cached_b = _generate_num_cached_tokens(llm, prefix_b + chunk + tail, sp)
@@ -334,9 +307,8 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
     # 4th check: A's in-prompt span K/V must be bit-identical to standalone.
     for i, (ip, st) in enumerate(zip(inprompt_chunk_kv, standalone_chunk_kv)):
         assert torch.equal(ip, st), (
-            f"[{alignment_label}] span block {i} K/V from A's in-prompt prefill "
-            f"is not bit-identical to the standalone chunk - the PIC span is "
-            f"not position-invariant"
+            f"span block {i} K/V from A's in-prompt prefill is not bit-identical "
+            f"to the standalone chunk - the PIC span is not position-invariant"
         )
 
 
