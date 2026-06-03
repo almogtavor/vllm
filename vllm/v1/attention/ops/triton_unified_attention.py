@@ -335,11 +335,11 @@ def kernel_unified_attention_2d(
     span_offset: tl.int32 = 0
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-        span_lb_vec = tl.load(
+        q_lb_vec = tl.load(
             attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
             mask=query_mask_0, other=INT32_MAX)
         # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
-        span_offset = tl.min(span_lb_vec)
+        span_offset = tl.min(q_lb_vec)
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
         num_tiles = cdiv_fn(max_seq_prefix_len - span_offset, TILE_SIZE)
         tile_start, tile_end = 0, num_tiles
@@ -529,9 +529,6 @@ def kernel_unified_attention_2d(
         # Order must match FlexAttention: (causal AND sliding_window) OR mm_prefix
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
-
-        if USE_SPAN:  # per-lane clamp for boundary Q-blocks (span_offset = min)
-            seq_mask = seq_mask & (seq_offset[None, :] >= span_lb_vec[:, None])
 
         # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
         # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
