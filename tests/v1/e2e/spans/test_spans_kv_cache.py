@@ -229,10 +229,7 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
     A: cold prompt prefills fully and stores the chunk NONE_HASH-rooted; the
        span's K/V must be bit-identical to the chunk computed standalone.
     B: a new-prefix request run as-is reuses nothing (block 0 misses, run halts).
-    C: a third-prefix request with its prefix warmed reuses both prefix+chunk.
-
-    prefix_blocks=2 puts span_start at 32 (tile-aligned). prefix_blocks=1 puts
-    it at 16 (block-aligned but mid-tile) - exercises the kernel base-shift."""
+    C: a third-prefix request with its prefix warmed reuses both prefix+chunk."""
     _force_in_process_engine(monkeypatch)
     prefix_len = BLOCK_SIZE * prefix_blocks
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))

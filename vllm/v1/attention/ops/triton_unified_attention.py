@@ -330,11 +330,8 @@ def kernel_unified_attention_2d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    # SPANS: re-base the KV-tile loop at the Q-block's smallest lower bound
-    # so tile 0 covers `[span_offset, +TILE_SIZE)` instead of absolute
-    # `[0, TILE_SIZE)`. Keeps the iteration shape (tile count + merge
-    # pattern) identical to the standalone reference even when span_start
-    # is mid-tile.
+    # SPANS: rebase the KV-tile loop at the Q-block's smallest lower bound so
+    # iteration shape matches the standalone reference even when span_start is mid-tile.
     span_offset: tl.int32 = 0
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)

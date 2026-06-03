@@ -703,8 +703,7 @@ class GPUModelRunner(
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
         if envs.VLLM_V1_SPANS_ENABLED:
-            # SPANS: flat per-KV-position lower bound + per-request KV offsets,
-            # rebuilt per forward in _prepare_inputs.
+            # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
             self._attn_lower_bounds_gpu: torch.Tensor | None = None
             self._req_kv_starts_gpu: torch.Tensor | None = None
         self.query_start_loc = self._make_buffer(
@@ -1755,8 +1754,6 @@ class GPUModelRunner(
             out=positions_np,
         )
 
-        # SPANS: flat per-KV-position causal lower bound (Q-side mask +
-        # K-side RoPE shift in the kernel; Q-position shift on the host).
         if envs.VLLM_V1_SPANS_ENABLED:
             seq_lens_arr = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs]
@@ -1868,8 +1865,7 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
-        # SPANS: shift Q positions to span-relative (after slot_mapping used
-        # the absolute positions), so in-model RoPE matches standalone.
+        # SPANS: shift Q positions to span-relative (after slot_mapping uses absolute).
         if envs.VLLM_V1_SPANS_ENABLED:
             sched_kv_indices = (
                 self._req_kv_starts_np[req_indices]
@@ -2112,7 +2108,6 @@ class GPUModelRunner(
             causal=True,
             cos_sin_cache=self._cos_sin_cache,
             rotary_dim=self._rotary_dim,
-            # SPANS attrs only exist when VLLM_V1_SPANS_ENABLED.
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
         )

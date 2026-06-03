@@ -347,11 +347,8 @@ class CommonAttentionMetadata:
     cos_sin_cache: torch.Tensor | None = None
     rotary_dim: int = 0
 
-    # SPANS: per-KV-position causal lower bound. Flat int32 tensor sized by
-    # sum(seq_lens) across this batch's requests. Indexed by
-    # `req_kv_starts[seq_idx] + kv_position_within_request`. The attention kernel
-    # uses it both Q-side (per-lane causal-window clamp) and K-side (per-key
-    # RoPE shift so in-span K rotates at span-relative positions).
+    # SPANS: flat int32 per-KV-position causal lower bound; indexed via
+    # `req_kv_starts[seq_idx] + kv_pos`. Drives Q-side clamp + K-side RoPE shift.
     attn_lower_bounds: torch.Tensor | None = None
     req_kv_starts: torch.Tensor | None = None
 
