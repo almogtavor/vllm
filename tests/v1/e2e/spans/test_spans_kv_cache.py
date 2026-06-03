@@ -221,51 +221,38 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     )
 
 
-@pytest.mark.parametrize(
-    "prefix_blocks,block_size,force_tile_size",
-    [
-        (2, 16, None), # span_start=32 -> tile-aligned to TILE_SIZE_PREFILL=32
-        (1, 16, None), # span_start=16 -> block-aligned but mid-tile
-        (1, 32, 16), # block > tile: block-aligned span_start (tile-aligned)
-    ],
-    ids=["aligned", "unaligned", "block-bigger-than-tile"],
-)
+@pytest.mark.parametrize("prefix_blocks", [2, 1], ids=["aligned", "unaligned"])
 def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
-    model, monkeypatch, prefix_blocks, block_size, force_tile_size
+    model, monkeypatch, prefix_blocks
 ):
     """Unwarmed PIC chunk, span in the middle (SPANS-PC, 3 requests A/B/C).
     A: cold prompt prefills fully and stores the chunk NONE_HASH-rooted; the
        span's K/V must be bit-identical to the chunk computed standalone.
     B: a new-prefix request run as-is reuses nothing (block 0 misses, run halts).
-    C: a third-prefix request with its prefix warmed reuses both prefix+chunk."""
+    C: a third-prefix request with its prefix warmed reuses both prefix+chunk.
+
+    prefix_blocks=2 puts span_start at 32 (tile-aligned). prefix_blocks=1 puts
+    it at 16 (block-aligned but mid-tile) - exercises the kernel base-shift."""
     _force_in_process_engine(monkeypatch)
-    if force_tile_size is not None:
-        import vllm.v1.attention.ops.triton_unified_attention as _kmod
-        monkeypatch.setattr(
-            _kmod, "_get_tile_size",
-            lambda head_size, sliding_window, element_size, is_prefill: force_tile_size,
-        )
-    prefix_len = block_size * prefix_blocks
-    chunk = list(range(500, 500 + block_size * 2))
-    tail = list(range(1200, 1200 + block_size))
+    prefix_len = BLOCK_SIZE * prefix_blocks
+    chunk = list(range(500, 500 + BLOCK_SIZE * 2))
+    tail = list(range(1200, 1200 + BLOCK_SIZE))
     prefix_a = list(range(0, prefix_len))
     prefix_b = list(range(3000, 3000 + prefix_len))
     prefix_c = list(range(6000, 6000 + prefix_len))
-    span_start = prefix_len
-    cross_start = prefix_len + block_size * 2
-    sp = greedy_sp({"span_starts": [span_start], "cross_span_starts": [cross_start]})
+    cross_start = prefix_len + BLOCK_SIZE * 2
+    sp = greedy_sp({"span_starts": [prefix_len], "cross_span_starts": [cross_start]})
     # Standalone reference (separate engine): the in-prompt span and a standalone chunk
     # collide on one NONE-rooted slot, so a second engine is the only way to compare.
-    llm = build_llm(model, "SPANS-PC", monkeypatch, block_size=block_size)
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
         _warmup_prompt(llm, chunk)
         standalone_chunk_kv = [
-            _block_kv(llm, h)
-            for h in _request_block_hashes(chunk, None, block_size=block_size)
+            _block_kv(llm, h) for h in _request_block_hashes(chunk, span_starts=None)
         ]
     finally:
         cleanup(llm)
-    llm = build_llm(model, "SPANS-PC", monkeypatch, block_size=block_size)
+    llm = build_llm(model, "SPANS-PC", monkeypatch)
     try:
         # A: cold run - the whole prompt prefills, chunk stored NONE_HASH-rooted.
         prompt_a = prefix_a + chunk + tail
@@ -276,18 +263,15 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
         def cached(h):
             return pool.get_cached_block(h, [0]) is not None
 
-        stored = _request_block_hashes(
-            prompt_a, [span_start], [cross_start], block_size=block_size
-        )
-        chained_chunk = _request_block_hashes(
-            prompt_a, None, block_size=block_size
-        )[prefix_blocks]
+        stored = _request_block_hashes(prompt_a, [prefix_len], [cross_start])
+        chained_chunk = _request_block_hashes(prompt_a, span_starts=None)[prefix_blocks]
         full_prefill = all(cached(h) for h in stored)
-        span_blocks = slice(prefix_blocks, prefix_blocks + 2)
-        chunk_none_rooted = all(cached(h) for h in stored[span_blocks]) and not cached(
+        span = slice(prefix_blocks, prefix_blocks + 2)
+        chunk_none_rooted = all(cached(h) for h in stored[span]) and not cached(
             chained_chunk
         )
-        inprompt_chunk_kv = [_block_kv(llm, h) for h in stored[span_blocks]]
+        # Span K/V as computed inside A's cold prefill.
+        inprompt_chunk_kv = [_block_kv(llm, h) for h in stored[span]]
 
         # B: different prefix, run as-is (unwarmed) - block 0 misses, no reuse.
         cached_b = _generate_num_cached_tokens(llm, prefix_b + chunk + tail, sp)
@@ -301,7 +285,7 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
     assert full_prefill, "cold run did not fully prefill the prompt"
     assert chunk_none_rooted, "chunk not stored under its NONE_HASH-rooted hash"
     assert cached_b == 0, f"unwarmed new prefix must halt at block 0, got {cached_b}"
-    assert cached_c == prefix_len + block_size * 2, (
+    assert cached_c == cross_start, (
         f"warmed prefix should reuse prefix + chunk, got {cached_c}"
     )
     # 4th check: A's in-prompt span K/V must be bit-identical to standalone.

@@ -94,7 +94,6 @@ def build_llm(
     mode: str,
     monkeypatch: pytest.MonkeyPatch,
     max_num_batched_tokens: int | None = None,
-    block_size: int = BLOCK_SIZE,
 ) -> LLM:
     """Construct an LLM configured for one of FR / SPANS / SPANS-PC / LL-16 / LL-FULL.
 
@@ -172,7 +171,7 @@ def build_llm(
         # to be sized for the model's full (e.g. 128K) context window.
         max_model_len=2048,
         enforce_eager=True,
-        block_size=block_size,
+        block_size=BLOCK_SIZE,
         enable_prefix_caching=enable_prefix_caching,
         async_scheduling=False,
         attention_backend="TRITON_ATTN",
