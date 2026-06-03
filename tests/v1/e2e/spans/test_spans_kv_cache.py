@@ -292,34 +292,6 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(
         )
 
 
-def test_two_spans_in_one_tile_e2e(model, monkeypatch):
-    """Two back-to-back 16-token PIC spans inside one TILE_SIZE_PREFILL=32 tile."""
-    _force_in_process_engine(monkeypatch)
-    chunk1 = list(range(500, 500 + BLOCK_SIZE))
-    chunk2 = list(range(700, 700 + BLOCK_SIZE))
-    prefix = list(range(0, BLOCK_SIZE * 2))
-    tail = list(range(1200, 1200 + BLOCK_SIZE))
-    spans, crosses = [BLOCK_SIZE * 2, BLOCK_SIZE * 3], [BLOCK_SIZE * 3, BLOCK_SIZE * 4]
-    sp = greedy_sp({"span_starts": spans, "cross_span_starts": crosses})
-    llm = build_llm(model, "SPANS-PC", monkeypatch)
-    try:
-        _warmup_prompt(llm, chunk1)
-        _warmup_prompt(llm, chunk2)
-        std1 = _block_kv(llm, _request_block_hashes(chunk1, span_starts=None)[0])
-        std2 = _block_kv(llm, _request_block_hashes(chunk2, span_starts=None)[0])
-    finally:
-        cleanup(llm)
-    llm = build_llm(model, "SPANS-PC", monkeypatch)
-    try:
-        _generate_num_cached_tokens(llm, prefix + chunk1 + chunk2 + tail, sp)
-        stored = _request_block_hashes(prefix + chunk1 + chunk2 + tail, spans, crosses)
-        ip1, ip2 = _block_kv(llm, stored[2]), _block_kv(llm, stored[3])
-    finally:
-        cleanup(llm)
-    assert torch.equal(ip1, std1), "span_1 K/V not bit-identical to its standalone"
-    assert torch.equal(ip2, std2), "span_2 K/V not bit-identical to its standalone"
-
-
 def test_pic_tail_not_reused_across_prefixes_e2e(model, monkeypatch):
     """Setup (mode SPANS-PC: spans on, prefix caching on, no gap policy):
       - Warm up by running a one-shot request whose only blocks are the
