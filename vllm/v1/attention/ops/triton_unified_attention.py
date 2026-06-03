@@ -331,35 +331,28 @@ def kernel_unified_attention_2d(
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
     # SPANS: rebase the KV-tile loop at the Q-block's smallest lower bound so
-    # iteration shape matches the standalone reference even when span_start is mid-tile.
+    # iteration shape matches the standalone reference even at mid-tile span_start.
     span_offset: tl.int32 = 0
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
         span_lb_vec = tl.load(
             attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
-            mask=query_mask_0,
-            other=INT32_MAX,
-        )
-        # tl.min returns INT32_MAX (the `other=`) when all lanes are masked;
-        # guard with the seq prefix len so we don't iterate past valid keys.
+            mask=query_mask_0, other=INT32_MAX)
+        # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
         span_offset = tl.min(span_lb_vec)
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
         num_tiles = cdiv_fn(max_seq_prefix_len - span_offset, TILE_SIZE)
-        tile_start = 0
-        tile_end = num_tiles
+        tile_start, tile_end = 0, num_tiles
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
         seq_offset = span_offset + j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        # SPANS: per-key K-RoPE shift via the same flat array.
-        if USE_SPAN:
+        if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
             key_span_lb = tl.load(
                 attn_lower_bounds_ptr + req_kv_start + seq_offset,
-                mask=tile_mask,
-                other=0,
-            )
+                mask=tile_mask, other=0)
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -537,9 +530,7 @@ def kernel_unified_attention_2d(
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
-        # SPANS: per-lane clamp for boundary Q-blocks where span_offset
-        # collapsed to 0 via tl.min — keeps in-span lanes from seeing prefix.
-        if USE_SPAN:
+        if USE_SPAN:  # per-lane clamp for boundary Q-blocks (span_offset = min)
             seq_mask = seq_mask & (seq_offset[None, :] >= span_lb_vec[:, None])
 
         # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
@@ -1314,11 +1305,8 @@ def unified_attention(
     use_alibi_sqrt=False,
     cos_sin_cache=None,
     rotary_dim=0,
-    # SPANS: per-KV-position causal lower bound. Flat int32 sized by
-    # sum(seq_lens). Indexed inside the kernel as
-    # `req_kv_starts[seq_idx] + kv_position_within_request`.
-    attn_lower_bounds=None,
-    req_kv_starts=None,
+    attn_lower_bounds=None,  # SPANS: flat per-KV-pos lower bound
+    req_kv_starts=None,  # SPANS: per-req start into attn_lower_bounds
 ):
     assert causal, "Only causal attention is supported"
     use_span = attn_lower_bounds is not None

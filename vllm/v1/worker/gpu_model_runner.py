@@ -1755,37 +1755,30 @@ class GPUModelRunner(
         )
 
         if envs.VLLM_V1_SPANS_ENABLED:
-            seq_lens_arr = (
-                self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                + num_scheduled_tokens
-            )
+            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            seq_lens_arr = num_computed + num_scheduled_tokens
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
-                if req.is_gap_recompute: # context-aware (attends full prefix)
+                params = req.sampling_params
+                if req.is_gap_recompute or params is None:
                     continue
-                ea = req.sampling_params.extra_args if req.sampling_params else None
+                ea = params.extra_args
                 spans = ea.get("span_starts") if ea else None
                 if not spans:
                     continue
-                crosses = (ea.get("cross_span_starts") if ea else None) or []
-                req_start = int(req_kv_starts[i])
-                req_len = int(seq_lens_arr[i])
+                crosses = ea.get("cross_span_starts") or []
+                req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
                 for j, span_start in enumerate(spans):
-                    cr = crosses[j] if j < len(crosses) else req_len
-                    attn_lb[req_start + int(span_start) : req_start + int(cr)] = (
-                        span_start
-                    )
-            self._attn_lb_np = attn_lb  # reused for Q-position shift below
-            self._req_kv_starts_np = req_kv_starts
+                    cross = crosses[j] if j < len(crosses) else req_len
+                    attn_lb[req_start + span_start : req_start + cross] = span_start
+            self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True
-            )
+                self.device, non_blocking=True)
             self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True
-            )
+                self.device, non_blocking=True)
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)

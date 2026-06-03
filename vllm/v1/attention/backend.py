@@ -347,10 +347,8 @@ class CommonAttentionMetadata:
     cos_sin_cache: torch.Tensor | None = None
     rotary_dim: int = 0
 
-    # SPANS: flat int32 per-KV-position causal lower bound; indexed via
-    # `req_kv_starts[seq_idx] + kv_pos`. Drives Q-side clamp + K-side RoPE shift.
-    attn_lower_bounds: torch.Tensor | None = None
-    req_kv_starts: torch.Tensor | None = None
+    attn_lower_bounds: torch.Tensor | None = None  # SPANS: per-KV-pos lower bound
+    req_kv_starts: torch.Tensor | None = None  # SPANS: per-req start into attn_lb
 
     causal: bool = True
 
