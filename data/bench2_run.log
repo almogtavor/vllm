@@ -1,0 +1,79 @@
+===== BENCH2 MODE 0 =====
+[m0] 2D straddle sw=128  min=0.1490 med=0.1513
+[m0] 2D straddle sw=256  min=0.1914 med=0.1947
+[m0] 2D straddle sw=512  min=0.2811 med=0.2847
+[m0] 2D straddle sw=1024  min=0.4569 med=0.4616
+[m0] 2D straddle sw=2048  min=0.8102 med=0.8181
+[m0] 2D straddle sw=4096  min=1.5272 med=1.5376
+[m0] 2D avg     sw=128  min=0.1445 med=0.1474
+[m0] 2D avg     sw=256  min=0.1902 med=0.1929
+[m0] 2D avg     sw=512  min=0.2778 med=0.2815
+[m0] 2D avg     sw=1024  min=0.4569 med=0.4607
+[m0] 2D avg     sw=2048  min=0.8102 med=0.8151
+[m0] 2D avg     sw=4096  min=1.5264 med=1.5319
+[m0] 3D straddle sw=128 ns=2  min=0.1079 med=0.1142
+[m0] 3D straddle sw=128 ns=8  min=0.1072 med=0.1101
+[m0] 3D straddle sw=256 ns=2  min=0.1066 med=0.1093
+[m0] 3D straddle sw=256 ns=8  min=0.1064 med=0.1091
+[m0] 3D straddle sw=512 ns=2  min=0.1069 med=0.1092
+[m0] 3D straddle sw=512 ns=8  min=0.1068 med=0.1094
+[m0] 3D straddle sw=1024 ns=2  min=0.1055 med=0.1089
+[m0] 3D straddle sw=1024 ns=8  min=0.1068 med=0.1099
+[m0] 3D straddle sw=2048 ns=2  min=0.1067 med=0.1095
+[m0] 3D straddle sw=2048 ns=8  min=0.1212 med=0.1238
+[m0] 3D straddle sw=4096 ns=2  min=0.1069 med=0.1099
+[m0] 3D straddle sw=4096 ns=8  min=0.1510 med=0.1539
+[m0] BENCH2 DONE
+===== BENCH2 MODE 1 =====
+[m1] 2D straddle sw=128  min=0.1389 med=0.1413
+[m1] 2D straddle sw=256  min=0.1819 med=0.1854
+[m1] 2D straddle sw=512  min=0.2753 med=0.2783
+[m1] 2D straddle sw=1024  min=0.4552 med=0.4606
+[m1] 2D straddle sw=2048  min=0.8181 med=0.8234
+[m1] 2D straddle sw=4096  min=1.5468 med=1.5526
+[m1] 2D avg     sw=128  min=0.1372 med=0.1397
+[m1] 2D avg     sw=256  min=0.1838 med=0.1870
+[m1] 2D avg     sw=512  min=0.2731 med=0.2770
+[m1] 2D avg     sw=1024  min=0.4568 med=0.4609
+[m1] 2D avg     sw=2048  min=0.8202 med=0.8243
+[m1] 2D avg     sw=4096  min=1.5521 med=1.5580
+[m1] 3D straddle sw=128 ns=2  min=0.1086 med=0.1171
+[m1] 3D straddle sw=128 ns=8  min=0.1090 med=0.1112
+[m1] 3D straddle sw=256 ns=2  min=0.1079 med=0.1111
+[m1] 3D straddle sw=256 ns=8  min=0.1076 med=0.1104
+[m1] 3D straddle sw=512 ns=2  min=0.1086 med=0.1112
+[m1] 3D straddle sw=512 ns=8  min=0.1078 med=0.1103
+[m1] 3D straddle sw=1024 ns=2  min=0.1073 med=0.1111
+[m1] 3D straddle sw=1024 ns=8  min=0.1089 med=0.1117
+[m1] 3D straddle sw=2048 ns=2  min=0.1075 med=0.1144
+[m1] 3D straddle sw=2048 ns=8  min=0.1227 med=0.1253
+[m1] 3D straddle sw=4096 ns=2  min=0.1084 med=0.1110
+[m1] 3D straddle sw=4096 ns=8  min=0.1523 med=0.1548
+[m1] BENCH2 DONE
+===== BENCH2 MODE 2 =====
+[m2] 2D straddle sw=128  min=0.1393 med=0.1422
+[m2] 2D straddle sw=256  min=0.1831 med=0.1863
+[m2] 2D straddle sw=512  min=0.2770 med=0.2827
+[m2] 2D straddle sw=1024  min=0.4523 med=0.4583
+[m2] 2D straddle sw=2048  min=0.8153 med=0.8213
+[m2] 2D straddle sw=4096  min=1.5465 med=1.5530
+[m2] 2D avg     sw=128  min=0.1379 med=0.1407
+[m2] 2D avg     sw=256  min=0.1845 med=0.1869
+[m2] 2D avg     sw=512  min=0.2745 med=0.2780
+[m2] 2D avg     sw=1024  min=0.4571 med=0.4614
+[m2] 2D avg     sw=2048  min=0.8202 med=0.8255
+[m2] 2D avg     sw=4096  min=1.5525 med=1.5583
+[m2] 3D straddle sw=128 ns=2  min=0.1096 med=0.1124
+[m2] 3D straddle sw=128 ns=8  min=0.1092 med=0.1152
+[m2] 3D straddle sw=256 ns=2  min=0.1092 med=0.1114
+[m2] 3D straddle sw=256 ns=8  min=0.1085 med=0.1118
+[m2] 3D straddle sw=512 ns=2  min=0.1085 med=0.1108
+[m2] 3D straddle sw=512 ns=8  min=0.1084 med=0.1111
+[m2] 3D straddle sw=1024 ns=2  min=0.1078 med=0.1116
+[m2] 3D straddle sw=1024 ns=8  min=0.1084 med=0.1116
+[m2] 3D straddle sw=2048 ns=2  min=0.1084 med=0.1116
+[m2] 3D straddle sw=2048 ns=8  min=0.1237 med=0.1264
+[m2] 3D straddle sw=4096 ns=2  min=0.1090 med=0.1151
+[m2] 3D straddle sw=4096 ns=8  min=0.1528 med=0.1554
+[m2] BENCH2 DONE
+ALL_BENCH2_DONE
