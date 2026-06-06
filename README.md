@@ -35,9 +35,16 @@ on the same GPU, so the comparison is fully controlled.
 
 * Per SW/chunked decode step, the window-aligned start removes **one KV tile**
   (`TILE_SIZE` keys of KV-cache load + the corresponding QK^T/PV MMA) on
-  ~`(TILE-1)/TILE` of steps (~97% for the 2D `TILE=32` path, ~94% for the 3D
-  `TILE=16` path), for every standard window (a multiple of `TILE_SIZE`).
-* Measured 2D-path kernel latency reduction on a tile-saving step:
-  **6.8% (W=128), 4.9% (W=256), 2.0% (W=512)**, tracking `1/⌈W/T⌉`.
-* The 3D base-shift makes the **3D-segmented** path bit-exact across batch shapes (previously
-  bf16-ULP drift) and removes the same leading masked tile.
+  ~`(TILE-1)/TILE` of steps (~97% for the 2D `TILE=32` path), for every standard
+  window (a multiple of `TILE_SIZE`). As a share of the SW layer's attention
+  it's `TILE/W`.
+* Exact FLOPs/KV-load removed at realistic windows (per generated token, summed
+  over the model's sliding-window layers, `TILE=32`):
+  * **Gemma-3-27B, W=1024**: 3.0% of SW-attention - 26 MFLOP + 12.6 MiB KV/token.
+  * **Mistral-7B, W=4096**: 0.8% of SW-attention - 16 MFLOP + 3.9 MiB KV/token.
+* Measured kernel latency at those realistic windows is **within the ±1.5% noise
+  band**; it only becomes a mover for sub-1k windows (6.8% / 4.9% / 2.0% at
+  W=128 / 256 / 512, the gpt-oss-style exception).
+* The unconditional win is **bit-exactness**: the 2D base-shift (this PR) makes
+  the 2D path byte-identical across batch shapes, and the 3D base-shift extends
+  that to the split-KV decode path (both previously bf16-ULP drift).
