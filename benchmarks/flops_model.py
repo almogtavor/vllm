@@ -103,7 +103,7 @@ axB.axhline(0, color="grey", lw=0.8)
 axB.set_xscale("log", base=2)
 axB.set_xlabel("sliding-window size  W  (keys)", fontsize=11)
 axB.set_ylabel("kernel latency reduction  (%)", fontsize=11)
-axB.set_title("(B) Measured 2D-path (V1) latency reduction on H100\n"
+axB.set_title("(B) Measured 2D-path latency reduction on H100\n"
               "batch=256 decode, bf16, head=128 (16 q / 8 kv heads)", fontsize=11)
 axB.grid(True, which="both", alpha=0.3)
 axB.legend(fontsize=9)
@@ -113,10 +113,10 @@ fig.savefig(f"{ASSET}/pr44584_flops_savings.png", dpi=130, bbox_inches="tight")
 print(f"\nwrote {ASSET}/pr44584_flops_savings.png")
 
 # =====================================================================
-# Figure 2: bit-exactness across batch shapes (OLD / V1 / V2 x 2D / 3D)
+# Figure 2: bit-exactness across batch shapes (OLD / 2D / 3D stages x 2D / 3D paths)
 # =====================================================================
 fig2, ax = plt.subplots(figsize=(7.2, 3.6))
-modes = ["OLD\n(baseline)", "V1\n(PR #44584)", "V2\n(+3D)"]
+modes = ["OLD\n(baseline)", "2D\n(this PR)", "3D\n(follow-up)"]
 paths = ["2D pointer path", "3D-segmented path"]
 # 1 = bit-exact (good), 0 = drifts
 grid = np.array([
