@@ -52,9 +52,10 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # skip_special_tokens=True).
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
-        self.new_turn_token_id = self.vocab["<|turn>"]
-        self.tool_call_token_id = self.vocab["<|tool_call>"]
-        self.tool_response_token_id = self.vocab["<|tool_response>"]
+        _ctid = self.model_tokenizer.convert_tokens_to_ids
+        self.new_turn_token_id = self.vocab.get("<|turn>") or _ctid("<|turn>")
+        self.tool_call_token_id = self.vocab.get("<|tool_call>") or _ctid("<|tool_call>")
+        self.tool_response_token_id = self.vocab.get("<|tool_response>") or _ctid("<|tool_response>")
 
     def adjust_request(
         self, request: "ChatCompletionRequest | ResponsesRequest"

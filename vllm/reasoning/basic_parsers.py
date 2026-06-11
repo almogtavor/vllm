@@ -61,6 +61,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         start_token_id = self.vocab.get(self.start_token)
         end_token_id = self.vocab.get(self.end_token)
+        if start_token_id is None:
+            start_token_id = self.model_tokenizer.convert_tokens_to_ids(self.start_token)
+        if end_token_id is None:
+            end_token_id = self.model_tokenizer.convert_tokens_to_ids(self.end_token)
         if start_token_id is None or end_token_id is None:
             raise RuntimeError(
                 f"{self.__class__.__name__} reasoning parser could not locate "
