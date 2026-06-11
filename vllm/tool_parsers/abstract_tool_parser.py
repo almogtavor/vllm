@@ -101,8 +101,13 @@ class ToolParser:
     @cached_property
     def vocab(self) -> dict[str, int]:
         # NOTE: Only PreTrainedTokenizerFast is guaranteed to have .vocab
-        # whereas all tokenizers have .get_vocab()
-        return self.model_tokenizer.get_vocab()
+        # whereas all tokenizers have .get_vocab(). get_vocab() can omit added
+        # special tokens (e.g. gemma-4 <|tool_call>), so merge get_added_vocab().
+        vocab = dict(self.model_tokenizer.get_vocab())
+        get_added = getattr(self.model_tokenizer, "get_added_vocab", None)
+        if get_added is not None:
+            vocab.update(get_added())
+        return vocab
 
     def adjust_request(
         self,
