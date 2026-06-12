@@ -645,8 +645,16 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
+        # SPANS only (cos_sin_cache is set just when VLLM_V1_SPANS_ENABLED): rotate
+        # K in-kernel with THIS layer's RoPE. Models with per-layer-type RoPE
+        # (e.g. gemma-4's local vs global theta) need each layer's own cache; the
+        # metadata carries only the first layer's, which mis-rotates the rest.
+        # Uniform-RoPE models keep the shared cache. FR (cache is None) is untouched.
         cos_sin_cache = attn_metadata.cos_sin_cache
         rotary_dim = attn_metadata.rotary_dim
+        if cos_sin_cache is not None:
+            cos_sin_cache = getattr(layer, "spans_cos_sin_cache", cos_sin_cache)
+            rotary_dim = getattr(layer, "spans_rotary_dim", rotary_dim)
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 

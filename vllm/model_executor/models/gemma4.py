@@ -501,6 +501,12 @@ class Gemma4Attention(nn.Module):
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
             prefix=f"{prefix}.attn",
         )
+        # SPANS: gemma-4 uses per-layer-type RoPE - sliding layers use a local
+        # theta and full rotary; full layers use a global theta and partial
+        # rotary (0.25). Expose this layer's cache + rotary_dim so the in-kernel
+        # span rotation matches, instead of the shared first-layer values.
+        self.attn.spans_cos_sin_cache = self.rotary_emb.cos_sin_cache
+        self.attn.spans_rotary_dim = self.rotary_emb.rotary_dim
 
     def forward(
         self,

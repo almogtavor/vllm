@@ -103,6 +103,31 @@ def test_all_configs_match_full_recompute(model, monkeypatch):
     assert not drifts, "mode equivalence failed:\n\n" + "\n\n".join(drifts)
 
 
+def test_per_layer_rope_spans_match_full_recompute(model, monkeypatch):
+    """Regression: models with per-layer-type RoPE (e.g. gemma-4, whose sliding
+    layers use a local theta and full layers a global theta) must still get
+    SPANS == FR. The in-kernel span K-rotation has to use each layer's own
+    cos_sin_cache; using the shared first-layer cache mis-rotates the other
+    layers and silently corrupts generation. Trivially holds for uniform-RoPE
+    models (Qwen/Llama); the real coverage is SPANS_TEST_MODEL=google/gemma-4-*.
+    """
+    prompt_tokens = list(range(0, BLOCK_SIZE * 4))
+    out = {}
+    for mode in ("FR", "SPANS"):
+        llm = build_llm(model, mode, monkeypatch)
+        try:
+            o = generate_single_output(
+                llm, prompt_tokens, greedy_sp(None, logprobs=LOGPROBS_TOPK)
+            ).outputs[0]
+            out[mode] = (o.text, extract_step0_topk(o, LOGPROBS_TOPK))
+        finally:
+            cleanup(llm)
+    assert out["SPANS"] == out["FR"], (
+        "SPANS != FR — per-layer RoPE not honored by the span kernel\n"
+        f"  FR:    {out['FR'][0]!r}\n  SPANS: {out['SPANS'][0]!r}"
+    )
+
+
 def test_block_size_constant_matches_conftest():
     """Defensive: tests assume block_size == 16. If conftest changes, tests
     that rely on PIC alignment must be revisited."""
