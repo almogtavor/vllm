@@ -416,23 +416,33 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], prepend: bool = False
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            prepend: Whether to put newly-free blocks at the front of the free
+                queue to be prioritized for reuse.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        # Remove duplicates while preserving order
+        # Remove duplicates while preserving order (spans can reference the same
+        # block more than once; dedup before freeing to avoid double-adding it to
+        # the free queue).
         dedup_bl = list({block.block_id: block for block in blocks_list}.values())
-        self.free_block_queue.append_n(
-            [block for block in dedup_bl if block.ref_cnt == 0 and not block.is_null]
-        )
+        freed_blocks = [
+            block for block in dedup_bl if block.ref_cnt == 0 and not block.is_null
+        ]
+        if prepend:
+            self.free_block_queue.prepend_n(freed_blocks)
+        else:
+            self.free_block_queue.append_n(freed_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
