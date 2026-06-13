@@ -204,10 +204,24 @@ def build_llm(
 
 def cleanup(llm: LLM | None) -> None:
     if llm is not None:
+        # The caller still holds `llm`, so `del` alone won't collect the engine;
+        # shut it down explicitly so its (subprocess) GPU memory is freed now -
+        # a 62GB model can't co-reside with the next build in the same process.
+        try:
+            llm.llm_engine.engine_core.shutdown()
+        except Exception:
+            pass
         del llm
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        import time
+
+        for _ in range(60):
+            free, total = torch.cuda.mem_get_info()
+            if free / total > 0.5:
+                break
+            time.sleep(1)
 
 
 def extract_step0_topk(out, topk: int = 10) -> list[tuple[int, float]]:
