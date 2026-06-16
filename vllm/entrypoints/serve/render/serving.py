@@ -289,8 +289,14 @@ class OpenAIServingRender:
 
         tool_calls: list[ToolCall] = []
         tools_called = False
-        if self.tool_parser is not None and content is not None:
-            tool_parser = self.tool_parser(tokenizer)
+        # The harmony refactor (PR #45464) folded the tool/reasoning parsers into
+        # the combined self.parser; the tool parser class is reached via
+        # self.parser.tool_parser_cls (see render_chat_request / build_parser).
+        tool_parser_cls = (
+            self.parser.tool_parser_cls if self.parser is not None else None
+        )
+        if tool_parser_cls is not None and content is not None:
+            tool_parser = tool_parser_cls(tokenizer)
             info = tool_parser.extract_tool_calls(content, request=parser_request)
             tools_called = info.tools_called
             tool_calls = info.tool_calls
