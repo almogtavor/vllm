@@ -432,8 +432,12 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+        # Remove duplicates while preserving order (spans can reference the same
+        # block more than once; dedup before freeing to avoid double-adding it to
+        # the free queue).
+        dedup_bl = list({block.block_id: block for block in blocks_list}.values())
         freed_blocks = [
-            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+            block for block in dedup_bl if block.ref_cnt == 0 and not block.is_null
         ]
         if prepend:
             self.free_block_queue.prepend_n(freed_blocks)

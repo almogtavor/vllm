@@ -143,6 +143,13 @@ class SchedulerConfig:
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
 
+    watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
+    """Fraction of total KV cache blocks to keep free (the watermark) when
+    admitting waiting or preempted requests into the running queue. This headroom
+    helps avoid frequent KV cache eviction and the resulting repeated preemption
+    of requests when GPU memory is scarce. Must be in the range [0.0, 1.0); 0.0
+    (the default) disables the watermark."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -153,6 +160,16 @@ class SchedulerConfig:
     A smaller value (1) makes streaming smoother by sending each token immediately,
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
+
+    gap_policy_name: str | None = None
+    """Name of the gap policy to use for KV cache recomputation.
+    Available policies: 'none', 'span_aware', or None (no gaps).
+    Gap policies decide where to insert recomputation gaps within prefix-cached
+    tokens, working uniformly across local and external KV caches."""
+
+    gap_policy_config: dict[str, Any] | None = None
+    """Configuration dictionary for the gap policy.
+    The specific fields depend on the chosen gap_policy_name."""
 
     @staticmethod
     def default_factory(**kwargs):
@@ -175,12 +192,13 @@ class SchedulerConfig:
 
             return Scheduler
 
-        # This warning can be removed once the Scheduler interface is
-        # finalized and we can maintain support for scheduler classes that
-        # implement it
+        # The first half of this warning can be removed once the Scheduler interface is
+        # finalized and we can maintain support for scheduler classes that implement it
         logger.warning_once(
-            "Using custom scheduler class %s. This scheduler interface is "
-            "not public and compatibility may not be maintained.",
+            "Using custom scheduler class %s. This scheduler interface is not public "
+            "and compatibility may not be maintained. If you have subclassed Scheduler "
+            "instead of AsyncScheduler, you will see degraded performance due to async "
+            "scheduling being disabled.",
             self.scheduler_cls,  # type: ignore[arg-type]
         )
         if not isinstance(self.scheduler_cls, str):

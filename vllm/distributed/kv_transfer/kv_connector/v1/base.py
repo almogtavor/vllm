@@ -485,6 +485,84 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_computed_token_gaps(
+        self,
+        request: "Request",
+    ) -> list[tuple[int, int]] | None:
+        """
+        Report token-index gaps within the request's currently computed-token range.
+
+        **DEPRECATED**: This method is deprecated in favor of scheduler-level GapPolicy.
+        Gap policy decisions should be made at the scheduler level using the GapPolicy
+        abstraction. Connectors should only report external-cache-specific issues via
+        get_external_cache_hints().
+
+        This method is maintained for backward compatibility and will be removed
+        in a future version.
+
+        This API enables non-consecutive external KV cache hits. While
+        `num_computed_tokens` represents the request's current computed-token watermark,
+        some token positions within `[0, num_computed_tokens)` may still lack usable KV
+        and must be recomputed. Such missing/invalid intervals are reported as "gaps".
+
+        Args:
+            request (Request): The request object.
+
+        Returns:
+            An optional list of gap intervals. Each gap is a pair `(start, end)`
+            denoting the half-open interval `[start, end)` of prompt token indices
+            in `[0, num_computed_tokens)` whose KV must be recomputed.
+
+            The list must satisfy:
+                - For each `[start, end)`: `0 <= start < end <= num_computed_tokens`
+                - Intervals must be strictly increasing and non-overlapping: for
+                  consecutive intervals `[start_i, end_i)`, `[start_{i+1}, end_{i+1})`:
+                  `end_i < start_{i+1}`
+
+            An empty list or `None` means KV is usable for all tokens in
+            `[0, num_computed_tokens)`.
+
+        Notes:
+            - The scheduler should recompute KV for the returned gap intervals, while
+              assuming KV is already available for the complement of those intervals
+              within `[0, num_computed_tokens)`.
+            - This method does not change the meaning of `get_num_new_matched_tokens()`.
+              The latter reports the number of externally matched tokens beyond locally
+              computed tokens, thereby defining the computed-token range. This API then
+              refines that range by reporting any internal gaps.
+        """
+
+    def get_external_cache_hints(
+        self,
+        request: "Request",
+    ) -> list[tuple[int, int]]:
+        """
+        Report intervals within external tokens that are invalid/unavailable.
+
+        This method allows connectors to report external-cache-specific issues
+        (corruption, partial loads, etc.) that should be treated as gaps.
+        These hints are merged with policy-driven gaps by the scheduler.
+
+        Unlike get_computed_token_gaps(), this method only reports issues with
+        external tokens, not policy-driven gaps. Gap policy decisions are now
+        handled at the scheduler level using the GapPolicy abstraction.
+
+        Args:
+            request: The request object
+
+        Returns:
+            List of (start, end) tuples representing half-open intervals [start, end)
+            within external tokens that are invalid and must be recomputed.
+            Empty list means all external tokens are valid.
+
+        Note:
+            This is the preferred API for connectors to report cache issues.
+            get_computed_token_gaps() is deprecated and maintained for backward
+            compatibility only.
+        """
+        return []
+        return None
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -568,6 +646,18 @@ class KVConnectorBase_V1(ABC):
             New KV cache events since the last call.
         """
         return ()
+
+    def has_pending_push_work(self) -> bool:
+        """Return True if the connector has push-mode work that requires
+        the engine main loop to keep stepping (e.g. a P-side request whose
+        KV blocks are waiting to be WRITTEN to a D node).
+
+        Connectors that don't implement push-based KV transfer should
+        leave this as False.
+        """
+        # TODO: replace with a more general connector hook for keeping the
+        # scheduler alive (e.g. extend has_unfinished_requests).
+        return False
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

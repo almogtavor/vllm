@@ -215,6 +215,9 @@ def kernel_unified_attention(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    USE_CAUSAL: tl.constexpr,  # bool
+    USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
+    per_seq_causal_ptr,  # [num_seqs] bool, or None
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
@@ -271,6 +274,17 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    # Fused span-relative RoPE (spans / Legolink). When ``FUSE_ROPE`` is set,
+    # K is stored un-rotated and rotated here per-tile using ``cos_sin_cache``
+    # indexed by span-relative key position; Q/K are loaded in halves and the
+    # score is the sum of the two half dots. Disabled (constexpr False) leaves
+    # the upstream path untouched (dead-code-eliminated at compile time).
+    cos_sin_cache_ptr=None,
+    stride_cs_cache_0: tl.int64 = 0,
+    stride_cs_cache_1: tl.constexpr = 0,
+    FUSE_ROPE: tl.constexpr = False,
+    ROTARY_DIM: tl.constexpr = 0,  # 0 means rotary_dim == head_size
+    KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -389,6 +403,8 @@ def kernel_unified_attention(
         SLIDING_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
+        USE_CAUSAL,
+        USE_PER_SEQ_CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
     )
@@ -448,25 +464,96 @@ def kernel_unified_attention(
                 + offs_d[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
+            if FUSE_ROPE:
+                # K is stored un-rotated. Rotate the FULL K tile in fp32 here to
+                # match the FR CUDA rotary kernel
+                # (csrc/libtorch_stable/pos_encoding_kernels.cu), which upcasts
+                # to float, rotates, and rounds to the cache dtype once. Then use
+                # a single full dot (matching FR's tl.dot(Q, K)) so the fp32
+                # accumulation order is identical. ROTARY_DIM <= 0 (or >= head)
+                # means rotary covers the whole head; otherwise only [0,
+                # ROTARY_DIM) rotates and the rest passes through (cos -> 1.0,
+                # sin -> 0.0 outside the rotary span).
+                ROT: tl.constexpr = (
+                    HEAD_SIZE
+                    if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE)
+                    else ROTARY_DIM
+                )
+                HALF_ROT: tl.constexpr = ROT // 2
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_raw_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                # neox pairing: x-part (d < HALF_ROT) pairs with d + HALF_ROT,
+                # y-part ([HALF_ROT, ROT)) pairs with d - HALF_ROT.
+                x_part = offs_d < HALF_ROT
+                partner_d = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + partner_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                rope_mask = (offs_d[:, None] < ROT) & tile_mask[None, :]
+                cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
+                cos_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
+                )
+                sin_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset, mask=rope_mask, other=1.0
+                ).to(tl.float32)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset, mask=rope_mask, other=0.0
+                ).to(tl.float32)
+                rope_sign = tl.where(x_part, -1.0, 1.0)
+                if K_raw_load.dtype.is_fp8():
+                    k_sc = tl.load(k_scale)
+                    K_raw_f = K_raw_load.to(tl.float32) * k_sc
+                    K_partner_f = K_partner_load.to(tl.float32) * k_sc
+                else:
+                    K_raw_f = K_raw_load.to(tl.float32)
+                    K_partner_f = K_partner_load.to(tl.float32)
+                K_rot = (
+                    K_raw_f * cos + rope_sign[:, None] * K_partner_f * sin
+                ).to(KV_COMPUTE_DTYPE)
+            else:
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
             # V : (TILE_SIZE, HEAD_SIZE)
             V_load = tl.load(
                 value_cache_ptr + v_offset,
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+        if not FUSE_ROPE:
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
@@ -493,17 +580,23 @@ def kernel_unified_attention(
             query_abs_pos,
             seq_offset,
             seq_idx,
+            seq_len,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
+            USE_CAUSAL,
+            USE_PER_SEQ_CAUSAL,
+            per_seq_causal_ptr,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
         )
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if FUSE_ROPE:
+            S += score_scale * tl.dot(Q, K_rot)
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -532,11 +625,19 @@ def kernel_unified_attention(
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
-            V = tl.where(
-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
-                V,
-                0.0,
-            )
+            dist = context_len + qpos_lo - seq_offset[:, None]
+            if USE_PER_SEQ_CAUSAL:
+                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                sw_mask_v = tl.where(
+                    is_causal_seq,
+                    dist < SLIDING_WINDOW,
+                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                )
+            elif USE_CAUSAL:
+                sw_mask_v = dist < SLIDING_WINDOW
+            else:
+                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+            V = tl.where(sw_mask_v, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
@@ -801,10 +902,32 @@ def unified_attention(
     # The non-TD branch is dead-code-eliminated at Triton compile time so
     # disabling this flag costs nothing.
     use_td: bool = False,
+    # Fused span-relative RoPE (spans / Legolink). When ``cos_sin_cache`` is
+    # provided, K is stored un-rotated and rotated inside the kernel using
+    # ``cos_sin_cache`` indexed by span-relative key position. ``rotary_dim``
+    # of 0 means rotary_dim == head_size (full rotary).
+    cos_sin_cache=None,
+    rotary_dim=0,
 ):
-    assert causal, "Only causal attention is supported"
+    # Resolve causal: bool or per-seq tensor.
+    use_per_seq_causal = isinstance(causal, torch.Tensor)
+    use_causal = bool(causal) if not use_per_seq_causal else True
+    per_seq_causal_ptr = causal if use_per_seq_causal else None
+
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+    fuse_rope = cos_sin_cache is not None
+    # Compute dtype for in-kernel RoPE + key cast, matching the layer-side RoPE
+    # dtype. For fp8 caches keep fp16 (the dequant path lands there).
+    if k.dtype == torch.bfloat16:
+        kv_compute_dtype = tl.bfloat16
+    elif k.dtype == torch.float16:
+        kv_compute_dtype = tl.float16
+    elif k.dtype == torch.float32:
+        kv_compute_dtype = tl.float32
+    else:
+        kv_compute_dtype = tl.float16
 
     use_per_token_head_scales = kv_quant_mode in (
         KVQuantMode.INT8_PER_TOKEN_HEAD,
@@ -841,6 +964,26 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
+    # Tuned launch parameters; ``None`` lets Triton pick its defaults.
+    launch_num_warps: int | None = None
+    launch_num_stages: int | None = None
+
+    # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
+    # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
+    # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
+    # more query rows per block + 8 warps is ~2x faster on B200.
+    tuned_large_head = (
+        head_size == 256
+        and max_seqlen_q > 1
+        and num_queries_per_kv <= 16
+        and current_platform.is_device_capability_family(100)
+    )
+    if tuned_large_head:
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 8
+        launch_num_stages = 2
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -868,6 +1011,11 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+
+    # Wider KV tile for the tuned large-head path (see above). Only the 2D
+    # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
+    if tuned_large_head:
+        TILE_SIZE_PREFILL = 128
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -964,6 +1112,12 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    launch_kwargs: dict[str, int] = {}
+    if launch_num_warps is not None:
+        launch_kwargs["num_warps"] = launch_num_warps
+    if launch_num_stages is not None:
+        launch_kwargs["num_stages"] = launch_num_stages
+
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1002,10 +1156,13 @@ def unified_attention(
         USE_QQ_BIAS=use_qq_bias,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
+        SLIDING_WINDOW=(1 + window_size[0]),
+        USE_CAUSAL=use_causal,
+        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
+        per_seq_causal_ptr=per_seq_causal_ptr,
         USE_MM_PREFIX=use_mm_prefix,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
-        SLIDING_WINDOW=(1 + window_size[0]),
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2),
@@ -1033,6 +1190,13 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        cos_sin_cache_ptr=cos_sin_cache,
+        stride_cs_cache_0=cos_sin_cache.stride(0) if fuse_rope else 0,
+        stride_cs_cache_1=cos_sin_cache.stride(1) if fuse_rope else 0,
+        FUSE_ROPE=fuse_rope,
+        ROTARY_DIM=rotary_dim,
+        KV_COMPUTE_DTYPE=kv_compute_dtype,
+        **launch_kwargs,
     )
 
     if use_3d:

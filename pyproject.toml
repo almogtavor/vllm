@@ -111,6 +111,7 @@ markers = [
     "split: run this test as part of a split",
     "distributed: run this test only in distributed GPU tests",
     "optional: optional tests that are automatically skipped, include --optional to run them",
+    "spans: spans / Legolink (gap-policy + position-invariant chunk) tests",
 ]
 
 [tool.ty.src]
@@ -162,6 +163,8 @@ dout = "dout"
 Pn = "Pn"
 arange = "arange"
 thw = "thw"
+# temporal position ids (parallels hpos/wpos in vision RoPE)
+tpos = "tpos"
 subtile = "subtile"
 HSA = "HSA"
 setp = "setp"

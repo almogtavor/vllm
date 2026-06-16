@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm import envs
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -101,6 +102,10 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
+        # SPANS: Per-request span boundary metadata
+        self.span_starts: list[int] | None = None
+        self.cross_span_starts: list[int] | None = None
+
         if pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
@@ -115,6 +120,11 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                if envs.VLLM_V1_SPANS_ENABLED:
+                    self.span_starts = sampling_params.extra_args.get("span_starts")
+                    self.cross_span_starts = sampling_params.extra_args.get(
+                        "cross_span_starts"
+                    )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -145,8 +155,16 @@ class Request:
         # so the worker's broadcast slot ring stays consistent.
         self.next_decode_eligible_step = 0
 
+        # Seq of the most recent step this request was scheduled in; fences
+        # deferred block freeing (see Scheduler._free_request_blocks).
+        self.last_sched_seq = 0
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # External (connector/offload) computed tokens. Upstream tracks this as
+        # a local in the scheduler, but the spans gap-policy path reads it back
+        # off the request (sched/scheduler.py); keep the attribute initialized.
+        self.num_external_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
