@@ -90,6 +90,8 @@ class TritonAttentionMetadata:
 
     cos_sin_cache: torch.Tensor | None = None
     rotary_dim: int = 0
+    attn_lower_bounds: torch.Tensor | None = None
+    req_kv_starts: torch.Tensor | None = None
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -219,9 +221,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         if envs.VLLM_V1_SPANS_ENABLED:
             cos_sin_cache = common_attn_metadata.cos_sin_cache
             rotary_dim = common_attn_metadata.rotary_dim
+            attn_lower_bounds = common_attn_metadata.attn_lower_bounds
+            req_kv_starts = common_attn_metadata.req_kv_starts
         else:
             cos_sin_cache = None
             rotary_dim = 0
+            attn_lower_bounds = None
+            req_kv_starts = None
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -245,6 +251,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_expsum=self.softmax_segm_expsum,
             cos_sin_cache=cos_sin_cache,
             rotary_dim=rotary_dim,
+            attn_lower_bounds=attn_lower_bounds,
+            req_kv_starts=req_kv_starts,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -659,6 +667,8 @@ class TritonAttentionImpl(AttentionImpl):
         if cos_sin_cache is not None:
             cos_sin_cache = getattr(layer, "spans_cos_sin_cache", cos_sin_cache)
             rotary_dim = getattr(layer, "spans_rotary_dim", rotary_dim)
+        attn_lower_bounds = attn_metadata.attn_lower_bounds
+        req_kv_starts = attn_metadata.req_kv_starts
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
@@ -696,6 +706,8 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            attn_lower_bounds=attn_lower_bounds,
+            req_kv_starts=req_kv_starts,
         )
 
         return output
