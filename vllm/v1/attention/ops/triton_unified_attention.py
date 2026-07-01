@@ -330,8 +330,8 @@ def kernel_unified_attention_2d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    # SPANS: rebase the KV-tile loop at the Q-block's smallest lower bound so
-    # iteration shape matches the standalone reference even at mid-tile span_start.
+    # SPANS: skip whole KV tiles before the Q-block's smallest lower bound;
+    # span_starts are block-aligned so span_offset is tile-aligned.
     span_offset: tl.int32 = 0
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
@@ -341,12 +341,11 @@ def kernel_unified_attention_2d(
         # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
         span_offset = tl.min(q_lb_vec)
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
-        num_tiles = cdiv_fn(max_seq_prefix_len - span_offset, TILE_SIZE)
-        tile_start, tile_end = 0, num_tiles
+        tile_start = tl.maximum(tile_start, span_offset // TILE_SIZE)
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
-        seq_offset = span_offset + j * TILE_SIZE + offs_t
+        seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
         if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
