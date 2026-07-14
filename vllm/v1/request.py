@@ -27,7 +27,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
-    from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.core.kv_cache_utils import BlockHash, PrefixHitSource
 
 
 @dataclass
@@ -105,6 +105,12 @@ class Request:
         # SPANS: Per-request span boundary metadata
         self.span_starts: list[int] | None = None
         self.cross_span_starts: list[int] | None = None
+        # SPANS: pd sibling hashes (parallel to block_hashes), the token
+        # ranges where the dual pd/pic lookup applies, and the per-block hit
+        # sources of the latest dual lookup.
+        self.pd_block_hashes: list[BlockHash] = []
+        self.pic_token_ranges: list[tuple[int, int | None]] = []
+        self.prefix_hit_sources: list[PrefixHitSource] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -127,6 +133,12 @@ class Request:
                     )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
+
+        if self.span_starts:
+            crosses = sorted(self.cross_span_starts or [])
+            for span_start in sorted(self.span_starts):
+                end = next((c for c in crosses if c > span_start), None)
+                self.pic_token_ranges.append((span_start, end))
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
