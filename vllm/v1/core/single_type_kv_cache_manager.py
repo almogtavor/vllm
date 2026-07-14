@@ -597,6 +597,19 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 computed.pop()
         return computed_blocks
 
+    def swap_blocks_for_gap_recompute(
+        self, request_id: str, block_indices: Sequence[int]
+    ) -> list[KVCacheBlock]:
+        """SPANS: replace PIC-hit blocks a gap recompute will fully rewrite
+        with fresh blocks, releasing the shared blocks' refs."""
+        req_blocks = self.req_to_blocks[request_id]
+        fresh_blocks = self.block_pool.get_new_blocks(len(block_indices))
+        for idx, fresh in zip(block_indices, fresh_blocks):
+            self.block_pool.free_blocks([req_blocks[idx]])
+            req_blocks[idx] = fresh
+            self.new_block_ids.append(fresh.block_id)
+        return fresh_blocks
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
         num_common_blocks = 0

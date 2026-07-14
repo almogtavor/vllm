@@ -9,8 +9,10 @@ from .conftest import (
     BLOCK_SIZE,
     LOGPROBS_TOPK,
     _block_kv,
+    _capture_request_block_ids,
     _force_in_process_engine,
     _generate_num_cached_tokens,
+    _physical_block_tensor,
     _request_block_hashes,
     _warmup_prompt,
     build_llm,
@@ -26,7 +28,9 @@ pytestmark = pytest.mark.spans
 def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
     """LL-32 gap_length = 2 blocks bounds the recompute at the block level.
 
-    Span is 4 blocks, gap_length covers only the first 2. After the run:
+    Span is 4 blocks, gap_length covers only the first 2. The recompute lands
+    in fresh pd-keyed blocks, so K/V is read off the request's block table.
+    After the run:
       - the first 2 span blocks were recomputed against the real prefix
         (K/V differs from the pre-warmed stale K/V);
       - the last 2 span blocks were NOT touched (K/V byte-identical to
@@ -52,8 +56,13 @@ def test_legolink_partial_recompute_within_gap_interval(model, monkeypatch):
 
         # Run the marked prompt - gap policy fires on the span at block 2
         # with gap (32, 64) and recomputes only the first 2 span blocks.
+        captured = _capture_request_block_ids(monkeypatch, llm)
         _generate_num_cached_tokens(llm, prompt_tokens, sp)
-        after_span_kv = [_block_kv(llm, h) for h in span_hashes]
+        block_ids = max(captured.values(), key=len)
+        # Span block i lives at prompt block i + 2.
+        after_span_kv = [
+            _physical_block_tensor(llm, block_ids[i + 2]) for i in range(4)
+        ]
 
         # Span blocks 0,1 (= prompt blocks 2,3) ARE the gap interval -
         # their K/V must differ from the stale warmup K/V.

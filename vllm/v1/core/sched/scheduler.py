@@ -37,8 +37,8 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.sched.gap_policy import GapPolicy, GapPolicyFactory
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.gap_policy import GapPolicy, GapPolicyFactory
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -771,6 +771,8 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+                    # SPANS: no fresh lookup ran; prior hit sources are stale.
+                    request.prefix_hit_sources = None
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -778,6 +780,7 @@ class Scheduler(SchedulerInterface):
                 # Pre-reserved token budget for virtual gap requests created
                 # for this request (set in else branch below; zero for async KV).
                 gap_overhead = 0
+                span_gaps: list[tuple[int, int]] = []
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -802,14 +805,12 @@ class Scheduler(SchedulerInterface):
                     # after scheduling, so get_gaps() returns the same gaps as
                     # the post-scheduling gap loop.
                     if self.gap_policy is not None:
-                        gap_overhead = sum(
-                            end - start
-                            for start, end in self.gap_policy.get_gaps(
-                                request,
-                                num_computed_tokens,
-                                num_external_computed_tokens,
-                            )
+                        span_gaps = self.gap_policy.get_gaps(
+                            request,
+                            num_computed_tokens,
+                            num_external_computed_tokens,
                         )
+                        gap_overhead = sum(end - start for start, end in span_gaps)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -901,6 +902,7 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    span_gaps=span_gaps,
                 )
 
                 if new_blocks is None:

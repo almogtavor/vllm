@@ -10,7 +10,7 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, PrefixHitSource
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -225,11 +225,26 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        # SPANS: dual lookup lets a prefix-aware recomputed copy win over the
+        # shared warmed copy; hit sources feed the scheduler's gap planning.
+        if (
+            request.span_starts
+            and request.pd_block_hashes
+            and getattr(self.coordinator, "supports_dual_cache_hit", lambda: False)()
+        ):
+            computed_blocks, num_new_computed_tokens, hit_sources = (
+                self.coordinator.find_longest_cache_hit_dual(
+                    request, max_cache_hit_length
+                )
             )
-        )
+            request.prefix_hit_sources = hit_sources
+        else:
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
+            )
+            request.prefix_hit_sources = None
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -254,6 +269,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        span_gaps: Sequence[tuple[int, int]] = (),
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -286,6 +302,9 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+            span_gaps: SPANS gap intervals; PIC-hit blocks they fully cover are
+                swapped for fresh pd-keyed blocks so repeated occurrences of a
+                span do not clobber each other on recompute.
 
         Blocks layout:
         ```
@@ -345,6 +364,9 @@ class KVCacheManager:
                 "external computed tokens"
             )
 
+        # SPANS: PIC-hit blocks a gap will recompute; reserve+swap them below.
+        swap_indices = self._span_swap_indices(request, span_gaps)
+
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
         else:
@@ -382,7 +404,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
+            required_blocks = (
+                num_blocks_to_allocate + len(swap_indices) + watermark_blocks
+            )
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
@@ -414,7 +438,7 @@ class KVCacheManager:
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
+        required_blocks = num_blocks_to_allocate + len(swap_indices) + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
@@ -455,7 +479,32 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
+        if swap_indices:
+            # SPANS: fresh pd-keyed blocks for the gap recompute; the shared
+            # warmed (pic) blocks are left untouched for other prefixes.
+            manager = self.coordinator.single_type_managers[0]
+            fresh = manager.swap_blocks_for_gap_recompute(
+                request.request_id, swap_indices
+            )
+            self.block_pool.cache_blocks_under_hashes(
+                fresh, [request.pd_block_hashes[i] for i in swap_indices], 0
+            )
+
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _span_swap_indices(
+        self, request: Request, span_gaps: Sequence[tuple[int, int]]
+    ) -> list[int]:
+        sources = request.prefix_hit_sources
+        if not span_gaps or sources is None:
+            return []
+        bs = self.coordinator.block_size
+        return [
+            b
+            for s, e in span_gaps
+            for b in range(s // bs, min(e // bs, len(sources)))
+            if sources[b] == PrefixHitSource.PIC
+        ]
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
