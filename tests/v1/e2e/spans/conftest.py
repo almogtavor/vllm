@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402  (VLLM_BATCH_INVARIANT must be set before vLLM is imported)
+import os
+
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1") # exact KV comparison across shapes
 import gc
 import hashlib
 import os

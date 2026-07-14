@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
 
 
 @triton.jit
@@ -285,6 +286,9 @@ def kernel_unified_attention(
     FUSE_ROPE: tl.constexpr = False,
     ROTARY_DIM: tl.constexpr = 0,  # 0 means rotary_dim == head_size
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
+    attn_lower_bounds_ptr: torch.Tensor | None = None,  # SPANS: per-KV-pos lb
+    req_kv_starts_ptr: torch.Tensor | None = None,  # SPANS: per-req KV start
+    USE_SPAN: tl.constexpr = False,  # bool
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -409,10 +413,30 @@ def kernel_unified_attention(
         CHUNK_SIZE,
     )
 
+    # SPANS: skip whole KV tiles before the Q-block's smallest lower bound;
+    # span_starts are block-aligned so span_offset is tile-aligned. This
+    # narrows HEAD's ``loop_lo`` (already computed by compute_tile_loop_bounds
+    # with sliding-window / mm-prefix / 3D-segment pruning) on top of those.
+    span_offset: tl.int32 = 0
+    if USE_SPAN:
+        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
+        q_lb_vec = tl.load(
+            attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
+            mask=query_mask_0, other=INT32_MAX)
+        # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
+        span_offset = tl.min(q_lb_vec)
+        span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
+        loop_lo = tl.maximum(loop_lo, span_offset // TILE_SIZE)
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
+
+        if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
+            key_span_lb = tl.load(
+                attn_lower_bounds_ptr + req_kv_start + seq_offset,
+                mask=tile_mask, other=0)
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -508,12 +532,16 @@ def kernel_unified_attention(
                 )
                 rope_mask = (offs_d[:, None] < ROT) & tile_mask[None, :]
                 cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
+                # SPANS: shift the cos/sin cache index to the span-relative key
+                # position. Per-key ``key_span_lb`` when USE_SPAN, else the
+                # (tile-aligned) scalar ``span_offset`` (0 outside spans).
+                key_pos_shift = key_span_lb[None, :] if USE_SPAN else span_offset
                 cos_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - key_pos_shift) * stride_cs_cache_0
                     + cos_idx[:, None] * stride_cs_cache_1
                 )
                 sin_offset = (
-                    seq_offset[None, :] * stride_cs_cache_0
+                    (seq_offset[None, :] - key_pos_shift) * stride_cs_cache_0
                     + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
                 )
                 cos = tl.load(
@@ -908,11 +936,15 @@ def unified_attention(
     # of 0 means rotary_dim == head_size (full rotary).
     cos_sin_cache=None,
     rotary_dim=0,
+    attn_lower_bounds=None,  # SPANS: flat per-KV-pos lower bound
+    req_kv_starts=None,  # SPANS: per-req start into attn_lower_bounds
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
     per_seq_causal_ptr = causal if use_per_seq_causal else None
+    # SPANS: on-the-fly span attention when lower bounds are provided.
+    use_span = attn_lower_bounds is not None
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1196,6 +1228,9 @@ def unified_attention(
         FUSE_ROPE=fuse_rope,
         ROTARY_DIM=rotary_dim,
         KV_COMPUTE_DTYPE=kv_compute_dtype,
+        attn_lower_bounds_ptr=attn_lower_bounds,
+        req_kv_starts_ptr=req_kv_starts,
+        USE_SPAN=use_span,
         **launch_kwargs,
     )
 

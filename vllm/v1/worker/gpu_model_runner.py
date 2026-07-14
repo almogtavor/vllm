@@ -768,6 +768,10 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
+            self._attn_lower_bounds_gpu: torch.Tensor | None = None
+            self._req_kv_starts_gpu: torch.Tensor | None = None
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1281,6 +1285,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1970,6 +1975,32 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
+        if envs.VLLM_V1_SPANS_ENABLED:
+            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            seq_lens_arr = num_computed + num_scheduled_tokens
+            req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
+            np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
+            attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            for i in range(num_reqs):
+                req = self.requests[self.input_batch.req_ids[i]]
+                params = req.sampling_params
+                if req.is_gap_recompute or params is None:
+                    continue
+                ea = params.extra_args
+                spans = ea.get("span_starts") if ea else None
+                if not spans:
+                    continue
+                crosses = ea.get("cross_span_starts") or []
+                req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
+                for j, span_start in enumerate(spans):
+                    cross = crosses[j] if j < len(crosses) else req_len
+                    attn_lb[req_start + span_start : req_start + cross] = span_start
+            self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
+                self.device, non_blocking=True)
+            self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
+                self.device, non_blocking=True)
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2045,6 +2076,15 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
+        # NOTE(merge on-the-fly-warmup): the on-the-fly branch computed the
+        # slot mapping on the CPU here via
+        # ``block_table.compute_slot_mapping(req_indices, positions_np)`` +
+        # ``commit_slot_mapping(...)`` and then shifted ``positions_np`` to
+        # span-relative. HEAD instead computes the slot mapping on the GPU
+        # (see ``compute_slot_mapping(num_reqs, query_start_loc, positions)``
+        # below), so those CPU calls are dropped. The span-relative Q-position
+        # shift is applied to the GPU ``self.positions`` right after that GPU
+        # slot mapping (which requires absolute positions).
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -2167,6 +2207,24 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+
+        # SPANS: shift Q positions to span-relative on the GPU, after the slot
+        # mapping (which requires absolute positions). On-the-fly-warmup did
+        # this on the CPU ``positions_np`` before ``copy_to_gpu``; HEAD keeps
+        # ``self.positions`` as a GPU tensor computed from ``query_pos.gpu``,
+        # so the shift is applied here to the GPU tensor instead.
+        if (
+            envs.VLLM_V1_SPANS_ENABLED
+            and self._attn_lower_bounds_gpu is not None
+            and self._req_kv_starts_gpu is not None
+        ):
+            pos_slice = self.positions[:total_num_scheduled_tokens]
+            sched_kv_indices = (
+                self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
+            )
+            pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
+                pos_slice.dtype
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2431,6 +2489,8 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
+            attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
+            req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
         )
 
         if self.dcp_world_size > 1:
