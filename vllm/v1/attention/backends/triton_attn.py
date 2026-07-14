@@ -88,6 +88,11 @@ class TritonAttentionMetadata:
     prefix_kv_lens: torch.Tensor | None
     suffix_kv_lens: torch.Tensor | None
 
+    cos_sin_cache: torch.Tensor | None = None
+    rotary_dim: int = 0
+    attn_lower_bounds: torch.Tensor | None = None
+    req_kv_starts: torch.Tensor | None = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -213,6 +218,17 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             suffix_kv_lens = None
             prefix_scheduler_metadata = None
 
+        if envs.VLLM_V1_SPANS_ENABLED:
+            cos_sin_cache = common_attn_metadata.cos_sin_cache
+            rotary_dim = common_attn_metadata.rotary_dim
+            attn_lower_bounds = common_attn_metadata.attn_lower_bounds
+            req_kv_starts = common_attn_metadata.req_kv_starts
+        else:
+            cos_sin_cache = None
+            rotary_dim = 0
+            attn_lower_bounds = None
+            req_kv_starts = None
+
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -233,6 +249,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            cos_sin_cache=cos_sin_cache,
+            rotary_dim=rotary_dim,
+            attn_lower_bounds=attn_lower_bounds,
+            req_kv_starts=req_kv_starts,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -637,6 +657,19 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
+        # SPANS only (cos_sin_cache is set just when VLLM_V1_SPANS_ENABLED): rotate
+        # K in-kernel with THIS layer's RoPE. Models with per-layer-type RoPE
+        # (e.g. gemma-4's local vs global theta) need each layer's own cache; the
+        # metadata carries only the first layer's, which mis-rotates the rest.
+        # Uniform-RoPE models keep the shared cache. FR (cache is None) is untouched.
+        cos_sin_cache = attn_metadata.cos_sin_cache
+        rotary_dim = attn_metadata.rotary_dim
+        if cos_sin_cache is not None:
+            cos_sin_cache = getattr(layer, "spans_cos_sin_cache", cos_sin_cache)
+            rotary_dim = getattr(layer, "spans_rotary_dim", rotary_dim)
+        attn_lower_bounds = attn_metadata.attn_lower_bounds
+        req_kv_starts = attn_metadata.req_kv_starts
+
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
@@ -665,12 +698,16 @@ class TritonAttentionImpl(AttentionImpl):
             softmax_segm_expsum=softmax_segm_expsum,
             sinks=self.sinks,
             output_scale=output_scale,
+            cos_sin_cache=cos_sin_cache,
             mm_prefix_range=mm_prefix_range_tensor,
+            rotary_dim=rotary_dim,
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            attn_lower_bounds=attn_lower_bounds,
+            req_kv_starts=req_kv_starts,
         )
 
         return output
