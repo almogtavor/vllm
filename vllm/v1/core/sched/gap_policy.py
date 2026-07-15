@@ -190,12 +190,20 @@ class SpanAwareGapPolicy(GapPolicy):
         )
 
 
+class QuestGapPolicy(SpanAwareGapPolicy):
+    """Span gap policy that recomputes the same blocks as ``SpanAwareGapPolicy``
+    but restricts each recompute's attention to the top-``gap_length/block_size``
+    prefix key blocks by Quest score (worker-side, in the attention forward).
+    """
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
     _POLICIES = {
         "none": NoGapPolicy,
         "span_aware": SpanAwareGapPolicy,
+        "span_quest": QuestGapPolicy,
     }
 
     @classmethod

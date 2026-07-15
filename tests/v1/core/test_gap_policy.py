@@ -8,6 +8,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.gap_policy import (
     GapPolicyFactory,
     NoGapPolicy,
+    QuestGapPolicy,
     SpanAwareGapPolicy,
 )
 from vllm.v1.request import Request
@@ -93,3 +94,13 @@ class TestSpanAwareGapPolicy:
         policy = GapPolicyFactory.create_policy("span_aware", {"gap_length": 64})
         assert isinstance(policy, SpanAwareGapPolicy)
         assert policy.gap_length == 64
+
+    def test_quest_matches_span_aware_gaps(self):
+        # QuestGapPolicy only changes the worker-side attention read pattern;
+        # its scheduler-visible gaps must be identical to span_aware.
+        cfg = {"gap_length": 32, "block_size": 16}
+        req = make_span_request(256, span_starts=[64, 128])
+        quest = GapPolicyFactory.create_policy("span_quest", cfg)
+        span_aware = GapPolicyFactory.create_policy("span_aware", cfg)
+        assert isinstance(quest, QuestGapPolicy)
+        assert quest.get_gaps(req, 256, 0) == span_aware.get_gaps(req, 256, 0)

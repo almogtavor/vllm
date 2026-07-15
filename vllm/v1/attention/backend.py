@@ -392,6 +392,9 @@ class CommonAttentionMetadata:
 
     attn_lower_bounds: torch.Tensor | None = None  # SPANS: per-KV-pos lower bound
     req_kv_starts: torch.Tensor | None = None  # SPANS: per-req start into attn_lb
+    # QUEST: (kv_start, gap_start, parent_q_row) per gap row + top-K block budget.
+    quest_gaps: list[tuple[int, int, int, int]] | None = None
+    quest_top_k: int = 0
 
     causal: bool | torch.Tensor = True
 

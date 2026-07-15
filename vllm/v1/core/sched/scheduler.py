@@ -1097,7 +1097,6 @@ class Scheduler(SchedulerInterface):
                     computed_token_gaps,
                 )
                 for start, end in computed_token_gaps:
-                    print(f"Gap: ({start},{end})")
                     nrd_copy = replace(nrd)
                     parent_req_id = nrd_copy.req_id  # Save parent before modification
                     nrd_copy.req_id = nrd_copy.req_id + "." + str(start)

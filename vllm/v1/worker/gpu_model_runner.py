@@ -772,6 +772,15 @@ class GPUModelRunner(
             # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
             self._attn_lower_bounds_gpu: torch.Tensor | None = None
             self._req_kv_starts_gpu: torch.Tensor | None = None
+            # QUEST: per-gap-recompute descriptors for query-aware block selection.
+            _gap_cfg = self.scheduler_config.gap_policy_config or {}
+            self._quest_top_k = (
+                _gap_cfg.get("gap_length", 0)
+                // (_gap_cfg.get("block_size") or self.cache_config.block_size or 1)
+                if self.scheduler_config.gap_policy_name == "span_quest"
+                else 0
+            )
+            self._quest_gaps: list[tuple[int, int, int, int]] = []
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1286,6 +1295,8 @@ class GPUModelRunner(
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
                 is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
+                gap_start=getattr(new_req_data, "gap_start", None),
+                parent_req_id=getattr(new_req_data, "parent_req_id", None),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1981,10 +1992,20 @@ class GPUModelRunner(
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            row_of = {rid: i for i, rid in enumerate(self.input_batch.req_ids)}
+            q_start = cu_num_tokens - num_scheduled_tokens  # per-req first query row
+            self._quest_gaps = []
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 params = req.sampling_params
                 if req.is_gap_recompute or params is None:
+                    # QUEST: (kv_start, gap_start, parent's 1st post-span q row, row)
+                    parent = row_of.get(req.parent_req_id or "")
+                    if self._quest_top_k and req.gap_start and parent is not None:
+                        self._quest_gaps.append(
+                            (int(req_kv_starts[i]), int(req.gap_start),
+                             int(q_start[parent]), i)
+                        )
                     continue
                 ea = params.extra_args
                 spans = ea.get("span_starts") if ea else None
@@ -2491,6 +2512,8 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
+            quest_gaps=getattr(self, "_quest_gaps", None) or None,
+            quest_top_k=getattr(self, "_quest_top_k", 0),
         )
 
         if self.dcp_world_size > 1:
