@@ -55,6 +55,7 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+PREROTATE_MAX_SCRATCH_MB = 4096  # larger prefill batches keep the fused path
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 
 
@@ -264,7 +265,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 scratch_mb = (
                     total * blk * self.num_heads_kv * self.headdim * 2
                 ) // (1024 * 1024)
-                if 0 < total and scratch_mb <= envs.VLLM_V1_SPANS_PREROTATE_MAX_MB:
+                if 0 < total and scratch_mb <= PREROTATE_MAX_SCRATCH_MB:
                     width = block_table_tensor.shape[1]
                     ar = torch.arange(
                         width, device=seq_lens.device, dtype=torch.int32

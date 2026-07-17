@@ -344,38 +344,31 @@ def rotate_k_prepass(
     req_kv_starts: torch.Tensor | None,
 ) -> None:
     # per-forward K rotation into the transient scratch
-    block_size = key_cache.shape[1]
-    num_kv_heads = key_cache.shape[2]
-    head_size = key_cache.shape[3]
     num_seqs = seq_lens.shape[0]
-    max_blocks = triton.cdiv(max_seq_len, block_size)
-    use_span = attn_lower_bounds is not None
-    kernel_rotate_k_prepass[(num_seqs, max_blocks, num_kv_heads)](
-        key_cache_ptr=key_cache,
-        scratch_ptr=k_scratch,
-        block_tables_ptr=block_table,
-        k_scratch_tables_ptr=k_scratch_block_table,
-        seq_lens_ptr=seq_lens,
-        cos_sin_cache_ptr=cos_sin_cache,
-        attn_lower_bounds_ptr=attn_lower_bounds,
-        req_kv_starts_ptr=req_kv_starts,
-        block_table_stride=block_table.stride(0),
-        scratch_table_stride=k_scratch_block_table.stride(0),
-        stride_k_cache_0=key_cache.stride(0),
-        stride_k_cache_1=key_cache.stride(1),
-        stride_k_cache_2=key_cache.stride(2),
-        stride_k_cache_3=key_cache.stride(3),
-        stride_scr_0=k_scratch.stride(0),
-        stride_scr_1=k_scratch.stride(1),
-        stride_scr_2=k_scratch.stride(2),
-        stride_scr_3=k_scratch.stride(3),
-        stride_cs_cache_0=cos_sin_cache.stride(0),
-        stride_cs_cache_1=cos_sin_cache.stride(1),
-        BLOCK_SIZE=block_size,
-        HEAD_SIZE=head_size,
-        HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+    grid = (
+        num_seqs,
+        triton.cdiv(max_seq_len, key_cache.shape[1]),
+        key_cache.shape[2],
+    )
+    kernel_rotate_k_prepass[grid](
+        key_cache,
+        k_scratch,
+        block_table,
+        k_scratch_block_table,
+        seq_lens,
+        cos_sin_cache,
+        attn_lower_bounds,
+        req_kv_starts,
+        block_table.stride(0),
+        k_scratch_block_table.stride(0),
+        *key_cache.stride(),
+        *k_scratch.stride(),
+        *cos_sin_cache.stride(),
+        BLOCK_SIZE=key_cache.shape[1],
+        HEAD_SIZE=key_cache.shape[3],
+        HEAD_SIZE_PADDED=triton.next_power_of_2(key_cache.shape[3]),
         ROTARY_DIM=rotary_dim,
-        USE_SPAN=use_span,
+        USE_SPAN=attn_lower_bounds is not None,
     )
 
 
