@@ -4173,6 +4173,11 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        # SPANS uses per-step attention metadata tensors that are carried
+        # through ForwardContext, not explicit model inputs. CUDA graph replay
+        # would otherwise reuse metadata pointers captured from an earlier step.
+        force_eager = force_eager or envs.VLLM_V1_SPANS_ENABLED
+
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -6809,6 +6814,13 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED:
+            logger.warning(
+                "Skipping CUDA graph memory profiling for spans because span "
+                "attention metadata is not CUDA graph replay safe."
+            )
+            return 0
+
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -6958,6 +6970,13 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED:
+            logger.warning(
+                "Skipping CUDA graph capture for spans because span attention "
+                "metadata is not CUDA graph replay safe."
+            )
+            return 0
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
