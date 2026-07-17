@@ -39,7 +39,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import (
+    rotate_k_prepass,
+    unified_attention,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -53,6 +56,24 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+
+
+_K_SCRATCH: dict[tuple[torch.device, torch.dtype, int, int, int], torch.Tensor] = {}
+
+
+def _get_k_scratch(key_cache: torch.Tensor, total_blocks: int) -> torch.Tensor:
+    # transient per-forward K scratch: grown on demand, overwritten each prefill
+    blk, heads, hdim = key_cache.shape[1], key_cache.shape[2], key_cache.shape[3]
+    key = (key_cache.device, key_cache.dtype, blk, heads, hdim)
+    buf = _K_SCRATCH.get(key)
+    if buf is None or buf.shape[0] < total_blocks:
+        buf = torch.empty(
+            (total_blocks, blk, heads, hdim),
+            dtype=key_cache.dtype,
+            device=key_cache.device,
+        )
+        _K_SCRATCH[key] = buf
+    return buf
 
 
 @dataclass
@@ -92,6 +113,9 @@ class TritonAttentionMetadata:
     rotary_dim: int = 0
     attn_lower_bounds: torch.Tensor | None = None
     req_kv_starts: torch.Tensor | None = None
+    # SPANS prerotate: per-req block table into the K scratch
+    k_scratch_block_table: torch.Tensor | None = None
+    k_scratch_total_blocks: int = 0
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -223,11 +247,39 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             rotary_dim = common_attn_metadata.rotary_dim
             attn_lower_bounds = common_attn_metadata.attn_lower_bounds
             req_kv_starts = common_attn_metadata.req_kv_starts
+            # prefill-bearing batches only: attention runs eagerly there, so
+            # the data-dependent scratch never enters a captured decode graph
+            k_scratch_block_table = None
+            k_scratch_total_blocks = 0
+            if (
+                envs.VLLM_V1_SPANS_PREROTATE
+                and cos_sin_cache is not None
+                and max_query_len > 1
+            ):
+                blk = self.block_size
+                nblk = (seq_lens[:num_reqs] + (blk - 1)) // blk
+                starts = torch.cumsum(nblk, 0) - nblk
+                total = int(nblk.sum().item())
+                # 2B/elt (bf16/fp16); fp8 rejected at use time
+                scratch_mb = (
+                    total * blk * self.num_heads_kv * self.headdim * 2
+                ) // (1024 * 1024)
+                if 0 < total and scratch_mb <= envs.VLLM_V1_SPANS_PREROTATE_MAX_MB:
+                    width = block_table_tensor.shape[1]
+                    ar = torch.arange(
+                        width, device=seq_lens.device, dtype=torch.int32
+                    )
+                    k_scratch_block_table = (
+                        starts.to(torch.int32)[:, None] + ar[None, :]
+                    ).clamp_(max=max(total - 1, 0))
+                    k_scratch_total_blocks = total
         else:
             cos_sin_cache = None
             rotary_dim = 0
             attn_lower_bounds = None
             req_kv_starts = None
+            k_scratch_block_table = None
+            k_scratch_total_blocks = 0
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -253,6 +305,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             rotary_dim=rotary_dim,
             attn_lower_bounds=attn_lower_bounds,
             req_kv_starts=req_kv_starts,
+            k_scratch_block_table=k_scratch_block_table,
+            k_scratch_total_blocks=k_scratch_total_blocks,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -670,6 +724,36 @@ class TritonAttentionImpl(AttentionImpl):
         attn_lower_bounds = attn_metadata.attn_lower_bounds
         req_kv_starts = attn_metadata.req_kv_starts
 
+        # SPANS prerotate: rotate K once into the scratch, run kernel with
+        # fused RoPE off; quantized caches / TD keep the fused path
+        k_scratch = None
+        k_scratch_block_table = attn_metadata.k_scratch_block_table
+        if (
+            k_scratch_block_table is not None
+            and cos_sin_cache is not None
+            and self._kv_quant_mode == KVQuantMode.NONE
+            and not self.use_td
+        ):
+            k_scratch = _get_k_scratch(
+                key_cache, attn_metadata.k_scratch_total_blocks
+            )
+            rotate_k_prepass(
+                key_cache,
+                k_scratch,
+                block_table,
+                k_scratch_block_table,
+                seqused_k,
+                max_seqlen_k,
+                cos_sin_cache,
+                rotary_dim,
+                attn_lower_bounds,
+                req_kv_starts,
+            )
+            cos_sin_cache = None
+            rotary_dim = 0
+        else:
+            k_scratch_block_table = None
+
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
@@ -708,6 +792,8 @@ class TritonAttentionImpl(AttentionImpl):
             use_td=self.use_td,
             attn_lower_bounds=attn_lower_bounds,
             req_kv_starts=req_kv_starts,
+            k_scratch=k_scratch,
+            k_scratch_block_table=k_scratch_block_table,
         )
 
         return output
