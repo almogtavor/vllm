@@ -209,6 +209,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.span_metadata import build_span_attention_metadata
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -572,7 +573,8 @@ class GPUModelRunner(
 
         if self._kv_hash_debug_enabled:
             logger.info(
-                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, output_file=%s, log_interval=%d",
+                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, "
+                "output_file=%s, log_interval=%d",
                 self._kv_hash_debug_layer,
                 self._kv_hash_debug_req_ids if self._kv_hash_debug_req_ids else "ALL",
                 self._kv_hash_debug_output_file
@@ -1987,40 +1989,25 @@ class GPUModelRunner(
 
         if envs.VLLM_V1_SPANS_ENABLED:
             num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-            seq_lens_arr = num_computed + num_scheduled_tokens
-            req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
-            np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
-            attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
             q_start = cu_num_tokens - num_scheduled_tokens  # per-req 1st query row
-            bs = self.cache_config.block_size
-            self._quest_score_descs, self._quest_span_scores = [], []
-            for i in range(num_reqs):
-                req = self.requests[self.input_batch.req_ids[i]]
-                params = req.sampling_params
-                if req.is_gap_recompute or params is None:
-                    continue
-                ea = params.extra_args
-                spans = ea.get("span_starts") if ea else None
-                if not spans:
-                    continue
-                crosses = ea.get("cross_span_starts") or []
-                req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-                nc, ns = int(num_computed[i]), int(num_scheduled_tokens[i])
-                for j, span_start in enumerate(spans):
-                    cross = crosses[j] if j < len(crosses) else req_len
-                    attn_lb[req_start + span_start : req_start + cross] = span_start
-                    # QUEST: when the first post-span query runs this step,
-                    # score the span's blocks against it (selection is stored
-                    # scheduler-side for later gap recomputes of this span).
-                    n_blk = (cross - span_start) // bs
-                    if 0 < self._quest_top_k < n_blk and nc <= cross < nc + ns:
-                        self._quest_score_descs.append(
-                            (i, span_start // bs, n_blk,
-                             int(q_start[i]) + cross - nc)
-                        )
-                        self._quest_span_scores.append(
-                            torch.zeros(n_blk, device=self.device)
-                        )
+            req_states = [
+                self.requests[req_id]
+                for req_id in self.input_batch.req_ids[:num_reqs]
+            ]
+            (
+                attn_lb,
+                req_kv_starts,
+                self._quest_score_descs,
+                self._quest_span_scores,
+            ) = build_span_attention_metadata(
+                req_states,
+                num_computed,
+                num_scheduled_tokens,
+                q_start,
+                self.cache_config.block_size,
+                self._quest_top_k,
+                self.device,
+            )
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
                 self.device, non_blocking=True)
@@ -2405,7 +2392,8 @@ class GPUModelRunner(
         # for name, module in self.model.named_modules():
         #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
         #     for attr_name, attr_value in module.__dict__.items():
-        #         logger.info("  .%s: %s = %s", attr_name, type(attr_value).__name__, repr(attr_value)[:100])
+        #         logger.info("  .%s: %s = %s", attr_name,
+        #                     type(attr_value).__name__, repr(attr_value)[:100])
 
         # # Find rotary
         # for name, module in self.model.named_modules():
@@ -2413,7 +2401,7 @@ class GPUModelRunner(
         #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
 
         if not hasattr(self, "rotate"):
-            # Get the layers list, handling both standard and Llama4-style model structures
+            # Handle both standard and Llama4-style model structures.
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                 layers = self.model.model.layers
             elif hasattr(self.model, "language_model") and hasattr(
@@ -2422,7 +2410,8 @@ class GPUModelRunner(
                 layers = self.model.language_model.model.layers
             else:
                 raise AttributeError(
-                    f"Cannot find layers in model structure: {type(self.model).__name__}"
+                    "Cannot find layers in model structure: "
+                    f"{type(self.model).__name__}"
                 )
 
             for lay in layers:
