@@ -38,7 +38,7 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.gap_policy import GapPolicy, GapPolicyFactory
+from vllm.v1.core.sched.gap_policy import GapPolicy, GapPolicyFactory, QuestGapPolicy
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -1609,6 +1609,24 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        # QUEST: persist worker-measured span-block selections, keyed by the
+        # span's first pic block hash so any later prompt reusing the span
+        # recomputes the query-preferred blocks.
+        if model_runner_output.quest_selections and isinstance(
+            self.gap_policy, QuestGapPolicy
+        ):
+            bs = self.gap_policy.block_size
+            for req_id, sels in model_runner_output.quest_selections.items():
+                req = self.requests.get(req_id)
+                if req is None:
+                    continue
+                for span_start, offsets in sels:
+                    blk = span_start // bs
+                    if blk < len(req.block_hashes):
+                        self.gap_policy.store_selection(
+                            req.block_hashes[blk], offsets
+                        )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

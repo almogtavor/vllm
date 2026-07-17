@@ -55,46 +55,32 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 
-
-# QUEST: (quest_score, true_attention_mass) per scored gap, for offline
-# validation/plots. Populated only when VLLM_QUEST_CAPTURE=1 (in-process tests).
+# QUEST fidelity capture (VLLM_QUEST_CAPTURE=1): per layer/span
+# (quest score, true attention mass) per span block, for offline analysis.
 QUEST_CAPTURE: list[tuple[torch.Tensor, torch.Tensor]] = []
 
 
-def _quest_select_mask(attn_metadata, query, key_cache, num_queries_per_kv):
-    """QUEST keep-mask over a gap recompute's prefix KV positions: score each
-    prefix key block by the Quest upper bound ``sum_i max(q_i*m_i, q_i*M_i)``
-    (channel-wise K min/max, on the stored pre-RoPE K) against the parent's
-    first post-span query and keep the top-K blocks. Flat int8, indexed like
-    ``attn_lower_bounds``; ``None`` (all non-Quest paths) changes nothing."""
-    gaps = attn_metadata.quest_gaps
-    top_k = attn_metadata.quest_top_k
-    if not gaps or top_k <= 0:
-        return None
-    bs = key_cache.shape[1]
-    keep = torch.ones_like(attn_metadata.attn_lower_bounds, dtype=torch.int8)
-    arange_bs = torch.arange(bs, device=keep.device)
-    for kv_start, gap_start, parent_q_row, gap_row in gaps:
-        n_blk = gap_start // bs
-        if n_blk <= top_k:
-            continue  # every prefix block fits the budget: no restriction
-        blk_ids = attn_metadata.block_table[gap_row, :n_blk].long()
-        k_blk = key_cache[blk_ids].float()  # (n_blk, bs, n_kv_h, head)
-        q = query[parent_q_row].float()  # (n_q_heads, head)
-        q = q.view(-1, num_queries_per_kv, q.shape[-1]).mean(1)  # (n_kv_h, head)
-        score = torch.maximum(q * k_blk.amin(dim=1), q * k_blk.amax(dim=1)).sum(
-            dim=(1, 2)
-        )  # (n_blk,) Quest page score
+def _quest_score_spans(attn_metadata, query, key_cache, num_queries_per_kv):
+    """QUEST: score each span block by the upper bound
+    ``sum_i max(q_i*m_i, q_i*M_i)`` (channel-wise K min/max, scratch only,
+    never stored) against the span's first following query row, accumulating
+    across layers into ``attn_metadata.quest_span_scores``. The summed scores
+    pick which span blocks a later gap recompute rewrites."""
+    descs = attn_metadata.quest_score_descs
+    if not descs:
+        return
+    for d, (row, s_blk, n_blk, q_row) in enumerate(descs):
+        blk_ids = attn_metadata.block_table[row, s_blk : s_blk + n_blk].long()
+        k_blk = key_cache[blk_ids].float()  # (n_blk, bs, n_kv_heads, head)
+        q = query[q_row].float()
+        q = q.view(-1, num_queries_per_kv, q.shape[-1]).mean(1)  # (n_kv_h, hd)
+        score = torch.maximum(q * k_blk.amin(1), q * k_blk.amax(1)).sum((1, 2))
         if os.environ.get("VLLM_QUEST_CAPTURE") == "1":
             logits = (k_blk * q).sum(-1).transpose(1, 2)  # (n_blk, n_kv_h, bs)
-            mass = logits.reshape(n_blk * bs, -1)
-            mass = mass.softmax(dim=0).sum(-1).view(n_blk, bs).sum(-1)
+            mass = logits.reshape(n_blk * key_cache.shape[1], -1)
+            mass = mass.softmax(dim=0).sum(-1).view(n_blk, -1).sum(-1)
             QUEST_CAPTURE.append((score.cpu(), mass.cpu()))
-        top = score.topk(top_k).indices
-        keep[kv_start : kv_start + n_blk * bs] = 0
-        sel = kv_start + (top[:, None] * bs + arange_bs).reshape(-1)
-        keep[sel] = 1
-    return keep
+        attn_metadata.quest_span_scores[d] += score
 
 
 @dataclass
@@ -134,9 +120,8 @@ class TritonAttentionMetadata:
     rotary_dim: int = 0
     attn_lower_bounds: torch.Tensor | None = None
     req_kv_starts: torch.Tensor | None = None
-    # QUEST: (kv_start, gap_start, parent_q_row) per gap-recompute row + budget K.
-    quest_gaps: list[tuple[int, int, int, int]] | None = None
-    quest_top_k: int = 0
+    quest_score_descs: list[tuple[int, int, int, int]] | None = None
+    quest_span_scores: list[torch.Tensor] | None = None
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -268,15 +253,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             rotary_dim = common_attn_metadata.rotary_dim
             attn_lower_bounds = common_attn_metadata.attn_lower_bounds
             req_kv_starts = common_attn_metadata.req_kv_starts
-            quest_gaps = common_attn_metadata.quest_gaps
-            quest_top_k = common_attn_metadata.quest_top_k
         else:
             cos_sin_cache = None
             rotary_dim = 0
             attn_lower_bounds = None
             req_kv_starts = None
-            quest_gaps = None
-            quest_top_k = 0
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -302,8 +283,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             rotary_dim=rotary_dim,
             attn_lower_bounds=attn_lower_bounds,
             req_kv_starts=req_kv_starts,
-            quest_gaps=quest_gaps,
-            quest_top_k=quest_top_k,
+            quest_score_descs=common_attn_metadata.quest_score_descs,
+            quest_span_scores=common_attn_metadata.quest_span_scores,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -720,9 +701,7 @@ class TritonAttentionImpl(AttentionImpl):
             rotary_dim = getattr(layer, "spans_rotary_dim", rotary_dim)
         attn_lower_bounds = attn_metadata.attn_lower_bounds
         req_kv_starts = attn_metadata.req_kv_starts
-        quest_select = _quest_select_mask(
-            attn_metadata, query, key_cache, self.num_queries_per_kv
-        )
+        _quest_score_spans(attn_metadata, query, key_cache, self.num_queries_per_kv)
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
@@ -762,7 +741,6 @@ class TritonAttentionImpl(AttentionImpl):
             use_td=self.use_td,
             attn_lower_bounds=attn_lower_bounds,
             req_kv_starts=req_kv_starts,
-            quest_select=quest_select,
         )
 
         return output

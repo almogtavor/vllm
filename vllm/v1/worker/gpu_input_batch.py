@@ -57,8 +57,6 @@ class CachedRequestState:
     prompt_is_token_ids: list[bool] | None = None
 
     is_gap_recompute: bool = False  # SPANS: skip span-local attention for Legolink
-    gap_start: int | None = None  # SPANS: span/prefix boundary of a gap recompute
-    parent_req_id: str | None = None  # SPANS: parent whose post-span query scores
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

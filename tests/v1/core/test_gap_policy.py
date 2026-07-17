@@ -95,12 +95,40 @@ class TestSpanAwareGapPolicy:
         assert isinstance(policy, SpanAwareGapPolicy)
         assert policy.gap_length == 64
 
-    def test_quest_matches_span_aware_gaps(self):
-        # QuestGapPolicy only changes the worker-side attention read pattern;
-        # its scheduler-visible gaps must be identical to span_aware.
-        cfg = {"gap_length": 32, "block_size": 16}
+
+class TestQuestGapPolicy:
+    def setup_method(self):
+        self._original = envs.VLLM_V1_SPANS_ENABLED
+        envs.VLLM_V1_SPANS_ENABLED = True
+
+    def teardown_method(self):
+        envs.VLLM_V1_SPANS_ENABLED = self._original
+
+    def test_no_selection_matches_span_aware(self):
+        policy = QuestGapPolicy(gap_length=32)
         req = make_span_request(256, span_starts=[64, 128])
-        quest = GapPolicyFactory.create_policy("span_quest", cfg)
-        span_aware = GapPolicyFactory.create_policy("span_aware", cfg)
-        assert isinstance(quest, QuestGapPolicy)
-        assert quest.get_gaps(req, 256, 0) == span_aware.get_gaps(req, 256, 0)
+        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
+        assert gaps == [(64, 96), (128, 160)]
+
+    def test_selection_emits_scattered_single_block_gaps(self):
+        policy = QuestGapPolicy(gap_length=32, block_size=16)  # budget: 2 blocks
+        req = make_span_request(256, span_starts=[64])
+        req.block_hashes = [bytes([b]) for b in range(256 // 16)]
+        policy.store_selection(req.block_hashes[64 // 16], [7, 2])
+        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
+        assert gaps == [(96, 112), (176, 192)]  # span_start + {2,7}*16
+
+    def test_selection_clamped_and_per_span(self):
+        policy = QuestGapPolicy(gap_length=32, block_size=16)
+        req = make_span_request(256, span_starts=[64, 128])
+        req.block_hashes = [bytes([b]) for b in range(256 // 16)]
+        # offset 5 -> 144, past the next span at 128: dropped. Span 2 has no
+        # selection stored -> contiguous fallback.
+        policy.store_selection(req.block_hashes[4], [1, 5])
+        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
+        assert gaps == [(80, 96), (128, 160)]
+
+    def test_factory_creates_quest(self):
+        policy = GapPolicyFactory.create_policy("span_quest", {"gap_length": 64})
+        assert isinstance(policy, QuestGapPolicy)
+        assert policy.gap_length == 64

@@ -120,13 +120,8 @@ class SpanAwareGapPolicy(GapPolicy):
                 if idx + 1 < len(span_starts)
                 else num_computed_tokens
             )
-            gap_end = min(
-                gap_start + self.gap_length,
-                next_start,
-                num_computed_tokens,
-            )
-            if gap_end > gap_start:
-                gaps.append((gap_start, gap_end))
+            end_lim = min(next_start, num_computed_tokens)
+            gaps.extend(self._span_gap_ranges(request, gap_start, end_lim))
 
         # SPANS: drop gaps whose blocks all hit a prefix-aware (pd) copy from an
         # earlier recompute of this prefix - recompute-once-per-unique-prefix.
@@ -148,6 +143,12 @@ class SpanAwareGapPolicy(GapPolicy):
         self._print_gaps_representation(gaps, num_external_tokens, num_computed_tokens)
 
         return gaps
+
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
+    ) -> list[tuple[int, int]]:
+        gap_end = min(span_start + self.gap_length, end_lim)
+        return [(span_start, gap_end)] if gap_end > span_start else []
 
     def _print_gaps_representation(
         self,
@@ -191,10 +192,46 @@ class SpanAwareGapPolicy(GapPolicy):
 
 
 class QuestGapPolicy(SpanAwareGapPolicy):
-    """Span gap policy that recomputes the same blocks as ``SpanAwareGapPolicy``
-    but restricts each recompute's attention to the top-``gap_length/block_size``
-    prefix key blocks by Quest score (worker-side, in the attention forward).
-    """
+    """Recompute the ``gap_length/block_size`` span blocks the following query
+    attends most (Quest upper-bound score, Tang et al. ICML 2024) instead of
+    the span's first ``gap_length`` tokens. Scores are measured worker-side at
+    the span's first occurrence against its first post-span query and stored
+    here keyed by the span's first pic block hash; a span with no stored
+    selection falls back to the contiguous span_aware gap. Each selected block
+    becomes its own gap, so its recompute attends the full causal prefix."""
+
+    MAX_SELECTIONS = 4096
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.selections: dict = {}
+
+    def store_selection(self, key, block_offsets: list[int]) -> None:
+        # First writer wins: re-scores of a reused span read blocks that are
+        # being gap-recomputed in the same step, so only the first-occurrence
+        # scores (prefix-free warmed K) are trustworthy.
+        if key in self.selections:
+            return
+        self.selections[key] = block_offsets
+        if len(self.selections) > self.MAX_SELECTIONS:
+            self.selections.pop(next(iter(self.selections)))
+
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
+    ) -> list[tuple[int, int]]:
+        bs = self.block_size
+        blk = span_start // bs
+        hashes = request.block_hashes
+        offsets = self.selections.get(hashes[blk]) if blk < len(hashes) else None
+        if not offsets:
+            return super()._span_gap_ranges(request, span_start, end_lim)
+        gaps = []
+        for o in sorted(offsets[: self.gap_length // bs]):
+            s = span_start + o * bs
+            e = min(s + bs, end_lim)
+            if e > s:
+                gaps.append((s, e))
+        return gaps
 
 
 class GapPolicyFactory:
@@ -202,8 +239,8 @@ class GapPolicyFactory:
 
     _POLICIES = {
         "none": NoGapPolicy,
-        "span_aware": SpanAwareGapPolicy,
         "span_quest": QuestGapPolicy,
+        "span_aware": SpanAwareGapPolicy,
     }
 
     @classmethod

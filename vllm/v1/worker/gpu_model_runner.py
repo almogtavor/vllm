@@ -772,7 +772,7 @@ class GPUModelRunner(
             # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
             self._attn_lower_bounds_gpu: torch.Tensor | None = None
             self._req_kv_starts_gpu: torch.Tensor | None = None
-            # QUEST: per-gap-recompute descriptors for query-aware block selection.
+            # QUEST: span-block budget; >0 only under gap_policy_name=span_quest.
             _gap_cfg = self.scheduler_config.gap_policy_config or {}
             self._quest_top_k = (
                 _gap_cfg.get("gap_length", 0)
@@ -780,7 +780,8 @@ class GPUModelRunner(
                 if self.scheduler_config.gap_policy_name == "span_quest"
                 else 0
             )
-            self._quest_gaps: list[tuple[int, int, int, int]] = []
+            self._quest_score_descs: list[tuple[int, int, int, int]] = []
+            self._quest_span_scores: list[torch.Tensor] = []
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1295,8 +1296,6 @@ class GPUModelRunner(
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
                 is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
-                gap_start=getattr(new_req_data, "gap_start", None),
-                parent_req_id=getattr(new_req_data, "parent_req_id", None),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1992,20 +1991,13 @@ class GPUModelRunner(
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
-            row_of = {rid: i for i, rid in enumerate(self.input_batch.req_ids)}
-            q_start = cu_num_tokens - num_scheduled_tokens  # per-req first query row
-            self._quest_gaps = []
+            q_start = cu_num_tokens - num_scheduled_tokens  # per-req 1st query row
+            bs = self.cache_config.block_size
+            self._quest_score_descs, self._quest_span_scores = [], []
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 params = req.sampling_params
                 if req.is_gap_recompute or params is None:
-                    # QUEST: (kv_start, gap_start, parent's 1st post-span q row, row)
-                    parent = row_of.get(req.parent_req_id or "")
-                    if self._quest_top_k and req.gap_start and parent is not None:
-                        self._quest_gaps.append(
-                            (int(req_kv_starts[i]), int(req.gap_start),
-                             int(q_start[parent]), i)
-                        )
                     continue
                 ea = params.extra_args
                 spans = ea.get("span_starts") if ea else None
@@ -2013,9 +2005,22 @@ class GPUModelRunner(
                     continue
                 crosses = ea.get("cross_span_starts") or []
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
+                nc, ns = int(num_computed[i]), int(num_scheduled_tokens[i])
                 for j, span_start in enumerate(spans):
                     cross = crosses[j] if j < len(crosses) else req_len
                     attn_lb[req_start + span_start : req_start + cross] = span_start
+                    # QUEST: when the first post-span query runs this step,
+                    # score the span's blocks against it (selection is stored
+                    # scheduler-side for later gap recomputes of this span).
+                    n_blk = (cross - span_start) // bs
+                    if 0 < self._quest_top_k < n_blk and nc <= cross < nc + ns:
+                        self._quest_score_descs.append(
+                            (i, span_start // bs, n_blk,
+                             int(q_start[i]) + cross - nc)
+                        )
+                        self._quest_span_scores.append(
+                            torch.zeros(n_blk, device=self.device)
+                        )
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
                 self.device, non_blocking=True)
@@ -2512,8 +2517,8 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
-            quest_gaps=getattr(self, "_quest_gaps", None) or None,
-            quest_top_k=getattr(self, "_quest_top_k", 0),
+            quest_score_descs=getattr(self, "_quest_score_descs", None) or None,
+            quest_span_scores=getattr(self, "_quest_span_scores", None) or None,
         )
 
         if self.dcp_world_size > 1:
@@ -4964,6 +4969,20 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        # QUEST: rank each scored span's blocks by the layer-summed Quest
+        # score; the scheduler stores the top-k offsets for later recomputes.
+        quest_selections = None
+        if getattr(self, "_quest_score_descs", None):
+            quest_selections = {}
+            bs = self.cache_config.block_size
+            for (row, s_blk, _, _), scores in zip(
+                self._quest_score_descs, self._quest_span_scores
+            ):
+                req_id = self.input_batch.req_ids[row]
+                offs = scores.topk(self._quest_top_k).indices.tolist()
+                quest_selections.setdefault(req_id, []).append((s_blk * bs, offs))
+            self._quest_score_descs, self._quest_span_scores = [], []
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4978,6 +4997,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                quest_selections=quest_selections,
             )
 
         # Handle virtual gap requests: cleanup only (KV written directly to parent)

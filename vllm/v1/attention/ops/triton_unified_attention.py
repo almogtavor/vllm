@@ -288,9 +288,7 @@ def kernel_unified_attention(
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     attn_lower_bounds_ptr: torch.Tensor | None = None,  # SPANS: per-KV-pos lb
     req_kv_starts_ptr: torch.Tensor | None = None,  # SPANS: per-req KV start
-    quest_select_ptr: torch.Tensor | None = None,  # QUEST: per-KV-pos keep mask
     USE_SPAN: tl.constexpr = False,  # bool
-    USE_QUEST: tl.constexpr = False,  # QUEST: mask unselected prefix keys
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -640,13 +638,6 @@ def kernel_unified_attention(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
         )
 
-        if USE_QUEST:  # QUEST: drop prefix keys not in the top-K selected blocks
-            keep = tl.load(
-                quest_select_ptr + req_kv_start + seq_offset,
-                mask=tile_mask, other=1,
-            )
-            S = tl.where(keep[None, :] != 0, S, float("-inf"))
-
         if USE_ALIBI_SLOPES:
             S = apply_alibi_to_score(
                 S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
@@ -947,7 +938,6 @@ def unified_attention(
     rotary_dim=0,
     attn_lower_bounds=None,  # SPANS: flat per-KV-pos lower bound
     req_kv_starts=None,  # SPANS: per-req start into attn_lower_bounds
-    quest_select=None,  # QUEST: flat per-KV-pos keep mask (0 = drop)
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -955,8 +945,6 @@ def unified_attention(
     per_seq_causal_ptr = causal if use_per_seq_causal else None
     # SPANS: on-the-fly span attention when lower bounds are provided.
     use_span = attn_lower_bounds is not None
-    # QUEST: the kernel's mask load indexes via req_kv_start, a USE_SPAN local.
-    use_quest = quest_select is not None and use_span
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1242,9 +1230,7 @@ def unified_attention(
         KV_COMPUTE_DTYPE=kv_compute_dtype,
         attn_lower_bounds_ptr=attn_lower_bounds,
         req_kv_starts_ptr=req_kv_starts,
-        quest_select_ptr=quest_select,
         USE_SPAN=use_span,
-        USE_QUEST=use_quest,
         **launch_kwargs,
     )
 
