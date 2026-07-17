@@ -1620,23 +1620,20 @@ class Scheduler(SchedulerInterface):
                 for req_id in scheduler_output.virtual_gap_req_ids
             )
 
-        # QUEST: persist worker-measured span-block selections, keyed by the
-        # span's first pic block hash so any later prompt reusing the span
-        # recomputes the query-preferred blocks.
+        # QUEST: persist worker-measured span-block selections. The gap policy
+        # keys them by span identity and following-query tokens so stale scores
+        # are not reused for a different continuation.
         if model_runner_output.quest_selections and isinstance(
             self.gap_policy, QuestGapPolicy
         ):
-            bs = self.gap_policy.block_size
             for req_id, sels in model_runner_output.quest_selections.items():
                 req = self.requests.get(req_id)
                 if req is None:
                     continue
                 for span_start, offsets in sels:
-                    blk = span_start // bs
-                    if blk < len(req.block_hashes):
-                        self.gap_policy.store_selection(
-                            req.block_hashes[blk], offsets
-                        )
+                    key = self.gap_policy.get_selection_key(req, span_start)
+                    if key is not None:
+                        self.gap_policy.store_selection(key, offsets)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

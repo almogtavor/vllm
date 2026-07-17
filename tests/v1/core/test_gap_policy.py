@@ -20,7 +20,13 @@ def make_span_request(
     prompt_len: int,
     span_starts: list[int] | None = None,
     cross_span_starts: list[int] | None = None,
+    prompt_token_ids: list[int] | None = None,
 ) -> Request:
+    if prompt_token_ids is None:
+        prompt_token_ids = list(range(prompt_len))
+    else:
+        prompt_len = len(prompt_token_ids)
+
     extra_args = {}
     if span_starts is not None:
         extra_args["span_starts"] = span_starts
@@ -34,7 +40,7 @@ def make_span_request(
     sampling_params.update_from_generation_config({}, eos_token_id=100)
     return Request(
         request_id="gap_test",
-        prompt_token_ids=list(range(prompt_len)),
+        prompt_token_ids=prompt_token_ids,
         sampling_params=sampling_params,
         pooling_params=None,
     )
@@ -112,19 +118,25 @@ class TestQuestGapPolicy:
 
     def test_selection_emits_scattered_single_block_gaps(self):
         policy = QuestGapPolicy(gap_length=32, block_size=16)  # budget: 2 blocks
-        req = make_span_request(256, span_starts=[64])
+        req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
         req.block_hashes = [bytes([b]) for b in range(256 // 16)]
-        policy.store_selection(req.block_hashes[64 // 16], [7, 2])
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [7, 2])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
         assert gaps == [(96, 112), (176, 192)]  # span_start + {2,7}*16
 
     def test_selection_clamped_and_per_span(self):
         policy = QuestGapPolicy(gap_length=32, block_size=16)
-        req = make_span_request(256, span_starts=[64, 128])
+        req = make_span_request(
+            256, span_starts=[64, 128], cross_span_starts=[224, 240]
+        )
         req.block_hashes = [bytes([b]) for b in range(256 // 16)]
         # offset 5 -> 144, past the next span at 128: dropped. Span 2 has no
         # selection stored -> contiguous fallback.
-        policy.store_selection(req.block_hashes[4], [1, 5])
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [1, 5])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
         assert gaps == [(80, 96), (128, 160)]
 
@@ -135,8 +147,31 @@ class TestQuestGapPolicy:
 
     def test_adjacent_selected_blocks_coalesce(self):
         policy = QuestGapPolicy(gap_length=48, block_size=16)  # budget: 3
-        req = make_span_request(256, span_starts=[64])
+        req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
         req.block_hashes = [bytes([b]) for b in range(256 // 16)]
-        policy.store_selection(req.block_hashes[4], [3, 4, 0])
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [3, 4, 0])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
         assert gaps == [(64, 80), (112, 144)]  # offsets 3,4 merge into one gap
+
+    def test_selection_requires_matching_following_query_tokens(self):
+        policy = QuestGapPolicy(gap_length=32, block_size=16)
+        req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
+        req.block_hashes = [bytes([b]) for b in range(256 // 16)]
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [7, 2])
+
+        prompt_token_ids = list(range(256))
+        prompt_token_ids[224] = 9999
+        other = make_span_request(
+            256,
+            span_starts=[64],
+            cross_span_starts=[224],
+            prompt_token_ids=prompt_token_ids,
+        )
+        other.block_hashes = req.block_hashes
+
+        gaps = policy.get_gaps(other, num_computed_tokens=256, num_external_tokens=0)
+        assert gaps == [(64, 96)]

@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import PrefixHitSource
+from vllm.v1.core.kv_cache_utils import BlockHash, PrefixHitSource
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -196,17 +196,54 @@ class QuestGapPolicy(SpanAwareGapPolicy):
     attends most (Quest upper-bound score, Tang et al. ICML 2024) instead of
     the span's first ``gap_length`` tokens. Scores are measured worker-side at
     the span's first occurrence against its first post-span query and stored
-    here keyed by the span's first pic block hash; a span with no stored
-    selection falls back to the contiguous span_aware gap. Each selected block
-    becomes its own gap, so its recompute attends the full causal prefix."""
+    here keyed by both the span's first pic block hash and first following
+    query tokens; a span with no stored selection falls back to the contiguous
+    span_aware gap. Each selected block becomes its own gap, so its recompute
+    attends the full causal prefix."""
 
     MAX_SELECTIONS = 4096
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.selections: dict = {}
+        self.selections: dict[tuple[BlockHash, tuple[int, ...]], list[int]] = {}
 
-    def store_selection(self, key, block_offsets: list[int]) -> None:
+    def get_selection_key(
+        self,
+        request: "Request",
+        span_start: int,
+    ) -> tuple[BlockHash, tuple[int, ...]] | None:
+        bs = self.block_size
+        blk = span_start // bs
+        if blk >= len(request.block_hashes):
+            return None
+
+        cross = self._following_query_start(request, span_start)
+        if cross is None or cross >= request.num_tokens:
+            return None
+
+        query_tokens = tuple(request.all_token_ids[cross : cross + bs])
+        if not query_tokens:
+            return None
+        return request.block_hashes[blk], query_tokens
+
+    def _following_query_start(
+        self,
+        request: "Request",
+        span_start: int,
+    ) -> int | None:
+        spans = request.span_starts or []
+        crosses = request.cross_span_starts or []
+        for idx, start in enumerate(spans):
+            if start == span_start and idx < len(crosses):
+                cross = crosses[idx]
+                return cross if cross > span_start else None
+        return next((cross for cross in sorted(crosses) if cross > span_start), None)
+
+    def store_selection(
+        self,
+        key: tuple[BlockHash, tuple[int, ...]],
+        block_offsets: list[int],
+    ) -> None:
         # First writer wins: re-scores of a reused span read blocks that are
         # being gap-recomputed in the same step, so only the first-occurrence
         # scores (prefix-free warmed K) are trustworthy.
@@ -220,9 +257,8 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         self, request: "Request", span_start: int, end_lim: int
     ) -> list[tuple[int, int]]:
         bs = self.block_size
-        blk = span_start // bs
-        hashes = request.block_hashes
-        offsets = self.selections.get(hashes[blk]) if blk < len(hashes) else None
+        key = self.get_selection_key(request, span_start)
+        offsets = self.selections.get(key) if key is not None else None
         if not offsets:
             return super()._span_gap_ranges(request, span_start, end_lim)
         gaps = []
