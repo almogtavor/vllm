@@ -229,7 +229,11 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         for o in sorted(offsets[: self.gap_length // bs]):
             s = span_start + o * bs
             e = min(s + bs, end_lim)
-            if e > s:
+            if e <= s:
+                continue
+            if gaps and gaps[-1][1] == s:  # coalesce adjacent selected blocks
+                gaps[-1] = (gaps[-1][0], e)
+            else:
                 gaps.append((s, e))
         return gaps
 

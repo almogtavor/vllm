@@ -17,6 +17,8 @@ One QUEST engine (gap_length = 2 blocks) serves every phase:
      copy, untouched.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -87,6 +89,8 @@ def test_quest_recomputes_query_selected_span_blocks_e2e(model, monkeypatch):
         assert QUEST_CAPTURE, "VLLM_QUEST_CAPTURE=1 captured no span scores"
         summed = torch.stack([s for s, _ in QUEST_CAPTURE]).sum(0)
         assert sorted(summed.topk(TOP_K).indices.tolist()) == sel
+        if os.environ.get("QUEST_CAPTURE_OUT"):
+            torch.save(QUEST_CAPTURE, os.environ["QUEST_CAPTURE_OUT"])
 
         a_id = max(captured, key=lambda k: len(captured[k]))
         a_ids = captured[a_id]
@@ -116,13 +120,16 @@ def test_quest_recomputes_query_selected_span_blocks_e2e(model, monkeypatch):
             f"reuse run should hit prefixB + the whole span ({cross} tokens), "
             f"got {cached}"
         )
-        expected_gaps = tuple(
-            (span_start + o * BLOCK_SIZE, span_start + (o + 1) * BLOCK_SIZE)
-            for o in sel
-        )
-        assert emitted == {expected_gaps}, (
-            f"gap policy must emit one single-block gap per Quest-selected "
-            f"offset {sel}, got {emitted}"
+        expected: list[tuple[int, int]] = []
+        for o in sel:  # adjacent selected blocks coalesce into one gap
+            s, e = span_start + o * BLOCK_SIZE, span_start + (o + 1) * BLOCK_SIZE
+            if expected and expected[-1][1] == s:
+                expected[-1] = (expected[-1][0], e)
+            else:
+                expected.append((s, e))
+        assert emitted == {tuple(expected)}, (
+            f"gap policy must emit exactly the Quest-selected blocks {sel} "
+            f"(adjacent ones coalesced), got {emitted}"
         )
         new_keys = set(captured) - pre_keys
         b_id = max(new_keys, key=lambda k: len(captured[k]))

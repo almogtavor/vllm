@@ -132,3 +132,11 @@ class TestQuestGapPolicy:
         policy = GapPolicyFactory.create_policy("span_quest", {"gap_length": 64})
         assert isinstance(policy, QuestGapPolicy)
         assert policy.gap_length == 64
+
+    def test_adjacent_selected_blocks_coalesce(self):
+        policy = QuestGapPolicy(gap_length=48, block_size=16)  # budget: 3
+        req = make_span_request(256, span_starts=[64])
+        req.block_hashes = [bytes([b]) for b in range(256 // 16)]
+        policy.store_selection(req.block_hashes[4], [3, 4, 0])
+        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
+        assert gaps == [(64, 80), (112, 144)]  # offsets 3,4 merge into one gap
