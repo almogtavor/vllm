@@ -356,16 +356,23 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
-        # When loading KV data asynchronously, we may have zero new tokens to
-        # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
-            raise ValueError(
-                "num_new_tokens must be greater than 0 when there are no "
-                "external computed tokens"
-            )
-
         # SPANS: PIC-hit blocks a gap will recompute; reserve+swap them below.
         swap_indices = self._span_swap_indices(request, span_gaps)
+
+        # When loading KV data asynchronously, we may have zero new tokens to
+        # compute while still allocating slots for externally computed tokens.
+        # SPANS gap-only scheduling also uses zero parent tokens: the virtual
+        # gap requests do the actual computation after the parent blocks are
+        # attached and PIC-hit gap blocks are swapped to fresh PD-keyed blocks.
+        if (
+            num_new_tokens == 0
+            and num_external_computed_tokens == 0
+            and not swap_indices
+        ):
+            raise ValueError(
+                "num_new_tokens must be greater than 0 when there are no "
+                "external computed tokens or gap blocks to recompute"
+            )
 
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks

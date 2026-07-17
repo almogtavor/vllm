@@ -209,6 +209,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self.finished_gap_recompute_req_ids: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -410,6 +411,7 @@ class Scheduler(SchedulerInterface):
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
+        gap_only_new_reqs: list[tuple[Request, list[tuple[int, int]]]] = []
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
@@ -781,6 +783,7 @@ class Scheduler(SchedulerInterface):
                 # for this request (set in else branch below; zero for async KV).
                 gap_overhead = 0
                 span_gaps: list[tuple[int, int]] = []
+                gap_only_recompute = False
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -804,52 +807,66 @@ class Scheduler(SchedulerInterface):
                     # num_computed_tokens here equals request.num_computed_tokens
                     # after scheduling, so get_gaps() returns the same gaps as
                     # the post-scheduling gap loop.
-                    if self.gap_policy is not None:
+                    if (
+                        self.gap_policy is not None
+                        and request.prefix_hit_sources is not None
+                    ):
                         span_gaps = self.gap_policy.get_gaps(
                             request,
                             num_computed_tokens,
                             num_external_computed_tokens,
                         )
+                        if span_gaps:
+                            span_gaps = self._merge_gaps(span_gaps)
                         gap_overhead = sum(end - start for start, end in span_gaps)
+                        gap_only_recompute = gap_overhead > 0
 
-                    # chunked prefill has to be enabled explicitly to allow
-                    # pooling requests to be chunked
-                    effective_budget = token_budget - gap_overhead
-                    if (
-                        not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > effective_budget
-                    ):
-                        # If chunked_prefill is disabled,
-                        # we can stop the scheduling here.
-                        break
-
-                    num_new_tokens = min(num_new_tokens, effective_budget)
-                    if num_new_tokens <= 0:
-                        # Gap overhead alone consumes the remaining budget;
-                        # this request will be scheduled in the next step.
-                        break
-                    assert num_new_tokens > 0
-
-                    # Schedule encoder inputs.
-                    if request.has_encoder_inputs:
-                        (
-                            encoder_inputs_to_schedule,
-                            num_new_tokens,
-                            new_encoder_compute_budget,
-                            external_load_encoder_input,
-                        ) = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                        )
-                        if num_new_tokens == 0:
-                            # The request cannot be scheduled.
+                    if gap_only_recompute:
+                        if gap_overhead > token_budget:
+                            # Gap overhead alone consumes the remaining budget;
+                            # this request will be scheduled in the next step.
+                            break
+                        num_new_tokens = 0
+                    else:
+                        # chunked prefill has to be enabled explicitly to allow
+                        # pooling requests to be chunked
+                        if (
+                            not self.scheduler_config.enable_chunked_prefill
+                            and num_new_tokens > token_budget
+                        ):
+                            # If chunked_prefill is disabled,
+                            # we can stop the scheduling here.
                             break
 
+                        num_new_tokens = min(num_new_tokens, token_budget)
+                        if num_new_tokens <= 0:
+                            break
+                        assert num_new_tokens > 0
+
+                        # Schedule encoder inputs.
+                        if request.has_encoder_inputs:
+                            (
+                                encoder_inputs_to_schedule,
+                                num_new_tokens,
+                                new_encoder_compute_budget,
+                                external_load_encoder_input,
+                            ) = self._try_schedule_encoder_inputs(
+                                request,
+                                num_computed_tokens,
+                                num_new_tokens,
+                                encoder_compute_budget,
+                                shift_computed_tokens=1 if self.use_eagle else 0,
+                            )
+                            if num_new_tokens == 0:
+                                # The request cannot be scheduled.
+                                break
+
                 # Skip block alignment when setting up async receive (no local work).
-                if self.need_mamba_block_aligned_split and not load_kv_async:
+                if (
+                    self.need_mamba_block_aligned_split
+                    and not load_kv_async
+                    and not gap_only_recompute
+                ):
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -913,6 +930,22 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                if gap_only_recompute:
+                    # Fence the parent request while virtual gap requests repair
+                    # the selected cached blocks. Scheduling the parent in the
+                    # same model step lets it read stale KV while the virtual rows
+                    # are writing the replacement blocks.
+                    request = request_queue.pop_request()
+                    request.status = RequestStatus.WAITING_FOR_GAP_RECOMPUTE
+                    request.num_computed_tokens = num_computed_tokens
+                    request.num_external_computed_tokens = (
+                        num_external_computed_tokens
+                    )
+                    gap_only_new_reqs.append((request, span_gaps))
+                    step_skipped_waiting.prepend_request(request)
+                    token_budget -= gap_overhead
+                    continue
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1050,85 +1083,55 @@ class Scheduler(SchedulerInterface):
         # Track virtual gap request IDs for model runner cleanup
         virtual_gap_req_ids: set[str] = set()
 
-        # NEW: Apply gap policy to create gaps in ANY cached tokens
-        if len(new_reqs_data) > 0:
-            for nrd in new_reqs_data:
-                request = self.requests.get(nrd.req_id)
-                if request is None:
-                    continue
-
-                # Get gaps from policy (works for all cached tokens)
-                computed_token_gaps: list[tuple[int, int]] = []
-
-                if self.gap_policy is not None:
-                    # Calculate total computed tokens
-                    num_computed_tokens = request.num_computed_tokens
-                    num_external_tokens = request.num_external_computed_tokens
-
-                    # Get policy-driven gaps
-                    policy_gaps = self.gap_policy.get_gaps(
-                        request,
-                        num_computed_tokens,
-                        num_external_tokens,
-                    )
-                    computed_token_gaps.extend(policy_gaps)
-
-                # Merge connector-reported gaps
-                if self.connector is not None:
-                    connector_gaps = self.connector.get_computed_token_gaps(request)
-                    if connector_gaps:
-                        logger.info(
-                            "Connector %s returned gaps via get_computed_token_gaps(). "
-                            "Consider migrating to use GapPolicy at scheduler level.",
-                            type(self.connector).__name__,
-                        )
-                        computed_token_gaps.extend(connector_gaps)
-
-                # Merge and deduplicate gaps if needed
-                if computed_token_gaps:
-                    computed_token_gaps = self._merge_gaps(computed_token_gaps)
-
-                if not computed_token_gaps:
-                    continue
-
-                logger.info(
-                    "Processing computed_token_gaps for request %s: %s",
-                    request.request_id,
-                    computed_token_gaps,
+        for request, computed_token_gaps in gap_only_new_reqs:
+            block_ids = self.kv_cache_manager.get_blocks(
+                request.request_id
+            ).get_block_ids()
+            if self.use_v2_model_runner:
+                nrd = NewRequestData.from_request(
+                    request, block_ids, request._all_token_ids
                 )
-                for start, end in computed_token_gaps:
-                    nrd_copy = replace(nrd)
-                    parent_req_id = nrd_copy.req_id  # Save parent before modification
-                    nrd_copy.req_id = nrd_copy.req_id + "." + str(start)
-                    # Virtual gap requests share parent's blocks and write directly
-                    # to gap positions in parent's KV cache. num_computed_tokens=start
-                    # makes positions [start, start+1, ...] which map to gap slots.
-                    nrd_copy.num_computed_tokens = start
-                    nrd_copy.is_gap_recompute = True
-                    nrd_copy.parent_req_id = parent_req_id
-                    nrd_copy.gap_start = start  # For cleanup tracking
-                    req_copy_num_sched_tokens = end - start
-                    num_scheduled_tokens[nrd_copy.req_id] = req_copy_num_sched_tokens
-                    total_num_scheduled_tokens += req_copy_num_sched_tokens
-                    # Virtual request shares ALL parent's blocks so slot mappings
-                    # point to correct positions in parent's KV cache
-                    nrd_copy.block_ids = nrd.block_ids
-                    # For virtual gap request, include prefix + gap tokens (tokens
-                    # up to end). This ensures token_indices correctly map to
-                    # position num_computed_tokens=start, since positions are
-                    # based on num_computed_tokens and prompt_token_ids must
-                    # include the prefix the model assumes is computed.
-                    nrd_copy.prompt_token_ids = (
-                        nrd.prompt_token_ids[:end]
-                        if nrd.prompt_token_ids is not None
-                        else None
-                    )
-                    # For v2 model runner, prefill_token_ids also needs to be set
-                    if self.use_v2_model_runner and nrd.prefill_token_ids is not None:
-                        nrd_copy.prefill_token_ids = nrd.prefill_token_ids[:end]
-                    new_reqs_data.append(nrd_copy)
-                    # Track this virtual request ID for cleanup
-                    virtual_gap_req_ids.add(nrd_copy.req_id)
+            else:
+                nrd = NewRequestData.from_request(request, block_ids)
+
+            logger.info(
+                "Processing computed_token_gaps for request %s: %s",
+                request.request_id,
+                computed_token_gaps,
+            )
+            for start, end in computed_token_gaps:
+                nrd_copy = replace(nrd)
+                parent_req_id = nrd_copy.req_id  # Save parent before modification
+                nrd_copy.req_id = nrd_copy.req_id + "." + str(start)
+                # Virtual gap requests share parent's blocks and write directly
+                # to gap positions in parent's KV cache. num_computed_tokens=start
+                # makes positions [start, start+1, ...] which map to gap slots.
+                nrd_copy.num_computed_tokens = start
+                nrd_copy.is_gap_recompute = True
+                nrd_copy.parent_req_id = parent_req_id
+                nrd_copy.gap_start = start  # For cleanup tracking
+                req_copy_num_sched_tokens = end - start
+                num_scheduled_tokens[nrd_copy.req_id] = req_copy_num_sched_tokens
+                total_num_scheduled_tokens += req_copy_num_sched_tokens
+                # Virtual request shares ALL parent's blocks so slot mappings
+                # point to correct positions in parent's KV cache
+                nrd_copy.block_ids = nrd.block_ids
+                # For virtual gap request, include prefix + gap tokens (tokens
+                # up to end). This ensures token_indices correctly map to
+                # position num_computed_tokens=start, since positions are
+                # based on num_computed_tokens and prompt_token_ids must
+                # include the prefix the model assumes is computed.
+                nrd_copy.prompt_token_ids = (
+                    nrd.prompt_token_ids[:end]
+                    if nrd.prompt_token_ids is not None
+                    else None
+                )
+                # For v2 model runner, prefill_token_ids also needs to be set
+                if self.use_v2_model_runner and nrd.prefill_token_ids is not None:
+                    nrd_copy.prefill_token_ids = nrd.prefill_token_ids[:end]
+                new_reqs_data.append(nrd_copy)
+                # Track this virtual request ID for cleanup
+                virtual_gap_req_ids.add(nrd_copy.req_id)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -1175,6 +1178,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
+        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1610,6 +1614,12 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        if scheduler_output.virtual_gap_req_ids:
+            self.finished_gap_recompute_req_ids.update(
+                req_id.rsplit(".", 1)[0]
+                for req_id in scheduler_output.virtual_gap_req_ids
+            )
+
         # QUEST: persist worker-measured span-block selections, keyed by the
         # span's first pic block hash so any later prompt reusing the span
         # recomputes the query-preferred blocks.
@@ -1961,6 +1971,7 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_GAP_RECOMPUTE,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
@@ -2192,6 +2203,8 @@ class Scheduler(SchedulerInterface):
                 )
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
+            elif request.status == RequestStatus.WAITING_FOR_GAP_RECOMPUTE:
+                self.finished_gap_recompute_req_ids.discard(request.request_id)
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
@@ -2547,6 +2560,16 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            if request.num_preemptions:
+                request.status = RequestStatus.PREEMPTED
+            else:
+                request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_GAP_RECOMPUTE:
+            if request.request_id not in self.finished_gap_recompute_req_ids:
+                return False
+            self.finished_gap_recompute_req_ids.remove(request.request_id)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
