@@ -132,3 +132,41 @@ def test_block_size_constant_matches_conftest():
     """Defensive: tests assume block_size == 16. If conftest changes, tests
     that rely on PIC alignment must be revisited."""
     assert BLOCK_SIZE == 16
+
+
+def test_adjacent_spans_with_trailing_query_match_fr(model, monkeypatch):
+    """Adjacent spans + trailing query must still match FR exactly.
+
+    The client omits a cross for a span whose end coincides with the next
+    span's start (adjacent spans), so cross_span_starts is SHORTER than
+    span_starts. Pairing crosses to spans by index then paints the last
+    span's attention lower bound over the trailing query and the generated
+    tokens - the model decodes blind to everything before the last span and
+    degenerates. Regression for the m2w multi-DOM-chunk layout; the
+    single-span [0] matrix above cannot see it.
+    """
+    prefix = list(range(0, BLOCK_SIZE))
+    span_a = list(range(300, 300 + BLOCK_SIZE * 2))
+    span_b = list(range(700, 700 + BLOCK_SIZE * 2))
+    tail = list(range(1100, 1100 + BLOCK_SIZE))
+    prompt = prefix + span_a + span_b + tail
+    # span_a ends where span_b starts: its cross is skipped client-side.
+    extra = {
+        "span_starts": [BLOCK_SIZE, BLOCK_SIZE * 3],
+        "cross_span_starts": [BLOCK_SIZE * 5],
+    }
+    out = {}
+    for mode, ea in (("FR", None), ("SPANS", extra)):
+        llm = build_llm(model, mode, monkeypatch)
+        try:
+            o = generate_single_output(
+                llm, prompt, greedy_sp(ea, logprobs=LOGPROBS_TOPK)
+            ).outputs[0]
+            out[mode] = (o.text, extract_step0_topk(o, LOGPROBS_TOPK))
+        finally:
+            cleanup(llm)
+    assert out["SPANS"] == out["FR"], (
+        "adjacent spans + trailing query drifted from FR (cross/span "
+        "pairing bug)\n"
+        f"  FR:    {out['FR'][0]!r}\n  SPANS: {out['SPANS'][0]!r}"
+    )
