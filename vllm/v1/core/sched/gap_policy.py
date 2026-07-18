@@ -287,7 +287,10 @@ class QuestGapPolicy(SpanAwareGapPolicy):
             return super()._span_gap_ranges(request, span_start, end_lim)
 
         selected_offsets = []
-        anchor_count = min(self.anchor_blocks, budget, n_blocks)
+        # With a stored selection, the anchor takes at most half the budget so
+        # query-selected blocks always get the rest (at gap-128 the full
+        # 8-block anchor would otherwise consume the whole budget).
+        anchor_count = min(self.anchor_blocks, budget // 2, n_blocks)
         for o in range(anchor_count):
             selected_offsets.append(o)
 

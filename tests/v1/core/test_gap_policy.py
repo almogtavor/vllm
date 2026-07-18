@@ -211,3 +211,24 @@ class TestQuestGapPolicy:
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
 
         assert gaps == [(64, 80), (96, 112), (176, 192)]
+
+    def test_anchor_capped_at_half_budget_when_selection_exists(self):
+        # gap-128: budget 8 blocks; the default 8-block anchor must leave
+        # half the budget for query-selected blocks.
+        policy = QuestGapPolicy(gap_length=128, block_size=16, anchor_blocks=8)
+        req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
+        req.block_hashes = [bytes([b]) for b in range(512 // 16)]
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [20, 10, 15, 12, 6])
+
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+
+        # anchor blocks 0-3 (one coalesced gap) + selected offsets 20,10,15,12
+        assert gaps == [
+            (64, 128),
+            (224, 240),
+            (256, 272),
+            (304, 320),
+            (384, 400),
+        ]
