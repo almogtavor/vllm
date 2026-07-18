@@ -437,6 +437,28 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+def compute_span_lb_regions(
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+    req_len: int,
+) -> list[tuple[int, int, int]]:
+    """SPANS: (start, end, lb) attention-lower-bound regions for a request.
+
+    A span's lb region ends at the NEXT boundary after it: the next span's
+    start (adjacent spans carry no cross of their own - the client skips
+    crosses that coincide with a span start) or the first cross past it.
+    Index-pairing crosses to spans mis-paints lb over later spans and the
+    generated tail whenever spans are adjacent."""
+    crosses = sorted(cross_span_starts or [])
+    spans_sorted = sorted(span_starts)
+    out = []
+    for j, start in enumerate(spans_sorted):
+        nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
+        cross = next((c for c in crosses if c > start), req_len)
+        out.append((start, min(nxt, cross), start))
+    return out
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -1990,24 +2012,11 @@ class GPUModelRunner(
                 spans = ea.get("span_starts") if ea else None
                 if not spans:
                     continue
-                crosses = sorted(ea.get("cross_span_starts") or [])
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-                # A span's lb region ends at the NEXT boundary after it: the
-                # next span's start (adjacent spans have no cross of their
-                # own - the client skips crosses that coincide with a span
-                # start) or the first cross past it. Index-pairing crosses to
-                # spans mis-paints lb over later spans and the generated tail
-                # whenever spans are adjacent.
-                spans_sorted = sorted(spans)
-                for j, span_start in enumerate(spans_sorted):
-                    nxt = (
-                        spans_sorted[j + 1]
-                        if j + 1 < len(spans_sorted) else req_len
-                    )
-                    cross = next((c for c in crosses if c > span_start), req_len)
-                    attn_lb[
-                        req_start + span_start : req_start + min(nxt, cross)
-                    ] = span_start
+                for start, end, lb in compute_span_lb_regions(
+                    spans, ea.get("cross_span_starts"), req_len
+                ):
+                    attn_lb[req_start + start : req_start + end] = lb
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
                 self.device, non_blocking=True)
