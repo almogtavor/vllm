@@ -202,10 +202,18 @@ class QuestGapPolicy(SpanAwareGapPolicy):
     attends the full causal prefix."""
 
     MAX_SELECTIONS = 4096
+    DEFAULT_ANCHOR_BLOCKS = 4
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        anchor_blocks: int = DEFAULT_ANCHOR_BLOCKS,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        self.anchor_blocks = max(anchor_blocks, 0)
         self.selections: dict[tuple[BlockHash, tuple[int, ...]], list[int]] = {}
+        logger.info("QuestGapPolicy initialized: anchor_blocks=%d", anchor_blocks)
 
     def get_selection_key(
         self,
@@ -257,12 +265,26 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         self, request: "Request", span_start: int, end_lim: int
     ) -> list[tuple[int, int]]:
         bs = self.block_size
+        budget = self.gap_length // bs
+        if budget <= 0:
+            return []
+
         key = self.get_selection_key(request, span_start)
         offsets = self.selections.get(key) if key is not None else None
         if not offsets:
             return super()._span_gap_ranges(request, span_start, end_lim)
+
+        selected_offsets = []
+        for o in range(min(self.anchor_blocks, budget)):
+            selected_offsets.append(o)
+        for o in offsets:
+            if len(selected_offsets) >= budget:
+                break
+            if o not in selected_offsets:
+                selected_offsets.append(o)
+
         gaps = []
-        for o in sorted(offsets[: self.gap_length // bs]):
+        for o in sorted(selected_offsets):
             s = span_start + o * bs
             e = min(s + bs, end_lim)
             if e <= s:

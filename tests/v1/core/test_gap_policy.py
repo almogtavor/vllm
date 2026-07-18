@@ -117,7 +117,9 @@ class TestQuestGapPolicy:
         assert gaps == [(64, 96), (128, 160)]
 
     def test_selection_emits_scattered_single_block_gaps(self):
-        policy = QuestGapPolicy(gap_length=32, block_size=16)  # budget: 2 blocks
+        policy = QuestGapPolicy(
+            gap_length=32, block_size=16, anchor_blocks=0
+        )  # budget: 2 blocks
         req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
         req.block_hashes = [bytes([b]) for b in range(256 // 16)]
         key = policy.get_selection_key(req, 64)
@@ -127,7 +129,7 @@ class TestQuestGapPolicy:
         assert gaps == [(96, 112), (176, 192)]  # span_start + {2,7}*16
 
     def test_selection_clamped_and_per_span(self):
-        policy = QuestGapPolicy(gap_length=32, block_size=16)
+        policy = QuestGapPolicy(gap_length=32, block_size=16, anchor_blocks=0)
         req = make_span_request(
             256, span_starts=[64, 128], cross_span_starts=[224, 240]
         )
@@ -146,7 +148,9 @@ class TestQuestGapPolicy:
         assert policy.gap_length == 64
 
     def test_adjacent_selected_blocks_coalesce(self):
-        policy = QuestGapPolicy(gap_length=48, block_size=16)  # budget: 3
+        policy = QuestGapPolicy(
+            gap_length=48, block_size=16, anchor_blocks=0
+        )  # budget: 3
         req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
         req.block_hashes = [bytes([b]) for b in range(256 // 16)]
         key = policy.get_selection_key(req, 64)
@@ -175,3 +179,15 @@ class TestQuestGapPolicy:
 
         gaps = policy.get_gaps(other, num_computed_tokens=256, num_external_tokens=0)
         assert gaps == [(64, 96)]
+
+    def test_selection_uses_anchor_within_same_budget(self):
+        policy = QuestGapPolicy(gap_length=48, block_size=16, anchor_blocks=1)
+        req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
+        req.block_hashes = [bytes([b]) for b in range(256 // 16)]
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [7, 2])
+
+        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
+
+        assert gaps == [(64, 80), (96, 112), (176, 192)]
