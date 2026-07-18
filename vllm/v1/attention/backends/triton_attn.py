@@ -255,6 +255,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             if (
                 envs.VLLM_V1_SPANS_PREROTATE
                 and cos_sin_cache is not None
+                and common_attn_metadata.spans_prerotate_safe
                 and max_query_len > 1
             ):
                 blk = self.block_size
@@ -262,14 +263,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 starts = torch.cumsum(nblk, 0) - nblk
                 total = int(nblk.sum().item())
                 # 2B/elt (bf16/fp16); fp8 rejected at use time
-                scratch_mb = (
-                    total * blk * self.num_heads_kv * self.headdim * 2
-                ) // (1024 * 1024)
-                if 0 < total and scratch_mb <= PREROTATE_MAX_SCRATCH_MB:
+                scratch_mb = (total * blk * self.num_heads_kv * self.headdim * 2) // (
+                    1024 * 1024
+                )
+                if total > 0 and scratch_mb <= PREROTATE_MAX_SCRATCH_MB:
                     width = block_table_tensor.shape[1]
-                    ar = torch.arange(
-                        width, device=seq_lens.device, dtype=torch.int32
-                    )
+                    ar = torch.arange(width, device=seq_lens.device, dtype=torch.int32)
                     k_scratch_block_table = (
                         starts.to(torch.int32)[:, None] + ar[None, :]
                     ).clamp_(max=max(total - 1, 0))
@@ -715,7 +714,7 @@ class TritonAttentionImpl(AttentionImpl):
         # SPANS only (cos_sin_cache is set just when VLLM_V1_SPANS_ENABLED): rotate
         # K in-kernel with THIS layer's RoPE. Models with per-layer-type RoPE
         # (e.g. gemma-4's local vs global theta) need each layer's own cache; the
-        # metadata carries only the first layer's, which mis-rotates the rest.
+        # metadata carries only the first layer's, which rotates the rest wrongly.
         # Uniform-RoPE models keep the shared cache. FR (cache is None) is untouched.
         cos_sin_cache = attn_metadata.cos_sin_cache
         rotary_dim = attn_metadata.rotary_dim
@@ -735,9 +734,7 @@ class TritonAttentionImpl(AttentionImpl):
             and self._kv_quant_mode == KVQuantMode.NONE
             and not self.use_td
         ):
-            k_scratch = _get_k_scratch(
-                key_cache, attn_metadata.k_scratch_total_blocks
-            )
+            k_scratch = _get_k_scratch(key_cache, attn_metadata.k_scratch_total_blocks)
             rotate_k_prepass(
                 key_cache,
                 k_scratch,

@@ -111,6 +111,7 @@ class Request:
         self.pd_block_hashes: list[BlockHash] = []
         self.pic_token_ranges: list[tuple[int, int | None]] = []
         self.prefix_hit_sources: list[PrefixHitSource] | None = None
+        self.pending_span_gaps: list[tuple[int, int]] = []
 
         if pooling_params is not None:
             # Pooling models.
@@ -145,9 +146,7 @@ class Request:
                 nxt = spans_sorted[i + 1] if i + 1 < len(spans_sorted) else None
                 cross = next((c for c in crosses if c > span_start), None)
                 ends = [e for e in (nxt, cross) if e is not None]
-                self.pic_token_ranges.append(
-                    (span_start, min(ends) if ends else None)
-                )
+                self.pic_token_ranges.append((span_start, min(ends) if ends else None))
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds

@@ -279,9 +279,9 @@ def kernel_rotate_k_prepass(
     src_blk = tl.load(block_tables_ptr + seq_idx * block_table_stride + blk_j).to(
         tl.int64
     )
-    dst_blk = tl.load(
-        k_scratch_tables_ptr + seq_idx * scratch_table_stride + blk_j
-    ).to(tl.int64)
+    dst_blk = tl.load(k_scratch_tables_ptr + seq_idx * scratch_table_stride + blk_j).to(
+        tl.int64
+    )
 
     offs_s = tl.arange(0, BLOCK_SIZE)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
@@ -630,7 +630,9 @@ def kernel_unified_attention(
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
         q_lb_vec = tl.load(
             attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
-            mask=query_mask_0, other=INT32_MAX)
+            mask=query_mask_0,
+            other=INT32_MAX,
+        )
         # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
         span_offset = tl.min(q_lb_vec)
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
@@ -644,7 +646,9 @@ def kernel_unified_attention(
         if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
             key_span_lb = tl.load(
                 attn_lower_bounds_ptr + req_kv_start + seq_offset,
-                mask=tile_mask, other=0)
+                mask=tile_mask,
+                other=0,
+            )
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -706,8 +710,11 @@ def kernel_unified_attention(
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
             if FUSE_ROPE:
-                # rel position: per-key span lb when USE_SPAN, else scalar 0
-                key_pos_shift = key_span_lb if USE_SPAN else span_offset
+                # SPANS: span-local queries see span-relative keys, but
+                # cross-tail queries (lb=0) must see absolute-position keys.
+                key_pos_shift = (
+                    tl.minimum(key_span_lb, span_offset) if USE_SPAN else span_offset
+                )
                 k_base = (
                     physical_block_idx * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
