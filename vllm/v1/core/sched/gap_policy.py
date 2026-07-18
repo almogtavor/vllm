@@ -197,7 +197,8 @@ class QuestGapPolicy(SpanAwareGapPolicy):
     Scores are measured worker-side at the span's first occurrence against its
     first post-span query and stored here keyed by both the span's first pic
     block hash and first following query tokens. A span with no stored
-    selection falls back to the contiguous span_aware gap.
+    selection falls back to anchor blocks, or to the contiguous span_aware gap
+    when anchoring is disabled.
     """
 
     MAX_SELECTIONS = 4096
@@ -290,18 +291,16 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         for o in range(anchor_count):
             selected_offsets.append(o)
 
-        remaining = min(budget - len(selected_offsets), n_blocks - anchor_count)
-        if remaining > 0:
-            target = next(
-                (o for o in offsets if anchor_count <= o < n_blocks),
-                anchor_count,
-            )
-            window_start = max(anchor_count, target - remaining + 1)
-            window_end = min(window_start + remaining, n_blocks)
-            if window_end - window_start < remaining:
-                window_start = max(anchor_count, n_blocks - remaining)
-                window_end = n_blocks
-            selected_offsets.extend(range(window_start, window_end))
+        selected = set(selected_offsets)
+        remaining = budget - len(selected_offsets)
+        for offset in offsets:
+            if remaining <= 0:
+                break
+            if offset < anchor_count or offset >= n_blocks or offset in selected:
+                continue
+            selected_offsets.append(offset)
+            selected.add(offset)
+            remaining -= 1
 
         gaps = []
         for o in sorted(selected_offsets):
