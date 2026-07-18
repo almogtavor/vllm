@@ -60,7 +60,43 @@ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 QUEST_CAPTURE: list[tuple[torch.Tensor, torch.Tensor]] = []
 
 
-def _quest_score_spans(attn_metadata, query, key_cache, num_queries_per_kv):
+def _rotate_k_for_quest_score(
+    k_blk: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int,
+) -> torch.Tensor:
+    if cos_sin_cache is None:
+        return k_blk.float()
+
+    head_size = k_blk.shape[-1]
+    rot = head_size if rotary_dim <= 0 or rotary_dim > head_size else rotary_dim
+    half_rot = rot // 2
+    if half_rot <= 0:
+        return k_blk.float()
+
+    k_rot = k_blk.float().clone()
+    rel_pos = torch.arange(
+        k_blk.shape[0] * k_blk.shape[1],
+        device=k_blk.device,
+        dtype=torch.long,
+    ).view(k_blk.shape[0], k_blk.shape[1])
+    cos = cos_sin_cache[rel_pos, :half_rot].float().unsqueeze(2)
+    sin = cos_sin_cache[rel_pos, half_rot:rot].float().unsqueeze(2)
+    first = k_rot[..., :half_rot].clone()
+    second = k_rot[..., half_rot:rot].clone()
+    k_rot[..., :half_rot] = first * cos - second * sin
+    k_rot[..., half_rot:rot] = second * cos + first * sin
+    return k_rot
+
+
+def _quest_score_spans(
+    attn_metadata,
+    query,
+    key_cache,
+    num_queries_per_kv,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int,
+):
     """QUEST: score each span block by the upper bound
     ``sum_i max(q_i*m_i, q_i*M_i)`` (channel-wise K min/max, scratch only,
     never stored) against the span's first following query row, accumulating
@@ -71,7 +107,9 @@ def _quest_score_spans(attn_metadata, query, key_cache, num_queries_per_kv):
         return
     for d, (row, s_blk, n_blk, q_row) in enumerate(descs):
         blk_ids = attn_metadata.block_table[row, s_blk : s_blk + n_blk].long()
-        k_blk = key_cache[blk_ids].float()  # (n_blk, bs, n_kv_heads, head)
+        k_blk = _rotate_k_for_quest_score(
+            key_cache[blk_ids], cos_sin_cache, rotary_dim
+        )
         q = query[q_row].float()
         q = q.view(-1, num_queries_per_kv, q.shape[-1]).mean(1)  # (n_kv_h, hd)
         score = torch.maximum(q * k_blk.amin(1), q * k_blk.amax(1)).sum((1, 2))
@@ -701,7 +739,14 @@ class TritonAttentionImpl(AttentionImpl):
             rotary_dim = getattr(layer, "spans_rotary_dim", rotary_dim)
         attn_lower_bounds = attn_metadata.attn_lower_bounds
         req_kv_starts = attn_metadata.req_kv_starts
-        _quest_score_spans(attn_metadata, query, key_cache, self.num_queries_per_kv)
+        _quest_score_spans(
+            attn_metadata,
+            query,
+            key_cache,
+            self.num_queries_per_kv,
+            cos_sin_cache,
+            rotary_dim,
+        )
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 

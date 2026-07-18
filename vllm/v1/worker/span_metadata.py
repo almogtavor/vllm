@@ -9,6 +9,22 @@ import torch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
+def compute_span_lb_regions(
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+    req_len: int,
+) -> list[tuple[int, int, int]]:
+    """Return (start, end, lower_bound) regions for span attention."""
+    crosses = sorted(cross_span_starts or [])
+    spans_sorted = sorted(span_starts)
+    regions = []
+    for idx, span_start in enumerate(spans_sorted):
+        next_span = spans_sorted[idx + 1] if idx + 1 < len(spans_sorted) else req_len
+        cross = next((c for c in crosses if c > span_start), req_len)
+        regions.append((span_start, min(next_span, cross), span_start))
+    return regions
+
+
 def build_span_attention_metadata(
     req_states: Sequence[CachedRequestState],
     num_computed: np.ndarray,
@@ -38,15 +54,15 @@ def build_span_attention_metadata(
         spans = extra_args.get("span_starts") if extra_args else None
         if not spans:
             continue
-        crosses = extra_args.get("cross_span_starts") or []
         req_start = int(req_kv_starts[i])
         req_len = int(seq_lens_arr[i])
         nc = int(num_computed[i])
         ns = int(num_scheduled_tokens[i])
-        for j, span_start in enumerate(spans):
+        for span_start, cross, _ in compute_span_lb_regions(
+            spans, extra_args.get("cross_span_starts"), req_len
+        ):
             if span_start >= req_len:
                 continue
-            cross = crosses[j] if j < len(crosses) else req_len
             cross = min(cross, req_len)
             if cross <= span_start:
                 continue

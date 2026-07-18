@@ -136,9 +136,16 @@ class Request:
 
         if self.span_starts:
             crosses = sorted(self.cross_span_starts or [])
-            for span_start in sorted(self.span_starts):
-                end = next((c for c in crosses if c > span_start), None)
-                self.pic_token_ranges.append((span_start, end))
+            spans_sorted = sorted(self.span_starts)
+            for idx, span_start in enumerate(spans_sorted):
+                next_span = (
+                    spans_sorted[idx + 1] if idx + 1 < len(spans_sorted) else None
+                )
+                cross = next((c for c in crosses if c > span_start), None)
+                ends = [end for end in (next_span, cross) if end is not None]
+                self.pic_token_ranges.append(
+                    (span_start, min(ends) if ends else None)
+                )
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds

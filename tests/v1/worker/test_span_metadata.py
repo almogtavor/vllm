@@ -5,10 +5,44 @@ import numpy as np
 import pytest
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.request import Request
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.span_metadata import build_span_attention_metadata
+from vllm.v1.worker.span_metadata import (
+    build_span_attention_metadata,
+    compute_span_lb_regions,
+)
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_adjacent_spans_stop_at_next_boundary():
+    regions = compute_span_lb_regions([16, 48], [80], 128)
+    assert regions == [(16, 48, 16), (48, 80, 48)]
+
+
+def test_request_pic_token_ranges_stop_at_next_span():
+    import vllm.envs as envs
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            extra_args={
+                "span_starts": [16, 48],
+                "cross_span_starts": [80],
+            },
+        )
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        req = Request(
+            request_id="adjacent_spans",
+            prompt_token_ids=list(range(128)),
+            sampling_params=sampling_params,
+            pooling_params=None,
+        )
+        assert req.pic_token_ranges == [(16, 48), (48, 80)]
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
 
 
 def test_virtual_gap_recompute_keeps_span_bounds_without_quest_scoring():
