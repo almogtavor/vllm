@@ -192,14 +192,13 @@ class SpanAwareGapPolicy(GapPolicy):
 
 
 class QuestGapPolicy(SpanAwareGapPolicy):
-    """Recompute the ``gap_length/block_size`` span blocks the following query
-    attends most (Quest upper-bound score, Tang et al. ICML 2024) instead of
-    the span's first ``gap_length`` tokens. Scores are measured worker-side at
-    the span's first occurrence against its first post-span query and stored
-    here keyed by both the span's first pic block hash and first following
-    query tokens; a span with no stored selection falls back to the contiguous
-    span_aware gap. Each selected block becomes its own gap, so its recompute
-    attends the full causal prefix."""
+    """Recompute span blocks selected by the following query's Quest score.
+
+    Scores are measured worker-side at the span's first occurrence against its
+    first post-span query and stored here keyed by both the span's first pic
+    block hash and first following query tokens. A span with no stored
+    selection falls back to the contiguous span_aware gap.
+    """
 
     MAX_SELECTIONS = 4096
     DEFAULT_ANCHOR_BLOCKS = 4
@@ -274,14 +273,27 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         if not offsets:
             return super()._span_gap_ranges(request, span_start, end_lim)
 
+        n_blocks = (end_lim - span_start + bs - 1) // bs
+        if n_blocks <= 0:
+            return []
+
         selected_offsets = []
-        for o in range(min(self.anchor_blocks, budget)):
+        anchor_count = min(self.anchor_blocks, budget, n_blocks)
+        for o in range(anchor_count):
             selected_offsets.append(o)
-        for o in offsets:
-            if len(selected_offsets) >= budget:
-                break
-            if o not in selected_offsets:
-                selected_offsets.append(o)
+
+        remaining = min(budget - len(selected_offsets), n_blocks - anchor_count)
+        if remaining > 0:
+            target = next(
+                (o for o in offsets if anchor_count <= o < n_blocks),
+                anchor_count,
+            )
+            window_start = max(anchor_count, target - remaining + 1)
+            window_end = min(window_start + remaining, n_blocks)
+            if window_end - window_start < remaining:
+                window_start = max(anchor_count, n_blocks - remaining)
+                window_end = n_blocks
+            selected_offsets.extend(range(window_start, window_end))
 
         gaps = []
         for o in sorted(selected_offsets):

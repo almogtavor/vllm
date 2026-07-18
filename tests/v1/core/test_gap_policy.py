@@ -116,7 +116,7 @@ class TestQuestGapPolicy:
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
         assert gaps == [(64, 96), (128, 160)]
 
-    def test_selection_emits_scattered_single_block_gaps(self):
+    def test_selection_emits_contiguous_quest_window(self):
         policy = QuestGapPolicy(
             gap_length=32, block_size=16, anchor_blocks=0
         )  # budget: 2 blocks
@@ -126,7 +126,7 @@ class TestQuestGapPolicy:
         assert key is not None
         policy.store_selection(key, [7, 2])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
-        assert gaps == [(96, 112), (176, 192)]  # span_start + {2,7}*16
+        assert gaps == [(160, 192)]  # span_start + {6,7}*16
 
     def test_selection_clamped_and_per_span(self):
         policy = QuestGapPolicy(gap_length=32, block_size=16, anchor_blocks=0)
@@ -140,7 +140,7 @@ class TestQuestGapPolicy:
         assert key is not None
         policy.store_selection(key, [1, 5])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
-        assert gaps == [(80, 96), (128, 160)]
+        assert gaps == [(64, 96), (128, 160)]
 
     def test_factory_creates_quest(self):
         policy = GapPolicyFactory.create_policy("span_quest", {"gap_length": 64})
@@ -157,7 +157,7 @@ class TestQuestGapPolicy:
         assert key is not None
         policy.store_selection(key, [3, 4, 0])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
-        assert gaps == [(64, 80), (112, 144)]  # offsets 3,4 merge into one gap
+        assert gaps == [(80, 128)]  # offsets 1,2,3 merge into one gap
 
     def test_selection_requires_matching_following_query_tokens(self):
         policy = QuestGapPolicy(gap_length=32, block_size=16)
@@ -190,4 +190,4 @@ class TestQuestGapPolicy:
 
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
 
-        assert gaps == [(64, 80), (96, 112), (176, 192)]
+        assert gaps == [(64, 80), (160, 192)]
