@@ -147,6 +147,18 @@ class TestQuestGapPolicy:
         assert isinstance(policy, QuestGapPolicy)
         assert policy.gap_length == 64
 
+    def test_default_anchor_uses_first_128_tokens_within_budget(self):
+        policy = QuestGapPolicy(gap_length=256, block_size=16)
+        req = make_span_request(512, span_starts=[64], cross_span_starts=[448])
+        req.block_hashes = [bytes([b]) for b in range(512 // 16)]
+        key = policy.get_selection_key(req, 64)
+        assert key is not None
+        policy.store_selection(key, [18])
+
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+
+        assert gaps == [(64, 192), (240, 368)]
+
     def test_adjacent_selected_blocks_coalesce(self):
         policy = QuestGapPolicy(
             gap_length=48, block_size=16, anchor_blocks=0

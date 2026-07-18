@@ -201,7 +201,7 @@ class QuestGapPolicy(SpanAwareGapPolicy):
     """
 
     MAX_SELECTIONS = 4096
-    DEFAULT_ANCHOR_BLOCKS = 4
+    DEFAULT_ANCHOR_BLOCKS = 8
 
     def __init__(
         self,
