@@ -25,6 +25,19 @@ def compute_span_lb_regions(
     return regions
 
 
+def _following_query_start(
+    span_start: int,
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+) -> int | None:
+    crosses = cross_span_starts or []
+    for idx, start in enumerate(span_starts):
+        if start == span_start and idx < len(crosses):
+            cross = crosses[idx]
+            return cross if cross > span_start else None
+    return next((cross for cross in sorted(crosses) if cross > span_start), None)
+
+
 def build_span_attention_metadata(
     req_states: Sequence[CachedRequestState],
     num_computed: np.ndarray,
@@ -58,29 +71,32 @@ def build_span_attention_metadata(
         req_len = int(seq_lens_arr[i])
         nc = int(num_computed[i])
         ns = int(num_scheduled_tokens[i])
-        for span_start, cross, _ in compute_span_lb_regions(
-            spans, extra_args.get("cross_span_starts"), req_len
+        crosses = extra_args.get("cross_span_starts")
+        for span_start, region_end, _ in compute_span_lb_regions(
+            spans, crosses, req_len
         ):
             if span_start >= req_len:
                 continue
-            cross = min(cross, req_len)
-            if cross <= span_start:
+            region_end = min(region_end, req_len)
+            if region_end <= span_start:
                 continue
-            attn_lb[req_start + span_start:req_start + cross] = span_start
+            attn_lb[req_start + span_start:req_start + region_end] = span_start
 
-            n_blk = (cross - span_start) // block_size
+            n_blk = (region_end - span_start) // block_size
+            query_start = _following_query_start(span_start, spans, crosses)
             # Virtual gap rows repair cached KV and must not update Quest scores.
             if (
                 not req.is_gap_recompute
+                and query_start is not None
                 and 0 < quest_top_k < n_blk
-                and nc <= cross < nc + ns
+                and nc <= query_start < nc + ns
             ):
                 quest_score_descs.append(
                     (
                         i,
                         span_start // block_size,
                         n_blk,
-                        int(q_start[i]) + cross - nc,
+                        int(q_start[i]) + query_start - nc,
                     )
                 )
                 quest_span_scores.append(torch.zeros(n_blk, device=device))

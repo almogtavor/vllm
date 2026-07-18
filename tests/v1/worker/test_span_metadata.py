@@ -20,6 +20,39 @@ def test_adjacent_spans_stop_at_next_boundary():
     assert regions == [(16, 48, 16), (48, 80, 48)]
 
 
+def test_quest_scores_adjacent_spans_against_following_query():
+    req = CachedRequestState(
+        req_id="adjacent",
+        prompt_token_ids=list(range(96)),
+        mm_features=[],
+        sampling_params=SamplingParams(
+            extra_args={
+                "span_starts": [16, 48],
+                "cross_span_starts": [80],
+            }
+        ),
+        generator=None,
+        block_ids=([0, 1, 2, 3, 4, 5],),
+        num_computed_tokens=0,
+        output_token_ids=[],
+    )
+
+    attn_lb, _, quest_descs, quest_scores = build_span_attention_metadata(
+        [req],
+        np.array([0], dtype=np.int32),
+        np.array([96], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        block_size=16,
+        quest_top_k=1,
+        device="cpu",
+    )
+
+    assert attn_lb[16:48].tolist() == [16] * 32
+    assert attn_lb[48:80].tolist() == [48] * 32
+    assert quest_descs == [(0, 1, 2, 80), (0, 3, 2, 80)]
+    assert len(quest_scores) == 2
+
+
 def test_request_pic_token_ranges_stop_at_next_span():
     import vllm.envs as envs
 
