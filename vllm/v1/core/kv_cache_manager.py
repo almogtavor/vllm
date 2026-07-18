@@ -358,7 +358,7 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        if num_new_tokens == 0 and num_external_computed_tokens == 0 and not span_gaps:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
                 "external computed tokens"

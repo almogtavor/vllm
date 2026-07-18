@@ -126,9 +126,7 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
         ), "warmed span K/V already matches the reference; recompute is a no-op"
 
         # Phase 3: marked LL request hits prefix+span, recomputes, prefills, decodes.
-        marked_hashes = _request_block_hashes(
-            prompt, span_starts=span_starts, cross_span_starts=cross_span_starts
-        )
+        captured = _capture_request_block_ids(monkeypatch, llm)
         marked_out = generate_single_output(
             llm,
             prompt,
@@ -142,8 +140,13 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
         )
         cached_marked = marked_out.num_cached_tokens
         actual_top = extract_step0_topk(marked_out.outputs[0], LOGPROBS_TOPK)
-        actual_span_kv = [_block_kv(llm, h) for h in marked_hashes[2:4]]
-        actual_cross_tail_kv = [_block_kv(llm, h) for h in marked_hashes[4:6]]
+        block_ids = max(captured.values(), key=len)
+        actual_span_kv = [
+            _physical_block_tensor(llm, block_ids[i]) for i in range(2, 4)
+        ]
+        actual_cross_tail_kv = [
+            _physical_block_tensor(llm, block_ids[i]) for i in range(4, 6)
+        ]
 
         assert cached_marked == BLOCK_SIZE * 4, (
             f"marked request should hit prefix + span (4 blocks); "
