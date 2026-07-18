@@ -159,6 +159,14 @@ class TestQuestGapPolicy:
 
         assert gaps == [(64, 192), (240, 368)]
 
+    def test_no_selection_defaults_to_anchor_not_full_budget(self):
+        policy = QuestGapPolicy(gap_length=256, block_size=16)
+        req = make_span_request(512, span_starts=[64], cross_span_starts=[448])
+
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+
+        assert gaps == [(64, 192)]
+
     def test_adjacent_selected_blocks_coalesce(self):
         policy = QuestGapPolicy(
             gap_length=48, block_size=16, anchor_blocks=0

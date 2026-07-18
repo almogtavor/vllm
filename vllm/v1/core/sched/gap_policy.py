@@ -268,14 +268,22 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         if budget <= 0:
             return []
 
-        key = self.get_selection_key(request, span_start)
-        offsets = self.selections.get(key) if key is not None else None
-        if not offsets:
-            return super()._span_gap_ranges(request, span_start, end_lim)
-
         n_blocks = (end_lim - span_start + bs - 1) // bs
         if n_blocks <= 0:
             return []
+
+        key = self.get_selection_key(request, span_start)
+        offsets = self.selections.get(key) if key is not None else None
+        if not offsets:
+            anchor_count = min(self.anchor_blocks, budget, n_blocks)
+            if anchor_count > 0:
+                return [
+                    (
+                        span_start,
+                        min(span_start + anchor_count * bs, end_lim),
+                    )
+                ]
+            return super()._span_gap_ranges(request, span_start, end_lim)
 
         selected_offsets = []
         anchor_count = min(self.anchor_blocks, budget, n_blocks)
