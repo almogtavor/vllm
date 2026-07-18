@@ -9,15 +9,160 @@ came from (local prefix cache, external connector, or both).
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
+from vllm.v1.core.sched.output import NewRequestData
 
 if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Sentinel: request has no span gaps, so the caller schedules it normally.
+NO_SPAN_GAPS = object()
+
+
+def split_gaps_for_budget(
+    gaps: list[tuple[int, int]], token_budget: int, block_size: int
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split gaps into a block-aligned chunk that fits token_budget and the rest."""
+    block_budget = max(0, token_budget) // block_size * block_size
+    if block_budget <= 0:
+        return [], gaps
+    scheduled: list[tuple[int, int]] = []
+    remaining: list[tuple[int, int]] = []
+    budget = block_budget
+    for start, end in gaps:
+        take = min(end - start, budget)
+        if take < end - start:
+            take = take // block_size * block_size
+        if take <= 0:
+            remaining.append((start, end))
+            continue
+        scheduled.append((start, start + take))
+        budget -= take
+        if start + take < end:
+            remaining.append((start + take, end))
+    return scheduled, remaining
+
+
+def append_virtual_gap_reqs(
+    parent_nrd: NewRequestData,
+    gaps: list[tuple[int, int]],
+    out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    num_scheduled_tokens: dict[str, int],
+) -> None:
+    """Emit one virtual gap-recompute request per gap, sharing the parent's blocks."""
+    logger.info(
+        "Processing computed_token_gaps for request %s: %s", parent_nrd.req_id, gaps
+    )
+    for start, end in gaps:
+        nrd = replace(parent_nrd)
+        nrd.req_id = parent_nrd.req_id + "." + str(start)
+        # Virtual gap requests share the parent's blocks and write directly
+        # to the gap slots in the parent's KV cache.
+        nrd.num_computed_tokens = start
+        nrd.is_gap_recompute = True
+        nrd.parent_req_id = parent_nrd.req_id
+        nrd.gap_start = start
+        nrd.block_ids = parent_nrd.block_ids
+        num_scheduled_tokens[nrd.req_id] = end - start
+        out.append(nrd)
+        virtual_gap_req_ids.add(nrd.req_id)
+
+
+def schedule_span_gaps(
+    sched: "Scheduler",
+    request: "Request",
+    did_prefix_lookup: bool,
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """Reserve gap-recompute work for `request` and defer the parent one step.
+
+    Gaps come from the request's pending remainder, the gap policy, and the
+    connector. Returns NO_SPAN_GAPS when there is nothing to recompute (the
+    caller schedules the request normally), None when there are gaps but no
+    room this step (the caller breaks), or the updated token_budget when the
+    parent was deferred (the caller sets token_budget and continues).
+    """
+    request_id = request.request_id
+    if request.pending_span_gaps:
+        span_gaps = request.pending_span_gaps
+    elif did_prefix_lookup and sched.gap_policy is not None:
+        span_gaps = sched.gap_policy.get_gaps(
+            request, num_computed_tokens, num_external_computed_tokens
+        )
+    else:
+        span_gaps = []
+    if did_prefix_lookup and sched.connector is not None:
+        connector_gaps = sched.connector.get_computed_token_gaps(request)
+        if connector_gaps:
+            logger.info(
+                "Connector %s returned gaps via get_computed_token_gaps(). "
+                "Consider migrating to use GapPolicy at scheduler level.",
+                type(sched.connector).__name__,
+            )
+            span_gaps.extend(connector_gaps)
+    if not span_gaps:
+        return NO_SPAN_GAPS
+
+    span_gaps = sched._merge_gaps(span_gaps)
+    gap_work, remaining_gaps = split_gaps_for_budget(
+        span_gaps, token_budget, sched.block_size
+    )
+    gap_overhead = sum(end - start for start, end in gap_work)
+    if gap_overhead <= 0:
+        return None
+
+    gap_blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        0,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        num_external_computed_tokens=num_external_computed_tokens,
+        span_gaps=gap_work,
+    )
+    if gap_blocks is None:
+        if request.has_encoder_inputs:
+            sched.encoder_cache_manager.free(request)
+        return None
+
+    if sched.connector is not None:
+        sched.connector.update_state_after_alloc(
+            request,
+            sched.kv_cache_manager.get_blocks(request_id),
+            num_external_computed_tokens,
+        )
+
+    request.num_computed_tokens = num_computed_tokens
+    request.pending_span_gaps = remaining_gaps
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request_id).get_block_ids()
+    )
+    append_virtual_gap_reqs(
+        parent_nrd,
+        gap_work,
+        virtual_reqs_out,
+        virtual_gap_req_ids,
+        num_scheduled_tokens,
+    )
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - gap_overhead
 
 
 class GapPolicy(ABC):
