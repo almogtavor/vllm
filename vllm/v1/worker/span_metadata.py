@@ -80,7 +80,13 @@ def build_span_attention_metadata(
             region_end = min(region_end, req_len)
             if region_end <= span_start:
                 continue
-            attn_lb[req_start + span_start:req_start + region_end] = span_start
+            # The lower bound both (1) skips prefix tiles for the span's own
+            # warm query and (2) shifts span keys to span-relative RoPE. A gap
+            # recompute's query MUST attend the real prefix (that is the whole
+            # point of the repair), so it must NOT be clamped to span_start;
+            # leaving attn_lb=0 makes the gap query attend [0, pos) as intended.
+            if not req.is_gap_recompute:
+                attn_lb[req_start + span_start:req_start + region_end] = span_start
 
             n_blk = (region_end - span_start) // block_size
             query_start = _following_query_start(span_start, spans, crosses)

@@ -78,7 +78,7 @@ def test_request_pic_token_ranges_stop_at_next_span():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
-def test_virtual_gap_recompute_keeps_span_bounds_without_quest_scoring():
+def test_virtual_gap_recompute_attends_prefix_without_quest_scoring():
     gap_req = CachedRequestState(
         req_id="gap",
         prompt_token_ids=list(range(48)),
@@ -119,7 +119,10 @@ def test_virtual_gap_recompute_keeps_span_bounds_without_quest_scoring():
     )
 
     assert req_starts.tolist() == [0, 48, 52]
-    assert attn_lb[16:48].tolist() == [16] * 32
+    # A gap recompute must attend the real prefix: its lower bound stays 0
+    # (NOT span_start), otherwise the recompute reproduces the prefix-free warm
+    # KV and repairs nothing.
+    assert attn_lb[16:48].tolist() == [0] * 32
     assert attn_lb[48:52].tolist() == [0] * 4
     assert quest_descs == []
     assert quest_scores == []
