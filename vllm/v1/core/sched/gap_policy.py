@@ -318,12 +318,114 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         return gaps
 
 
+class DeviationGapPolicy(QuestGapPolicy):
+    """Query-aware budget *allocation* across spans, contiguous prefix within one.
+
+    span_quest picks WHICH blocks to rewrite by Quest score, so it emits
+    scattered single-block gaps. That violates the span's causal structure: a
+    block at offset P is only correct once 0..P-1 are prefix-aware, so a
+    scattered rewrite reads still-prefix-free predecessors and leaves the span
+    KV internally inconsistent. Measured per-block deviation from the
+    prefix-aware KV also decays monotonically from the span start, so
+    "most-wrong K blocks" is just "first K" - selecting blocks by deviation
+    re-derives span_aware and cannot beat it.
+
+    What Quest's signal *is* good for is deciding HOW MUCH of each span to
+    repair. span_aware spends an identical gap_length on every span, including
+    ones the next query never looks at. Here each span keeps a causally
+    faithful contiguous prefix, but its length is set by how deep that span's
+    attention actually reaches (max selected block offset + 1), with the total
+    budget across spans held at n_spans * gap_length so this is a reallocation
+    of span_aware's budget, not an increase.
+    """
+
+    def get_gaps(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> list[tuple[int, int]]:
+        # Allocation is cross-span, so the per-span hook is not enough: compute
+        # every span's need first, then hand each span its prefix length.
+        self._alloc = self._allocate(request, num_computed_tokens)
+        try:
+            return super().get_gaps(request, num_computed_tokens, num_external_tokens)
+        finally:
+            self._alloc = None
+
+    def _span_bounds(
+        self, request: "Request", num_computed_tokens: int
+    ) -> list[tuple[int, int]]:
+        starts = [s for s in (request.span_starts or []) if s < num_computed_tokens]
+        bounds = []
+        for idx, s in enumerate(starts):
+            nxt = starts[idx + 1] if idx + 1 < len(starts) else num_computed_tokens
+            bounds.append((s, min(nxt, num_computed_tokens)))
+        return bounds
+
+    def _allocate(
+        self, request: "Request", num_computed_tokens: int
+    ) -> dict[int, int]:
+        """span_start -> number of blocks to recompute (contiguous prefix)."""
+        bs = self.block_size
+        per_span = self.gap_length // bs
+        if per_span <= 0:
+            return {}
+
+        bounds = self._span_bounds(request, num_computed_tokens)
+        if not bounds:
+            return {}
+
+        total_budget = per_span * len(bounds)
+        needs: dict[int, int] = {}
+        for span_start, end_lim in bounds:
+            n_blocks = (end_lim - span_start + bs - 1) // bs
+            key = self.get_selection_key(request, span_start)
+            offsets = self.selections.get(key) if key is not None else None
+            # Attention reaches offset max(offsets); to repair that block
+            # faithfully every predecessor must be repaired too. With no score
+            # yet, fall back to the uniform span_aware length.
+            need = max(offsets) + 1 if offsets else per_span
+            needs[span_start] = max(1, min(need, n_blocks))
+
+        wanted = sum(needs.values())
+        if wanted <= total_budget:
+            return needs
+
+        # Oversubscribed: scale proportionally, keeping >=1 block per span so no
+        # span loses its highest-deviation (first) block.
+        scaled: dict[int, int] = {}
+        for span_start, need in needs.items():
+            scaled[span_start] = max(1, int(need * total_budget / wanted))
+        # Hand any rounding remainder to the neediest spans.
+        leftover = total_budget - sum(scaled.values())
+        for span_start, _ in sorted(needs.items(), key=lambda kv: -kv[1]):
+            if leftover <= 0:
+                break
+            scaled[span_start] += 1
+            leftover -= 1
+        return scaled
+
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
+    ) -> list[tuple[int, int]]:
+        alloc = getattr(self, "_alloc", None)
+        if not alloc:
+            return super()._span_gap_ranges(request, span_start, end_lim)
+        n = alloc.get(span_start, 0)
+        if n <= 0:
+            return []
+        end = min(span_start + n * self.block_size, end_lim)
+        return [(span_start, end)] if end > span_start else []
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
     _POLICIES = {
         "none": NoGapPolicy,
         "span_quest": QuestGapPolicy,
+        "span_devia": DeviationGapPolicy,
         "span_aware": SpanAwareGapPolicy,
     }
 
