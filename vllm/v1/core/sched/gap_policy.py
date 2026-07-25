@@ -377,35 +377,42 @@ class LegoQuestGapPolicy(QuestGapPolicy):
         if not bounds:
             return {}
 
-        total_budget = per_span * len(bounds)
+        # Per-span and independent of the other spans in this request. An
+        # allocation that shifts with the rest of the batch changes the emitted
+        # range for the SAME span between turns, so the recompute-once dedup
+        # (drop a gap whose blocks are all already prefix-aware) never fires and
+        # the span is rewritten every turn: measured 3.6M recompute tokens vs
+        # 275K for span_aware, the same span redone ~7.9k times. Stability
+        # matters more than exactly hitting a global budget, so the length is
+        # clamped per span instead of rescaled across them.
         needs: dict[int, int] = {}
         for span_start, end_lim in bounds:
             n_blocks = (end_lim - span_start + bs - 1) // bs
             key = self.get_selection_key(request, span_start)
             offsets = self.selections.get(key) if key is not None else None
-            # Attention reaches offset max(offsets); to repair that block
-            # faithfully every predecessor must be repaired too. With no score
-            # yet, fall back to the uniform span_aware length.
-            need = max(offsets) + 1 if offsets else per_span
-            needs[span_start] = max(1, min(need, n_blocks))
+            needs[span_start] = self._span_need(offsets, per_span, n_blocks)
+        return needs
 
-        wanted = sum(needs.values())
-        if wanted <= total_budget:
-            return needs
-
-        # Oversubscribed: scale proportionally, keeping >=1 block per span so no
-        # span loses its highest-deviation (first) block.
-        scaled: dict[int, int] = {}
-        for span_start, need in needs.items():
-            scaled[span_start] = max(1, int(need * total_budget / wanted))
-        # Hand any rounding remainder to the neediest spans.
-        leftover = total_budget - sum(scaled.values())
-        for span_start, _ in sorted(needs.items(), key=lambda kv: -kv[1]):
-            if leftover <= 0:
-                break
-            scaled[span_start] += 1
-            leftover -= 1
-        return scaled
+    def _span_need(
+        self, offsets: list[int] | None, per_span: int, n_blocks: int
+    ) -> int:
+        """Blocks to repair for one span, from its attended block offsets."""
+        if not offsets:
+            # No score yet: uniform span_aware length.
+            return max(1, min(per_span, n_blocks))
+        # Depth covering ~80% of the attended blocks, NOT max(): a single
+        # far-out attended block would otherwise demand a prefix many times
+        # the uniform length (one span asking for 32 blocks starved every
+        # other span to 1 block - 34% of spans ended up repaired LESS than
+        # span_aware, which is what made the agent work harder).
+        ordered = sorted(offsets)
+        idx = max(0, min(len(ordered) - 1, int(round(0.8 * (len(ordered) - 1)))))
+        need = ordered[idx] + 1
+        # Floor at half the uniform length so a span is never starved below a
+        # useful repair, cap at double so no span can monopolise recompute.
+        lo = max(1, per_span // 2)
+        hi = max(lo, per_span * 2)
+        return max(1, min(max(need, lo), hi, n_blocks))
 
     def _span_gap_ranges(
         self, request: "Request", span_start: int, end_lim: int
