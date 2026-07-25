@@ -327,112 +327,73 @@ class QuestGapPolicy(SpanAwareGapPolicy):
 
 
 class LegoQuestGapPolicy(QuestGapPolicy):
-    """LegoQuest: query-aware budget *allocation* across spans, contiguous
-    prefix within one.
+    """LegoQuest: recompute the K best span blocks, wherever they sit.
 
-    span_quest picks WHICH blocks to rewrite by Quest score, so it emits
-    scattered single-block gaps. That violates the span's causal structure: a
-    block at offset P is only correct once 0..P-1 are prefix-aware, so a
-    scattered rewrite reads still-prefix-free predecessors and leaves the span
-    KV internally inconsistent. Measured per-block deviation from the
-    prefix-aware KV also decays monotonically from the span start, so
-    "most-wrong K blocks" is just "first K" - selecting blocks by deviation
-    re-derives span_aware and cannot beat it.
+    The point is that the chosen blocks are NOT constrained to be the first K
+    of the span (span_aware) nor to be contiguous at all: the policy is free to
+    pick the K blocks that a metric says are worth repairing, anywhere in the
+    span. Today that metric is the stored per-block score; adjacent picks are
+    merged into one range purely to emit fewer virtual requests.
 
-    What Quest's signal *is* good for is deciding HOW MUCH of each span to
-    repair. span_aware spends an identical gap_length on every span, including
-    ones the next query never looks at. Here each span keeps a causally
-    faithful contiguous prefix, but its length is set by how deep that span's
-    attention actually reaches (max selected block offset + 1), with the total
-    budget across spans held at n_spans * gap_length so this is a reallocation
-    of span_aware's budget, not an increase.
+    Two things make this practical here where plain span_quest struggled:
+    selections are stored first-writer-wins so a span's chosen set is stable
+    across turns, and get_gaps trims blocks that already hold a prefix-aware
+    (pd) copy, so a block repaired on an earlier turn is not rewritten again.
+    The pd/pic dual hashing is what makes that trim sound - a repaired block is
+    keyed by its prefix-aware identity, so later turns with the same prefix hit
+    it directly.
+
+    Caveat worth stating: a chosen block whose predecessors are still
+    prefix-free attends the wrong keys when rewritten, so its repair is
+    approximate. Because repaired blocks persist under their pd key, the span
+    converges over turns instead of being rewritten from scratch each time.
     """
-
-    def get_gaps(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-        num_external_tokens: int,
-    ) -> list[tuple[int, int]]:
-        # Allocation is cross-span, so the per-span hook is not enough: compute
-        # every span's need first, then hand each span its prefix length.
-        self._alloc = self._allocate(request, num_computed_tokens)
-        try:
-            return super().get_gaps(request, num_computed_tokens, num_external_tokens)
-        finally:
-            self._alloc = None
-
-    def _span_bounds(
-        self, request: "Request", num_computed_tokens: int
-    ) -> list[tuple[int, int]]:
-        starts = [s for s in (request.span_starts or []) if s < num_computed_tokens]
-        bounds = []
-        for idx, s in enumerate(starts):
-            nxt = starts[idx + 1] if idx + 1 < len(starts) else num_computed_tokens
-            bounds.append((s, min(nxt, num_computed_tokens)))
-        return bounds
-
-    def _allocate(
-        self, request: "Request", num_computed_tokens: int
-    ) -> dict[int, int]:
-        """span_start -> number of blocks to recompute (contiguous prefix)."""
-        bs = self.block_size
-        per_span = self.gap_length // bs
-        if per_span <= 0:
-            return {}
-
-        bounds = self._span_bounds(request, num_computed_tokens)
-        if not bounds:
-            return {}
-
-        # Per-span and independent of the other spans in this request. An
-        # allocation that shifts with the rest of the batch changes the emitted
-        # range for the SAME span between turns, so the recompute-once dedup
-        # (drop a gap whose blocks are all already prefix-aware) never fires and
-        # the span is rewritten every turn: measured 3.6M recompute tokens vs
-        # 275K for span_aware, the same span redone ~7.9k times. Stability
-        # matters more than exactly hitting a global budget, so the length is
-        # clamped per span instead of rescaled across them.
-        needs: dict[int, int] = {}
-        for span_start, end_lim in bounds:
-            n_blocks = (end_lim - span_start + bs - 1) // bs
-            key = self.get_selection_key(request, span_start)
-            offsets = self.selections.get(key) if key is not None else None
-            needs[span_start] = self._span_need(offsets, per_span, n_blocks)
-        return needs
-
-    def _span_need(
-        self, offsets: list[int] | None, per_span: int, n_blocks: int
-    ) -> int:
-        """Blocks to repair for one span, from its attended block offsets."""
-        if not offsets:
-            # No score yet: uniform span_aware length.
-            return max(1, min(per_span, n_blocks))
-        # Depth covering ~80% of the attended blocks, NOT max(): a single
-        # far-out attended block would otherwise demand a prefix many times
-        # the uniform length (one span asking for 32 blocks starved every
-        # other span to 1 block - 34% of spans ended up repaired LESS than
-        # span_aware, which is what made the agent work harder).
-        ordered = sorted(offsets)
-        idx = max(0, min(len(ordered) - 1, int(round(0.8 * (len(ordered) - 1)))))
-        need = ordered[idx] + 1
-        # Floor at half the uniform length so a span is never starved below a
-        # useful repair, cap at double so no span can monopolise recompute.
-        lo = max(1, per_span // 2)
-        hi = max(lo, per_span * 2)
-        return max(1, min(max(need, lo), hi, n_blocks))
 
     def _span_gap_ranges(
         self, request: "Request", span_start: int, end_lim: int
     ) -> list[tuple[int, int]]:
-        alloc = getattr(self, "_alloc", None)
-        if not alloc:
-            return super()._span_gap_ranges(request, span_start, end_lim)
-        n = alloc.get(span_start, 0)
-        if n <= 0:
+        """The K best blocks for this span - NOT forced to be contiguous.
+
+        Picking a contiguous prefix would just be span_aware with a variable
+        length; the point of this policy is that the chosen blocks may sit
+        anywhere in the span. Adjacent picks are coalesced into one range only
+        so the scheduler emits fewer virtual requests, never to force adjacency.
+
+        A block whose predecessors are still prefix-free attends the wrong keys
+        when it is rewritten, so the repair is approximate; blocks already
+        repaired for this prefix are skipped by the pd trim in get_gaps, so
+        across turns the span converges rather than being rewritten each time.
+        """
+        bs = self.block_size
+        budget = self.gap_length // bs
+        if budget <= 0:
             return []
-        end = min(span_start + n * self.block_size, end_lim)
-        return [(span_start, end)] if end > span_start else []
+        n_blocks = (end_lim - span_start + bs - 1) // bs
+        if n_blocks <= 0:
+            return []
+
+        key = self.get_selection_key(request, span_start)
+        offsets = self.selections.get(key) if key is not None else None
+        if not offsets:
+            # No score for this span yet: fall back to the contiguous prefix.
+            return super(QuestGapPolicy, self)._span_gap_ranges(
+                request, span_start, end_lim
+            )
+
+        chosen = sorted({o for o in offsets if 0 <= o < n_blocks})[:budget]
+        if not chosen:
+            return []
+        gaps: list[tuple[int, int]] = []
+        for o in chosen:
+            s = span_start + o * bs
+            e = min(s + bs, end_lim)
+            if e <= s:
+                continue
+            if gaps and gaps[-1][1] == s:
+                gaps[-1] = (gaps[-1][0], e)  # coalesce adjacency, not force it
+            else:
+                gaps.append((s, e))
+        return gaps
 
 
 class GapPolicyFactory:

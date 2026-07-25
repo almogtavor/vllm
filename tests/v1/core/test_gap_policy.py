@@ -236,8 +236,7 @@ class TestQuestGapPolicy:
 
 
 class TestLegoQuestGapPolicy:
-    """legoquest: query-aware budget ALLOCATION,
-    contiguous prefix within a span."""
+    """legoquest: the K best blocks, free to sit anywhere in the span."""
 
     def setup_method(self):
         self._original = envs.VLLM_V1_SPANS_ENABLED
@@ -246,104 +245,50 @@ class TestLegoQuestGapPolicy:
     def teardown_method(self):
         envs.VLLM_V1_SPANS_ENABLED = self._original
 
-    def test_no_selection_matches_span_aware(self):
-        # With no scores stored the budget is uniform, i.e. exactly span_aware.
-        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
-        req = make_span_request(256, span_starts=[64, 128])
-        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
-        assert gaps == [(64, 96), (128, 160)]
-
-    def test_gaps_are_always_contiguous_prefixes(self):
-        # The whole point: even for a late-attended block, never scatter.
-        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
-        req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
-        req.block_hashes = [bytes([b]) for b in range(256 // 16)]
-        key = policy.get_selection_key(req, 64)
-        policy.store_selection(key, [5, 1])  # attention reaches offset 5
-        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
-        # one range starting at the span start (not scattered blocks 1 and 5)
-        assert len(gaps) == 1
-        assert gaps[0][0] == 64
-
-    def test_no_score_matches_span_aware(self):
-        # Without a score the length is exactly the uniform span_aware one.
-        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
+    def test_selected_blocks_are_not_forced_contiguous(self):
+        # THE point: blocks 1 and 6 are chosen, so two separate ranges are
+        # emitted - not one prefix covering 0..6.
+        policy = LegoQuestGapPolicy(gap_length=64, block_size=16)  # budget 4
         req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
+        req.block_hashes = [bytes([b]) for b in range(512 // 16)]
+        policy.store_selection(policy.get_selection_key(req, 64), [6, 1])
         gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
-        assert gaps == [(64, 96)]  # 2 blocks == gap_length
+        assert gaps == [(80, 96), (160, 176)], gaps
 
-    def test_outlier_offset_does_not_explode_allocation(self):
-        # A single far-out attended block must NOT demand a huge prefix: p80 of
-        # [0,1,2,30] is ~2, and the cap is 2x per_span.
-        policy = LegoQuestGapPolicy(gap_length=128, block_size=16)  # per_span=8
-        req = make_span_request(2048, span_starts=[64], cross_span_starts=[1024])
-        req.block_hashes = [bytes([b % 251]) for b in range(2048 // 16)]
-        policy.store_selection(policy.get_selection_key(req, 64), [0, 1, 2, 30])
-        gaps = policy.get_gaps(req, num_computed_tokens=2048, num_external_tokens=0)
-        blocks = (gaps[0][1] - gaps[0][0]) // 16
-        assert blocks <= 16, f"outlier drove allocation to {blocks} blocks"
+    def test_does_not_start_at_span_start_when_not_selected(self):
+        # A pure prefix policy would always include the span's first block;
+        # legoquest must not, if the metric did not pick it.
+        policy = LegoQuestGapPolicy(gap_length=64, block_size=16)
+        req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
+        req.block_hashes = [bytes([b]) for b in range(512 // 16)]
+        policy.store_selection(policy.get_selection_key(req, 64), [5])
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+        assert gaps == [(144, 160)], gaps
+        assert gaps[0][0] != 64  # not the span start
 
-    def test_span_never_starved_below_floor(self):
-        # Shallow attention must still get >= half the uniform length, never 1.
-        policy = LegoQuestGapPolicy(gap_length=128, block_size=16)  # per_span=8
-        req = make_span_request(2048, span_starts=[64], cross_span_starts=[1024])
-        req.block_hashes = [bytes([b % 251]) for b in range(2048 // 16)]
-        policy.store_selection(policy.get_selection_key(req, 64), [0])
-        gaps = policy.get_gaps(req, num_computed_tokens=2048, num_external_tokens=0)
-        blocks = (gaps[0][1] - gaps[0][0]) // 16
-        assert blocks >= 4, f"span starved to {blocks} blocks (floor is per_span//2)"
-
-    def test_allocation_is_stable_across_span_sets(self):
-        # THE dedup-defeat guard: a span's length must not depend on which other
-        # spans are in the request, or the emitted range changes every turn and
-        # recompute-once never fires (measured 13x recompute volume).
-        def alloc_for(spans, crosses):
-            p = LegoQuestGapPolicy(gap_length=128, block_size=16)
-            r = make_span_request(4096, span_starts=spans, cross_span_starts=crosses)
-            r.block_hashes = [bytes([b % 251]) for b in range(4096 // 16)]
-            p.store_selection(p.get_selection_key(r, 64), [0, 1, 2, 6])
-            g = p.get_gaps(r, num_computed_tokens=4096, num_external_tokens=0)
-            return next((e - s for s, e in g if s == 64), None)
-        alone = alloc_for([64], [1024])
-        with_others = alloc_for([64, 2048, 3000], [1024, 2500, 3500])
-        assert alone == with_others, (
-            f"span 64 got {alone} alone but {with_others} with others"
-        )
-
-    def test_deep_span_gets_more_than_shallow_span(self):
-        # Deep attention earns a longer prefix than shallow attention, both
-        # clamped to [per_span//2, per_span*2] and both contiguous.
-        policy = LegoQuestGapPolicy(gap_length=128, block_size=16)  # per_span=8
-        req = make_span_request(
-            4096, span_starts=[64, 2048], cross_span_starts=[1024, 3000]
-        )
-        req.block_hashes = [bytes([b % 251]) for b in range(4096 // 16)]
-        # production top_k is 8; deep span attends out to offset 12
+    def test_budget_caps_number_of_blocks(self):
+        policy = LegoQuestGapPolicy(gap_length=64, block_size=16)  # budget 4
+        req = make_span_request(1024, span_starts=[64], cross_span_starts=[900])
+        req.block_hashes = [bytes([b % 251]) for b in range(1024 // 16)]
         policy.store_selection(
-            policy.get_selection_key(req, 64), [0, 1, 2, 3, 4, 5, 6, 12]
+            policy.get_selection_key(req, 64), [1, 3, 5, 7, 9, 11]
         )
-        policy.store_selection(policy.get_selection_key(req, 2048), [0, 1])
-        gaps = policy.get_gaps(req, num_computed_tokens=4096, num_external_tokens=0)
-        deep = next(e - s for s, e in gaps if s == 64) // 16
-        shallow = next(e - s for s, e in gaps if s == 2048) // 16
-        assert deep > shallow, f"deep={deep} shallow={shallow}"
-        assert shallow >= 4  # floor: never starved
+        gaps = policy.get_gaps(req, num_computed_tokens=1024, num_external_tokens=0)
+        assert sum((e - s) // 16 for s, e in gaps) <= 4
 
-    def test_per_span_length_is_capped_at_double_uniform(self):
-        # Exact global budget conservation was traded for per-span stability
-        # (see test_allocation_is_stable_across_span_sets); the guard is now a
-        # per-span cap of 2x the uniform length.
-        policy = LegoQuestGapPolicy(gap_length=128, block_size=16)  # per_span=8
-        req = make_span_request(
-            4096, span_starts=[64, 2048], cross_span_starts=[1024, 3000]
-        )
-        req.block_hashes = [bytes([b % 251]) for b in range(4096 // 16)]
-        for s in (64, 2048):
-            policy.store_selection(policy.get_selection_key(req, s), [0, 40])
-        gaps = policy.get_gaps(req, num_computed_tokens=4096, num_external_tokens=0)
-        for s, e in gaps:
-            assert (e - s) // 16 <= 16, f"span at {s} got {(e-s)//16} blocks"
-        assert all(s in (64, 2048) for s, _ in gaps)
+    def test_adjacent_picks_coalesce_into_one_range(self):
+        policy = LegoQuestGapPolicy(gap_length=64, block_size=16)
+        req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
+        req.block_hashes = [bytes([b]) for b in range(512 // 16)]
+        policy.store_selection(policy.get_selection_key(req, 64), [2, 3])
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+        assert gaps == [(96, 128)], gaps  # one range, still only 2 blocks
+
+    def test_no_score_falls_back_to_contiguous_prefix(self):
+        policy = LegoQuestGapPolicy(gap_length=64, block_size=16)
+        req = make_span_request(512, span_starts=[64])
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+        assert gaps == [(64, 128)]
 
     def test_factory_creates_legoquest(self):
         policy = GapPolicyFactory.create_policy("span_legoquest", {"gap_length": 64})
