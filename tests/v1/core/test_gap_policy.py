@@ -6,8 +6,8 @@ import pytest
 import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.gap_policy import (
-    DeviationGapPolicy,
     GapPolicyFactory,
+    LegoQuestGapPolicy,
     NoGapPolicy,
     QuestGapPolicy,
     SpanAwareGapPolicy,
@@ -235,8 +235,8 @@ class TestQuestGapPolicy:
         ]
 
 
-class TestDeviationGapPolicy:
-    """legoquest-devia: query-aware budget ALLOCATION,
+class TestLegoQuestGapPolicy:
+    """legoquest: query-aware budget ALLOCATION,
     contiguous prefix within a span."""
 
     def setup_method(self):
@@ -248,14 +248,14 @@ class TestDeviationGapPolicy:
 
     def test_no_selection_matches_span_aware(self):
         # With no scores stored the budget is uniform, i.e. exactly span_aware.
-        policy = DeviationGapPolicy(gap_length=32, block_size=16)
+        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
         req = make_span_request(256, span_starts=[64, 128])
         gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
         assert gaps == [(64, 96), (128, 160)]
 
     def test_gaps_are_always_contiguous_prefixes(self):
         # The whole point: even for a late-attended block, never scatter.
-        policy = DeviationGapPolicy(gap_length=32, block_size=16)
+        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
         req = make_span_request(256, span_starts=[64], cross_span_starts=[224])
         req.block_hashes = [bytes([b]) for b in range(256 // 16)]
         key = policy.get_selection_key(req, 64)
@@ -268,7 +268,7 @@ class TestDeviationGapPolicy:
     def test_single_span_equals_span_aware(self):
         # With one span there is nothing to reallocate from: total budget is
         # per_span * 1, so devia must degrade exactly to span_aware.
-        policy = DeviationGapPolicy(gap_length=32, block_size=16)
+        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
         req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
         req.block_hashes = [bytes([b]) for b in range(512 // 16)]
         key = policy.get_selection_key(req, 64)
@@ -280,7 +280,7 @@ class TestDeviationGapPolicy:
         # THE point of devia: span A's query attention reaches offset 3 (needs 4
         # blocks), span B's only block 0 (needs 1). span_aware would spend 2+2;
         # devia spends 4+1, same total, allocated where the query looks.
-        policy = DeviationGapPolicy(gap_length=32, block_size=16)
+        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
         req = make_span_request(
             512, span_starts=[64, 256], cross_span_starts=[240, 500]
         )
@@ -295,7 +295,7 @@ class TestDeviationGapPolicy:
 
     def test_total_budget_not_exceeded_when_oversubscribed(self):
         # Two spans both wanting deep repair must still fit 2*gap_length total.
-        policy = DeviationGapPolicy(gap_length=32, block_size=16)
+        policy = LegoQuestGapPolicy(gap_length=32, block_size=16)
         req = make_span_request(
             512, span_starts=[64, 256], cross_span_starts=[240, 500]
         )
@@ -308,7 +308,7 @@ class TestDeviationGapPolicy:
         assert blocks <= 2 * (32 // 16)  # total budget preserved
         assert all(s in (64, 256) for s, _ in gaps)  # still prefixes
 
-    def test_factory_creates_devia(self):
-        policy = GapPolicyFactory.create_policy("span_devia", {"gap_length": 64})
-        assert isinstance(policy, DeviationGapPolicy)
+    def test_factory_creates_legoquest(self):
+        policy = GapPolicyFactory.create_policy("span_legoquest", {"gap_length": 64})
+        assert isinstance(policy, LegoQuestGapPolicy)
         assert policy.gap_length == 64

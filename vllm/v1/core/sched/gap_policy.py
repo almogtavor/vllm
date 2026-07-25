@@ -318,8 +318,9 @@ class QuestGapPolicy(SpanAwareGapPolicy):
         return gaps
 
 
-class DeviationGapPolicy(QuestGapPolicy):
-    """Query-aware budget *allocation* across spans, contiguous prefix within one.
+class LegoQuestGapPolicy(QuestGapPolicy):
+    """LegoQuest: query-aware budget *allocation* across spans, contiguous
+    prefix within one.
 
     span_quest picks WHICH blocks to rewrite by Quest score, so it emits
     scattered single-block gaps. That violates the span's causal structure: a
@@ -425,7 +426,7 @@ class GapPolicyFactory:
     _POLICIES = {
         "none": NoGapPolicy,
         "span_quest": QuestGapPolicy,
-        "span_devia": DeviationGapPolicy,
+        "span_legoquest": LegoQuestGapPolicy,
         "span_aware": SpanAwareGapPolicy,
     }
 
