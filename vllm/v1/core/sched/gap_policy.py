@@ -123,17 +123,25 @@ class SpanAwareGapPolicy(GapPolicy):
             end_lim = min(next_start, num_computed_tokens)
             gaps.extend(self._span_gap_ranges(request, gap_start, end_lim))
 
-        # SPANS: drop gaps whose blocks all hit a prefix-aware (pd) copy from an
+        # SPANS: skip blocks that already hold a prefix-aware (pd) copy from an
         # earlier recompute of this prefix - recompute-once-per-unique-prefix.
+        # Trim the leading pd run instead of only dropping all-pd gaps: those
+        # blocks are already correct for this prefix and the rest of the gap can
+        # attend them, so redoing them is pure waste. It matters when a gap grows
+        # between turns (span_legoquest sizes each span from its attention, so a
+        # span repaired to 8 blocks may later want 12) - without trimming, the
+        # whole 12 is redone and the span is rewritten every turn.
         sources = request.prefix_hit_sources
         if sources is not None:
             bs = self.block_size
             kept = []
             for s, e in gaps:
-                blocks = range(s // bs, min(e // bs, len(sources)))
-                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
-                    continue
-                kept.append((s, e))
+                b0, b1 = s // bs, min(e // bs, len(sources))
+                while b0 < b1 and sources[b0] == PrefixHitSource.PD:
+                    b0 += 1
+                if b0 >= b1:
+                    continue  # whole gap is already prefix-aware
+                kept.append((max(s, b0 * bs), e))
             gaps = kept
 
         logger.info(

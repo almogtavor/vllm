@@ -349,3 +349,36 @@ class TestLegoQuestGapPolicy:
         policy = GapPolicyFactory.create_policy("span_legoquest", {"gap_length": 64})
         assert isinstance(policy, LegoQuestGapPolicy)
         assert policy.gap_length == 64
+
+
+class TestPdTrim:
+    """Already prefix-aware blocks must not be recomputed again."""
+
+    def setup_method(self):
+        self._original = envs.VLLM_V1_SPANS_ENABLED
+        envs.VLLM_V1_SPANS_ENABLED = True
+
+    def teardown_method(self):
+        envs.VLLM_V1_SPANS_ENABLED = self._original
+
+    def test_leading_pd_blocks_are_trimmed_not_redone(self):
+        from vllm.v1.core.kv_cache_utils import PrefixHitSource
+
+        policy = SpanAwareGapPolicy(gap_length=128, block_size=16)
+        req = make_span_request(512, span_starts=[64])
+        # blocks 4..7 (tokens 64..127) already prefix-aware from an earlier turn
+        req.prefix_hit_sources = [PrefixHitSource.PIC] * 32
+        for b in range(4, 8):
+            req.prefix_hit_sources[b] = PrefixHitSource.PD
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+        # gap would be (64,192); the first 4 blocks are pd -> start at 128
+        assert gaps == [(128, 192)], gaps
+
+    def test_all_pd_gap_still_dropped(self):
+        from vllm.v1.core.kv_cache_utils import PrefixHitSource
+
+        policy = SpanAwareGapPolicy(gap_length=128, block_size=16)
+        req = make_span_request(512, span_starts=[64])
+        req.prefix_hit_sources = [PrefixHitSource.PD] * 32
+        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
+        assert gaps == []
