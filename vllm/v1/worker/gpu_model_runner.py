@@ -774,12 +774,16 @@ class GPUModelRunner(
             # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
             self._attn_lower_bounds_gpu: torch.Tensor | None = None
             self._req_kv_starts_gpu: torch.Tensor | None = None
-            # QUEST: span-block budget; >0 only under gap_policy_name=span_quest.
+            # QUEST: span-block budget; >0 only for policies that consume the
+            # per-span block scores. span_legoquest needs them too - it reads
+            # max(selected offset) to size each span's contiguous prefix, so
+            # without scoring it silently degrades to uniform span_aware.
             _gap_cfg = self.scheduler_config.gap_policy_config or {}
             self._quest_top_k = (
                 _gap_cfg.get("gap_length", 0)
                 // (_gap_cfg.get("block_size") or self.cache_config.block_size or 1)
-                if self.scheduler_config.gap_policy_name == "span_quest"
+                if self.scheduler_config.gap_policy_name
+                in ("span_quest", "span_legoquest")
                 else 0
             )
             self._quest_score_descs: list[tuple[int, int, int, int]] = []
