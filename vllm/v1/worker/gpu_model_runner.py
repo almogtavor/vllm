@@ -437,6 +437,28 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+def compute_span_lb_regions(
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+    req_len: int,
+) -> list[tuple[int, int, int]]:
+    """SPANS: (start, end, lb) attention-lower-bound regions for a request.
+
+    A span's lb region ends at the NEXT boundary after it: the next span's
+    start (adjacent spans carry no cross of their own - the client skips
+    crosses that coincide with a span start) or the first cross past it.
+    Index-pairing crosses to spans paints lb wrongly over later spans and the
+    generated tail whenever spans are adjacent."""
+    crosses = sorted(cross_span_starts or [])
+    spans_sorted = sorted(span_starts)
+    out = []
+    for j, start in enumerate(spans_sorted):
+        nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
+        cross = next((c for c in crosses if c > start), req_len)
+        out.append((start, min(nxt, cross), start))
+    return out
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -1981,6 +2003,7 @@ class GPUModelRunner(
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            spans_prerotate_safe = True
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 params = req.sampling_params
@@ -1990,16 +2013,28 @@ class GPUModelRunner(
                 spans = ea.get("span_starts") if ea else None
                 if not spans:
                     continue
-                crosses = ea.get("cross_span_starts") or []
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-                for j, span_start in enumerate(spans):
-                    cross = crosses[j] if j < len(crosses) else req_len
-                    attn_lb[req_start + span_start : req_start + cross] = span_start
+                for start, end, lb in compute_span_lb_regions(
+                    spans, ea.get("cross_span_starts"), req_len
+                ):
+                    attn_lb[req_start + start : req_start + end] = lb
+                q_start = req_start + int(num_computed[i])
+                q_end = req_start + req_len
+                if q_end > q_start:
+                    req_lbs = attn_lb[req_start:q_end]
+                    query_lbs = attn_lb[q_start:q_end]
+                    if np.max(req_lbs) > 0 and (
+                        np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
+                    ):
+                        spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._spans_prerotate_safe = spans_prerotate_safe
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True)
+                self.device, non_blocking=True
+            )
             self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True)
+                self.device, non_blocking=True
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2219,9 +2254,7 @@ class GPUModelRunner(
             and self._req_kv_starts_gpu is not None
         ):
             pos_slice = self.positions[:total_num_scheduled_tokens]
-            sched_kv_indices = (
-                self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
-            )
+            sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
             pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
                 pos_slice.dtype
             )
@@ -2491,6 +2524,7 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
+            spans_prerotate_safe=getattr(self, "_spans_prerotate_safe", True),
         )
 
         if self.dcp_world_size > 1:
