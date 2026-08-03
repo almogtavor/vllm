@@ -236,7 +236,13 @@ class TestQuestGapPolicy:
 
 
 class TestLegoQuestGapPolicy:
-    """legoquest: the K best blocks, free to sit anywhere in the span."""
+    """legoquest: repair reaches the last scored block, and stops there.
+
+    A gap recompute attends [0, pos), so repairing a scored block while its
+    in-span predecessors are still prefix-free rewrites it against a context
+    that is neither the warmed state nor the truth. Every range this policy
+    emits must therefore start at the span start.
+    """
 
     def setup_method(self):
         self._original = envs.VLLM_V1_SPANS_ENABLED
@@ -245,44 +251,48 @@ class TestLegoQuestGapPolicy:
     def teardown_method(self):
         envs.VLLM_V1_SPANS_ENABLED = self._original
 
-    def test_selected_blocks_are_not_forced_contiguous(self):
-        # THE point: blocks 1 and 6 are chosen, so two separate ranges are
-        # emitted - not one prefix covering 0..6.
+    def test_repair_is_prefix_closed(self):
+        # Blocks 1 and 6 scored: repairing 6 alone would attend stale 2..5, so
+        # the range starts at the span start and reaches as far as budget lets.
         policy = LegoQuestGapPolicy(gap_length=64, block_size=16)  # budget 4
         req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
         req.block_hashes = [bytes([b]) for b in range(512 // 16)]
         policy.store_selection(policy.get_selection_key(req, 64), [6, 1])
         gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
-        assert gaps == [(80, 96), (160, 176)], gaps
+        assert gaps == [(64, 128)], gaps
+        assert all(s == 64 for s, _ in gaps)
 
-    def test_does_not_start_at_span_start_when_not_selected(self):
-        # A pure prefix policy would always include the span's first block;
-        # legoquest must not, if the metric did not pick it.
+    def test_score_shortens_the_range_when_scored_blocks_are_early(self):
+        # The payoff: block 1 is the last one that matters, so 2 blocks are
+        # recomputed where span_aware would have spent the full budget of 4.
         policy = LegoQuestGapPolicy(gap_length=64, block_size=16)
         req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
         req.block_hashes = [bytes([b]) for b in range(512 // 16)]
-        policy.store_selection(policy.get_selection_key(req, 64), [5])
+        policy.store_selection(policy.get_selection_key(req, 64), [1, 0])
         gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
-        assert gaps == [(144, 160)], gaps
-        assert gaps[0][0] != 64  # not the span start
+        assert gaps == [(64, 96)], gaps
+
+    def test_never_recomputes_more_than_span_aware(self):
+        # The property that makes the policy worth running at all: for any
+        # selection, it costs at most what the contiguous policy costs.
+        for scored in ([0], [3], [15], [2, 9], [1, 3, 5, 7, 9, 11]):
+            lego = LegoQuestGapPolicy(gap_length=64, block_size=16)
+            base = SpanAwareGapPolicy(gap_length=64, block_size=16)
+            req = make_span_request(1024, span_starts=[64], cross_span_starts=[900])
+            req.block_hashes = [bytes([b % 251]) for b in range(1024 // 16)]
+            lego.store_selection(lego.get_selection_key(req, 64), scored)
+            kw = dict(num_computed_tokens=1024, num_external_tokens=0)
+            n_lego = sum(e - s for s, e in lego.get_gaps(req, **kw))
+            n_base = sum(e - s for s, e in base.get_gaps(req, **kw))
+            assert n_lego <= n_base, (scored, n_lego, n_base)
 
     def test_budget_caps_number_of_blocks(self):
         policy = LegoQuestGapPolicy(gap_length=64, block_size=16)  # budget 4
         req = make_span_request(1024, span_starts=[64], cross_span_starts=[900])
         req.block_hashes = [bytes([b % 251]) for b in range(1024 // 16)]
-        policy.store_selection(
-            policy.get_selection_key(req, 64), [1, 3, 5, 7, 9, 11]
-        )
+        policy.store_selection(policy.get_selection_key(req, 64), [1, 3, 5, 7, 9, 11])
         gaps = policy.get_gaps(req, num_computed_tokens=1024, num_external_tokens=0)
         assert sum((e - s) // 16 for s, e in gaps) <= 4
-
-    def test_adjacent_picks_coalesce_into_one_range(self):
-        policy = LegoQuestGapPolicy(gap_length=64, block_size=16)
-        req = make_span_request(512, span_starts=[64], cross_span_starts=[480])
-        req.block_hashes = [bytes([b]) for b in range(512 // 16)]
-        policy.store_selection(policy.get_selection_key(req, 64), [2, 3])
-        gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
-        assert gaps == [(96, 128)], gaps  # one range, still only 2 blocks
 
     def test_no_score_falls_back_to_contiguous_prefix(self):
         policy = LegoQuestGapPolicy(gap_length=64, block_size=16)

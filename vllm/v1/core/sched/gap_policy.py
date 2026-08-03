@@ -313,7 +313,7 @@ class QuestGapPolicy(SpanAwareGapPolicy):
             selected.add(offset)
             remaining -= 1
 
-        gaps = []
+        gaps: list[tuple[int, int]] = []
         for o in sorted(selected_offsets):
             s = span_start + o * bs
             e = min(s + bs, end_lim)
@@ -327,42 +327,37 @@ class QuestGapPolicy(SpanAwareGapPolicy):
 
 
 class LegoQuestGapPolicy(QuestGapPolicy):
-    """LegoQuest: recompute the K best span blocks, wherever they sit.
+    """LegoQuest: repair a span only as far as its scored blocks require.
 
-    The point is that the chosen blocks are NOT constrained to be the first K
-    of the span (span_aware) nor to be contiguous at all: the policy is free to
-    pick the K blocks that a metric says are worth repairing, anywhere in the
-    span. Today that metric is the stored per-block score; adjacent picks are
-    merged into one range purely to emit fewer virtual requests.
+    The scores say which blocks the following query actually reads. This policy
+    uses them to decide HOW FAR into the span the repair has to reach, and then
+    repairs everything up to that point.
 
-    Two things make this practical here where plain span_quest struggled:
-    selections are stored first-writer-wins so a span's chosen set is stable
-    across turns, and get_gaps trims blocks that already hold a prefix-aware
-    (pd) copy, so a block repaired on an earlier turn is not rewritten again.
-    The pd/pic dual hashing is what makes that trim sound - a repaired block is
-    keyed by its prefix-aware identity, so later turns with the same prefix hit
-    it directly.
+    It does not repair a scored block while skipping the blocks before it. A
+    gap recompute attends [0, pos) (see span_metadata.py), so a block whose
+    in-span predecessors are still prefix-free is rewritten against a hybrid
+    context - real prefix plus stale intermediates - that matches neither the
+    warmed state nor the truth. Measured on Qwen2.5-0.5B over real text, a
+    prefix-closed repair lands its blocks at 0.0000 relative KV error while a
+    scattered top-K repair of the SAME token budget leaves them at 0.019-0.104,
+    and ends up 1.1-2.9x worse in next-token KL. Scattering also costs more:
+    it touches more spans, and the budget is per span.
 
-    Caveat worth stating: a chosen block whose predecessors are still
-    prefix-free attends the wrong keys when rewritten, so its repair is
-    approximate. Because repaired blocks persist under their pd key, the span
-    converges over turns instead of being rewritten from scratch each time.
+    The scoring makes this cheaper rather than more expensive. Repairing up to
+    the last block that matters is capped at the budget, so this policy never
+    recomputes more than span_aware, and recomputes strictly less whenever a
+    span's scored blocks sit early.
     """
 
     def _span_gap_ranges(
         self, request: "Request", span_start: int, end_lim: int
     ) -> list[tuple[int, int]]:
-        """The K best blocks for this span - NOT forced to be contiguous.
+        """Contiguous prefix reaching the last scored block, capped by budget.
 
-        Picking a contiguous prefix would just be span_aware with a variable
-        length; the point of this policy is that the chosen blocks may sit
-        anywhere in the span. Adjacent picks are coalesced into one range only
-        so the scheduler emits fewer virtual requests, never to force adjacency.
-
-        A block whose predecessors are still prefix-free attends the wrong keys
-        when it is rewritten, so the repair is approximate; blocks already
-        repaired for this prefix are skipped by the pd trim in get_gaps, so
-        across turns the span converges rather than being rewritten each time.
+        Prefix-closed by construction, so every repaired block attends a fully
+        repaired in-span context and comes out exact. The score only shortens
+        the range: reach = min(budget, last_scored + 1) <= budget, which is
+        what span_aware would have spent.
         """
         bs = self.block_size
         budget = self.gap_length // bs
@@ -380,20 +375,13 @@ class LegoQuestGapPolicy(QuestGapPolicy):
                 request, span_start, end_lim
             )
 
-        chosen = sorted({o for o in offsets if 0 <= o < n_blocks})[:budget]
-        if not chosen:
+        scored = [o for o in offsets if 0 <= o < n_blocks]
+        if not scored:
             return []
-        gaps: list[tuple[int, int]] = []
-        for o in chosen:
-            s = span_start + o * bs
-            e = min(s + bs, end_lim)
-            if e <= s:
-                continue
-            if gaps and gaps[-1][1] == s:
-                gaps[-1] = (gaps[-1][0], e)  # coalesce adjacency, not force it
-            else:
-                gaps.append((s, e))
-        return gaps
+        reach = min(budget, max(scored) + 1, n_blocks)
+        if reach <= 0:
+            return []
+        return [(span_start, min(span_start + reach * bs, end_lim))]
 
 
 class GapPolicyFactory:
