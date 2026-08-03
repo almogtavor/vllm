@@ -236,13 +236,13 @@ class TestQuestGapPolicy:
 
 
 class TestLegoQuestGapPolicy:
-    """legoquest: a span is repaired end to end, or not at all.
+    """legoquest: a span is repaired end to end, or left warm.
 
     A partly repaired span mixes prefix-aware and prefix-free KV, and that
-    mixture measures WORSE than leaving the span warm. On gemma-4-31b with a
-    2048-token span, greedy generation matched the true cache on 0.125 of tokens
-    with no repair, 0.021 after repairing the first 256, and 1.000 only once the
-    whole span was repaired. So the budget selects WHICH spans to repair.
+    mixture measures worse than leaving the span alone. On gemma-4-31b with a
+    2048-token span, greedy generation matched the true cache on 0.1292 of
+    tokens with no repair and 0.1146 after repairing the first 256, while
+    repairing the whole span reached 1.000.
     """
 
     def setup_method(self):
@@ -252,28 +252,21 @@ class TestLegoQuestGapPolicy:
     def teardown_method(self):
         envs.VLLM_V1_SPANS_ENABLED = self._original
 
-    def test_repairs_whole_spans_only(self):
+    def test_span_within_budget_is_repaired_whole(self):
         policy = LegoQuestGapPolicy(gap_length=128, block_size=16)
         req = make_span_request(256, span_starts=[64, 128])
         gaps = policy.get_gaps(req, num_computed_tokens=192, num_external_tokens=0)
         assert gaps == [(64, 128), (128, 192)], gaps
 
-    def test_span_too_large_for_budget_is_left_alone(self):
-        # Never emit the harmful partial repair, even though budget remains.
+    def test_span_larger_than_budget_is_left_alone(self):
+        # The harmful case: span_aware would rewrite the first 128 tokens here.
         policy = LegoQuestGapPolicy(gap_length=128, block_size=16)
         req = make_span_request(1024, span_starts=[64])
         gaps = policy.get_gaps(req, num_computed_tokens=1024, num_external_tokens=0)
         assert gaps == [], gaps
 
-    def test_budget_picks_a_subset_of_spans_never_a_partial_span(self):
-        policy = LegoQuestGapPolicy(gap_length=128, block_size=16)
-        req = make_span_request(384, span_starts=[0, 128])
-        gaps = policy.get_gaps(req, num_computed_tokens=256, num_external_tokens=0)
-        assert len(gaps) == 1, gaps
-        assert gaps[0] in [(0, 128), (128, 256)], gaps
-
-    def test_every_gap_covers_a_whole_span(self):
-        policy = LegoQuestGapPolicy(gap_length=512, block_size=16)
+    def test_each_emitted_gap_covers_a_whole_span(self):
+        policy = LegoQuestGapPolicy(gap_length=256, block_size=16)
         req = make_span_request(512, span_starts=[0, 128, 320])
         bounds = {0: 128, 128: 320, 320: 512}
         gaps = policy.get_gaps(req, num_computed_tokens=512, num_external_tokens=0)
@@ -281,17 +274,24 @@ class TestLegoQuestGapPolicy:
         for s, e in gaps:
             assert s in bounds and e == bounds[s], (s, e, gaps)
 
+    def test_small_spans_still_all_repaired_like_span_aware(self):
+        # Per-span budget is preserved: where span_aware already repaired a span
+        # completely, this policy must not repair fewer spans.
+        lego = LegoQuestGapPolicy(gap_length=128, block_size=16)
+        base = SpanAwareGapPolicy(gap_length=128, block_size=16)
+        req = make_span_request(512, span_starts=[0, 128, 256, 384])
+        kw = dict(num_computed_tokens=512, num_external_tokens=0)
+        assert lego.get_gaps(req, **kw) == base.get_gaps(req, **kw)
+
     def test_never_recomputes_more_than_span_aware(self):
-        for scored in ([0], [3], [15], [2, 9], [1, 3, 5, 7, 9, 11]):
-            lego = LegoQuestGapPolicy(gap_length=64, block_size=16)
-            base = SpanAwareGapPolicy(gap_length=64, block_size=16)
-            req = make_span_request(1024, span_starts=[64], cross_span_starts=[900])
-            req.block_hashes = [bytes([b % 251]) for b in range(1024 // 16)]
-            lego.store_selection(lego.get_selection_key(req, 64), scored)
+        for spans in ([64], [0, 128], [0, 128, 256], [64, 700]):
+            lego = LegoQuestGapPolicy(gap_length=128, block_size=16)
+            base = SpanAwareGapPolicy(gap_length=128, block_size=16)
+            req = make_span_request(1024, span_starts=spans)
             kw = dict(num_computed_tokens=1024, num_external_tokens=0)
             n_lego = sum(e - s for s, e in lego.get_gaps(req, **kw))
             n_base = sum(e - s for s, e in base.get_gaps(req, **kw))
-            assert n_lego <= n_base, (scored, n_lego, n_base)
+            assert n_lego <= n_base, (spans, n_lego, n_base)
 
     def test_factory_creates_legoquest(self):
         policy = GapPolicyFactory.create_policy("span_legoquest", {"gap_length": 64})

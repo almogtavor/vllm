@@ -339,81 +339,41 @@ class QuestGapPolicy(SpanAwareGapPolicy):
 
 
 class LegoQuestGapPolicy(QuestGapPolicy):
-    """LegoQuest: repair a span only as far as its scored blocks require.
+    """LegoQuest: repair a span end to end, or leave it warm.
 
-    The scores say which blocks the following query actually reads. This policy
-    uses them to decide HOW FAR into the span the repair has to reach, and then
-    repairs everything up to that point.
+    A partly repaired span holds prefix-aware blocks next to prefix-free ones,
+    and that mixture is worse than either pure state. The warm span is
+    internally consistent - every block was computed prefix-free together - so
+    rewriting a subset against the real prefix leaves neighbours that no longer
+    agree with it.
 
-    It does not repair a scored block while skipping the blocks before it. A
-    gap recompute attends [0, pos) (see span_metadata.py), so a block whose
-    in-span predecessors are still prefix-free is rewritten against a hybrid
-    context - real prefix plus stale intermediates - that matches neither the
-    warmed state nor the truth. Measured on Qwen2.5-0.5B over real text, a
-    prefix-closed repair lands its blocks at 0.0000 relative KV error while a
-    scattered top-K repair of the SAME token budget leaves them at 0.019-0.104,
-    and ends up 1.1-2.9x worse in next-token KL. Scattering also costs more:
-    it touches more spans, and the budget is per span.
+    Measured offline on gemma-4-31b-it (fp32, 1024-token prefix, 2048-token
+    span, greedy generation compared against the true cache over 5 offsets):
+    no repair matched 0.1292 of generated tokens, repairing the first 256
+    matched 0.1146 - worse than leaving it alone, while spending 256 tokens of
+    prefill. Sweeping the budget shows a step, not a curve: .125 / .021 / .135 /
+    .042 / .125 / 1.000 at budgets 0 / 256 / 512 / 1024 / 1536 / 2048. Only the
+    whole span reaches a consistent state.
 
-    The scoring makes this cheaper rather than more expensive. Repairing up to
-    the last block that matters is capped at the budget, so this policy never
-    recomputes more than span_aware, and recomputes strictly less whenever a
-    span's scored blocks sit early.
+    The budget stays per span, exactly as span_aware spends it, so spans the
+    budget already covers behave as before. The only case that changes is the
+    harmful one: a span larger than the budget is skipped rather than partly
+    rewritten, which costs less and measures better.
+
+    On models without sliding-window attention the partial repair does help
+    (Qwen3-32B, same test: 0.399 -> 0.805), so this trades a real gain on those
+    for correctness on the ones where it backfires. Revisit if the budget can be
+    raised to cover whole spans.
     """
 
-    def get_gaps(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-        num_external_tokens: int,
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
     ) -> list[tuple[int, int]]:
-        """Fully repair as many spans as the budget covers; never part of one.
-
-        gap_length is a per-REQUEST token budget here, not a per-span one. Spans
-        are taken in score order and each is either repaired end to end or left
-        untouched, so the cache never holds a span that is part prefix-aware and
-        part prefix-free.
-        """
-        if self.gap_length <= 0 or num_computed_tokens == 0:
+        """The whole span if the budget covers it, otherwise nothing."""
+        size = end_lim - span_start
+        if size <= 0 or size > self.gap_length:
             return []
-        span_starts = sorted(
-            s for s in (request.span_starts or []) if s < num_computed_tokens
-        )
-        if not span_starts:
-            return []
-
-        regions = []
-        for idx, start in enumerate(span_starts):
-            nxt = (
-                span_starts[idx + 1]
-                if idx + 1 < len(span_starts)
-                else num_computed_tokens
-            )
-            end = min(nxt, num_computed_tokens)
-            if end > start:
-                regions.append((start, end))
-
-        # Score order decides WHICH spans get the budget - the selection this
-        # policy exists to make. Unscored spans sort last but stay eligible.
-        def score(region: tuple[int, int]) -> float:
-            key = self.get_selection_key(request, region[0])
-            offsets = self.selections.get(key) if key is not None else None
-            return -float(len(offsets)) if offsets else 0.0
-
-        remaining = self.gap_length
-        chosen: list[tuple[int, int]] = []
-        for start, end in sorted(regions, key=score):
-            size = end - start
-            if size <= remaining:
-                chosen.append((start, end))
-                remaining -= size
-        gaps = sorted(chosen)
-
-        gaps = self._trim_prefix_aware(request, gaps)
-        logger.info(
-            "Created %d gaps for request %s: %s", len(gaps), request.request_id, gaps
-        )
-        return gaps
+        return [(span_start, end_lim)]
 
 
 class GapPolicyFactory:
