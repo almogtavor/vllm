@@ -385,18 +385,13 @@ class LegoQuestGapPolicy(QuestGapPolicy):
                 request, span_start, end_lim
             )
 
-        query_start = self._following_query_start(request, span_start)
-        if query_start is None:
-            query_start = request.num_tokens
-        # The prefix we could afford ends here; the query attends back only
-        # sliding_window tokens. If the repair lands entirely behind that, it is
-        # invisible to the query and only breaks the span's self-consistency.
-        repaired_end = span_start + self.gap_length
-        if repaired_end <= query_start - self.sliding_window:
-            return []
-        return super(QuestGapPolicy, self)._span_gap_ranges(
-            request, span_start, end_lim
-        )
+        # Sliding-window model, span past the budget: leave it warm. Tested
+        # whether this could be narrowed to repairs that land behind the window
+        # - it cannot. On gemma-4 with a 1024-token span sitting entirely inside
+        # the query's window, repairing its first 256 tokens still matched warm
+        # exactly (0.0911 vs 0.0911 over 4 offsets), so position is not the
+        # discriminator and the gate stays on the architecture.
+        return []
 
 
 class GapPolicyFactory:

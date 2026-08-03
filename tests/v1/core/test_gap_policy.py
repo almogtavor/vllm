@@ -274,13 +274,15 @@ class TestLegoQuestGapPolicy:
         gaps = policy.get_gaps(req, num_computed_tokens=2048, num_external_tokens=0)
         assert gaps == [], gaps
 
-    def test_repair_inside_the_window_is_kept(self):
-        # Same window, but the span sits close enough that the repaired prefix
-        # is still attended.
+    def test_position_within_the_window_does_not_re_enable_partial_repair(self):
+        # Measured: on gemma-4 a 1024-token span sitting entirely inside the
+        # query's window still gained nothing from repairing its first 256
+        # (0.0911 vs 0.0911 warm, 4 offsets). The gate is the architecture, not
+        # where the repair lands.
         policy = LegoQuestGapPolicy(gap_length=128, block_size=16, sliding_window=1024)
         req = make_span_request(2048, span_starts=[1600])
         gaps = policy.get_gaps(req, num_computed_tokens=2048, num_external_tokens=0)
-        assert gaps == [(1600, 1728)], gaps
+        assert gaps == [], gaps
 
     def test_never_recomputes_more_than_span_aware(self):
         for window in (0, 1024):
