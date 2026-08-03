@@ -339,41 +339,64 @@ class QuestGapPolicy(SpanAwareGapPolicy):
 
 
 class LegoQuestGapPolicy(QuestGapPolicy):
-    """LegoQuest: repair a span end to end, or leave it warm.
+    """LegoQuest: repair a span whole, or only where the query can still see it.
 
     A partly repaired span holds prefix-aware blocks next to prefix-free ones,
-    and that mixture is worse than either pure state. The warm span is
-    internally consistent - every block was computed prefix-free together - so
-    rewriting a subset against the real prefix leaves neighbours that no longer
-    agree with it.
+    and that mixture is worse than either pure state - the warm span is
+    internally consistent, so rewriting a subset against the real prefix leaves
+    neighbours that no longer agree with it. Whether that costs anything depends
+    on whether the following query can attend the rewritten region at all.
 
-    Measured offline on gemma-4-31b-it (fp32, 1024-token prefix, 2048-token
-    span, greedy generation compared against the true cache over 5 offsets):
-    no repair matched 0.1292 of generated tokens, repairing the first 256
-    matched 0.1146 - worse than leaving it alone, while spending 256 tokens of
-    prefill. Sweeping the budget shows a step, not a curve: .125 / .021 / .135 /
-    .042 / .125 / 1.000 at budgets 0 / 256 / 512 / 1024 / 1536 / 2048. Only the
-    whole span reaches a consistent state.
+    Measured offline (fp32, 1024-token prefix, 2048-token span, greedy
+    generation compared against the true cache):
 
-    The budget stays per span, exactly as span_aware spends it, so spans the
-    budget already covers behave as before. The only case that changes is the
-    harmful one: a span larger than the budget is skipped rather than partly
-    rewritten, which costs less and measures better.
+    * gemma-4-31b-it, sliding_window=1024, 5 offsets: no repair matched 0.1292
+      of generated tokens, repairing the first 256 matched 0.1146 - worse than
+      leaving it alone, while spending 256 tokens of prefill. The query sits
+      past the window, so it never sees the repaired prefix. Sweeping the budget
+      gives a step, not a curve: .125 / .021 / .135 / .042 / .125 / 1.000 at
+      budgets 0 / 256 / 512 / 1024 / 1536 / 2048.
+    * Qwen3-32B, no sliding window: the same 256-token repair lifted the match
+      from 0.399 to 0.805, because the query attends the whole span.
 
-    On models without sliding-window attention the partial repair does help
-    (Qwen3-32B, same test: 0.399 -> 0.805), so this trades a real gain on those
-    for correctness on the ones where it backfires. Revisit if the budget can be
-    raised to cover whole spans.
+    So a span within budget is repaired end to end, and an oversized span is
+    repaired only when the repaired prefix falls inside the query's attention
+    window. Without a sliding window everything is in the window and the policy
+    matches span_aware. It never recomputes more than span_aware does.
     """
+
+    def __init__(self, *args, sliding_window: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sliding_window = sliding_window or 0
 
     def _span_gap_ranges(
         self, request: "Request", span_start: int, end_lim: int
     ) -> list[tuple[int, int]]:
-        """The whole span if the budget covers it, otherwise nothing."""
         size = end_lim - span_start
-        if size <= 0 or size > self.gap_length:
+        if size <= 0:
             return []
-        return [(span_start, end_lim)]
+        if size <= self.gap_length:
+            return [(span_start, end_lim)]  # fits: repair it whole
+
+        if self.sliding_window <= 0:
+            # Full attention: the query sees the repaired prefix, and partial
+            # repair measurably helps. Same ranges span_aware would emit.
+            return super(QuestGapPolicy, self)._span_gap_ranges(
+                request, span_start, end_lim
+            )
+
+        query_start = self._following_query_start(request, span_start)
+        if query_start is None:
+            query_start = request.num_tokens
+        # The prefix we could afford ends here; the query attends back only
+        # sliding_window tokens. If the repair lands entirely behind that, it is
+        # invisible to the query and only breaks the span's self-consistency.
+        repaired_end = span_start + self.gap_length
+        if repaired_end <= query_start - self.sliding_window:
+            return []
+        return super(QuestGapPolicy, self)._span_gap_ranges(
+            request, span_start, end_lim
+        )
 
 
 class GapPolicyFactory:

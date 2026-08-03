@@ -154,9 +154,16 @@ class Scheduler(SchedulerInterface):
         # Initialize gap policy for KV cache recomputation
         self.gap_policy: GapPolicy | None = None
         if self.scheduler_config.gap_policy_name is not None:
+            gap_cfg = dict(self.scheduler_config.gap_policy_config or {})
+            # span_legoquest needs the attention window to tell whether a
+            # partial repair would land behind it, where the query cannot see it.
+            if self.scheduler_config.gap_policy_name == "span_legoquest":
+                gap_cfg.setdefault(
+                    "sliding_window", vllm_config.model_config.get_sliding_window()
+                )
             self.gap_policy = GapPolicyFactory.create_policy(
                 policy_name=self.scheduler_config.gap_policy_name,
-                policy_config=self.scheduler_config.gap_policy_config,
+                policy_config=gap_cfg,
             )
             logger.info(
                 "Initialized gap policy: %s with config: %s",
@@ -939,9 +946,7 @@ class Scheduler(SchedulerInterface):
                     request = request_queue.pop_request()
                     request.status = RequestStatus.WAITING_FOR_GAP_RECOMPUTE
                     request.num_computed_tokens = num_computed_tokens
-                    request.num_external_computed_tokens = (
-                        num_external_computed_tokens
-                    )
+                    request.num_external_computed_tokens = num_external_computed_tokens
                     gap_only_new_reqs.append((request, span_gaps))
                     step_skipped_waiting.prepend_request(request)
                     token_budget -= gap_overhead
