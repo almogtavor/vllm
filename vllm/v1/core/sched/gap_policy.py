@@ -131,18 +131,7 @@ class SpanAwareGapPolicy(GapPolicy):
         # between turns (span_legoquest sizes each span from its attention, so a
         # span repaired to 8 blocks may later want 12) - without trimming, the
         # whole 12 is redone and the span is rewritten every turn.
-        sources = request.prefix_hit_sources
-        if sources is not None:
-            bs = self.block_size
-            kept = []
-            for s, e in gaps:
-                b0, b1 = s // bs, min(e // bs, len(sources))
-                while b0 < b1 and sources[b0] == PrefixHitSource.PD:
-                    b0 += 1
-                if b0 >= b1:
-                    continue  # whole gap is already prefix-aware
-                kept.append((max(s, b0 * bs), e))
-            gaps = kept
+        gaps = self._trim_prefix_aware(request, gaps)
 
         logger.info(
             "Created %d gaps for request %s: %s", len(gaps), request.request_id, gaps
@@ -151,6 +140,29 @@ class SpanAwareGapPolicy(GapPolicy):
         self._print_gaps_representation(gaps, num_external_tokens, num_computed_tokens)
 
         return gaps
+
+    def _trim_prefix_aware(
+        self, request: "Request", gaps: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Drop leading blocks that already hold a prefix-aware (pd) copy.
+
+        Those blocks are already correct for this prefix and the rest of the gap
+        can attend them, so redoing them is pure waste. Trimming never leaves a
+        span half-repaired: the blocks it removes are the already-repaired ones.
+        """
+        sources = request.prefix_hit_sources
+        if sources is None:
+            return gaps
+        bs = self.block_size
+        kept = []
+        for s, e in gaps:
+            b0, b1 = s // bs, min(e // bs, len(sources))
+            while b0 < b1 and sources[b0] == PrefixHitSource.PD:
+                b0 += 1
+            if b0 >= b1:
+                continue  # whole gap is already prefix-aware
+            kept.append((max(s, b0 * bs), e))
+        return kept
 
     def _span_gap_ranges(
         self, request: "Request", span_start: int, end_lim: int
@@ -349,39 +361,59 @@ class LegoQuestGapPolicy(QuestGapPolicy):
     span's scored blocks sit early.
     """
 
-    def _span_gap_ranges(
-        self, request: "Request", span_start: int, end_lim: int
+    def get_gaps(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
     ) -> list[tuple[int, int]]:
-        """Contiguous prefix reaching the last scored block, capped by budget.
+        """Fully repair as many spans as the budget covers; never part of one.
 
-        Prefix-closed by construction, so every repaired block attends a fully
-        repaired in-span context and comes out exact. The score only shortens
-        the range: reach = min(budget, last_scored + 1) <= budget, which is
-        what span_aware would have spent.
+        gap_length is a per-REQUEST token budget here, not a per-span one. Spans
+        are taken in score order and each is either repaired end to end or left
+        untouched, so the cache never holds a span that is part prefix-aware and
+        part prefix-free.
         """
-        bs = self.block_size
-        budget = self.gap_length // bs
-        if budget <= 0:
+        if self.gap_length <= 0 or num_computed_tokens == 0:
             return []
-        n_blocks = (end_lim - span_start + bs - 1) // bs
-        if n_blocks <= 0:
+        span_starts = sorted(
+            s for s in (request.span_starts or []) if s < num_computed_tokens
+        )
+        if not span_starts:
             return []
 
-        key = self.get_selection_key(request, span_start)
-        offsets = self.selections.get(key) if key is not None else None
-        if not offsets:
-            # No score for this span yet: fall back to the contiguous prefix.
-            return super(QuestGapPolicy, self)._span_gap_ranges(
-                request, span_start, end_lim
+        regions = []
+        for idx, start in enumerate(span_starts):
+            nxt = (
+                span_starts[idx + 1]
+                if idx + 1 < len(span_starts)
+                else num_computed_tokens
             )
+            end = min(nxt, num_computed_tokens)
+            if end > start:
+                regions.append((start, end))
 
-        scored = [o for o in offsets if 0 <= o < n_blocks]
-        if not scored:
-            return []
-        reach = min(budget, max(scored) + 1, n_blocks)
-        if reach <= 0:
-            return []
-        return [(span_start, min(span_start + reach * bs, end_lim))]
+        # Score order decides WHICH spans get the budget - the selection this
+        # policy exists to make. Unscored spans sort last but stay eligible.
+        def score(region: tuple[int, int]) -> float:
+            key = self.get_selection_key(request, region[0])
+            offsets = self.selections.get(key) if key is not None else None
+            return -float(len(offsets)) if offsets else 0.0
+
+        remaining = self.gap_length
+        chosen: list[tuple[int, int]] = []
+        for start, end in sorted(regions, key=score):
+            size = end - start
+            if size <= remaining:
+                chosen.append((start, end))
+                remaining -= size
+        gaps = sorted(chosen)
+
+        gaps = self._trim_prefix_aware(request, gaps)
+        logger.info(
+            "Created %d gaps for request %s: %s", len(gaps), request.request_id, gaps
+        )
+        return gaps
 
 
 class GapPolicyFactory:
