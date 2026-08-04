@@ -360,6 +360,22 @@ class LegoQuestGapPolicy(QuestGapPolicy):
     recovery is a step rather than a curve: .125 / .021 / .135 / .042 / .125 /
     1.000 at budgets 0 / 256 / 512 / 1024 / 1536 / 2048.
 
+    On a full-attention model the policy pays, and cheaply. Qwen3-32B, prefix
+    1024, span 2048, matched offsets, per offset:
+
+      offset   warm    12%     25%     50%    100%
+      0        0.354   0.990   1.000   1.000  1.000
+      1        1.000   1.000   1.000   1.000    -
+      2        0.052   0.542   0.542   0.542    -
+      3        0.188   0.688   0.688   0.750    -
+
+    Twelve percent coverage captures essentially the whole achievable gain -
+    quadrupling the budget to 50% adds 0.003 on average. So gap-256 against a
+    2048-token span buys most of the way to a correct cache for an eighth of the
+    prefill, which is the saving PIC is supposed to deliver. Two things it does
+    not do: it does not always reach 1.000 (offsets 2 and 3 plateau below it at
+    any budget), and it does nothing on the sliding-window model below.
+
     Coverage is what decides it, and it behaves as a step. gemma-4-31b, prefix
     1024, n=3 per cell, same generation metric:
 
