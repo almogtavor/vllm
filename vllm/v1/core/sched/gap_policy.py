@@ -360,6 +360,21 @@ class LegoQuestGapPolicy(QuestGapPolicy):
     recovery is a step rather than a curve: .125 / .021 / .135 / .042 / .125 /
     1.000 at budgets 0 / 256 / 512 / 1024 / 1536 / 2048.
 
+    Coverage is what decides it, and it behaves as a step. gemma-4-31b, prefix
+    1024, n=3 per cell, same generation metric:
+
+      span 256, budget 256   100% coverage   warm 0.3889 -> 1.0000
+      span 512, budget 512   100% coverage   warm 0.3854 -> 1.0000
+      span 512, budget 256    50% coverage   warm 0.3854 -> 0.3923
+      span 1024, budget 512   50% coverage   warm 0.0764 -> 0.0903
+
+    Full coverage reproduces the true cache exactly; half coverage is worth
+    almost nothing. So the way to make a span reusable without inflating token
+    counts is to keep spans no larger than the gap budget, not to spend the
+    budget more cleverly inside an oversized span. Note also how far warm falls
+    as spans grow (0.389 at 256 tokens, 0.076 at 1024): large spans are much
+    more damaged before any repair.
+
     So: a span within budget is repaired end to end; an oversized span is
     skipped on sliding-window models and left to span_aware elsewhere. Position
     is not the discriminator - the span-1024 row above has the repair fully
