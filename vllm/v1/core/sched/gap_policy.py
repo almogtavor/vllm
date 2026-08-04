@@ -339,30 +339,37 @@ class QuestGapPolicy(SpanAwareGapPolicy):
 
 
 class LegoQuestGapPolicy(QuestGapPolicy):
-    """LegoQuest: repair a span whole, or only where the query can still see it.
+    """LegoQuest: repair a span whole, or skip it on sliding-window models.
 
-    A partly repaired span holds prefix-aware blocks next to prefix-free ones,
-    and that mixture is worse than either pure state - the warm span is
-    internally consistent, so rewriting a subset against the real prefix leaves
-    neighbours that no longer agree with it. Whether that costs anything depends
-    on whether the following query can attend the rewritten region at all.
+    Whether a partial repair is worth its tokens depends on the architecture.
+    Measured offline (fp32, 1024-token prefix, greedy generation compared
+    against the true cache, fraction of matching tokens, first 256 tokens of
+    each span repaired):
 
-    Measured offline (fp32, 1024-token prefix, 2048-token span, greedy
-    generation compared against the true cache):
+      Qwen3-32B, no sliding window, span 2048, n=8
+        no repair 0.4349   first 256 0.6068   (beats warm 4/8, loses 1/8)
+      gemma-4-31b-it, sliding_window=1024, span 2048, n=5
+        no repair 0.1292   first 256 0.1146   (beats warm 2/5, loses 2/5)
+      gemma-4-31b-it, span 1024 sitting inside the query's window, n=4
+        no repair 0.0911   first 256 0.0911   (beats warm 1/4, loses 1/4)
 
-    * gemma-4-31b-it, sliding_window=1024, 5 offsets: no repair matched 0.1292
-      of generated tokens, repairing the first 256 matched 0.1146 - worse than
-      leaving it alone, while spending 256 tokens of prefill. The query sits
-      past the window, so it never sees the repaired prefix. Sweeping the budget
-      gives a step, not a curve: .125 / .021 / .135 / .042 / .125 / 1.000 at
-      budgets 0 / 256 / 512 / 1024 / 1536 / 2048.
-    * Qwen3-32B, no sliding window: the same 256-token repair lifted the match
-      from 0.399 to 0.805, because the query attends the whole span.
+    On the full-attention model the partial repair pays. On the sliding-window
+    model it buys nothing - the means are a wash and the win/loss record is even
+    - so those 256 tokens per span are spent for no measurable gain. Repairing
+    the whole span does work there (matched 1.000 at budget 2048), and the
+    recovery is a step rather than a curve: .125 / .021 / .135 / .042 / .125 /
+    1.000 at budgets 0 / 256 / 512 / 1024 / 1536 / 2048.
 
-    So a span within budget is repaired end to end, and an oversized span is
-    repaired only when the repaired prefix falls inside the query's attention
-    window. Without a sliding window everything is in the window and the policy
-    matches span_aware. It never recomputes more than span_aware does.
+    So: a span within budget is repaired end to end; an oversized span is
+    skipped on sliding-window models and left to span_aware elsewhere. Position
+    is not the discriminator - the span-1024 row above has the repair fully
+    inside the query's window and still gains nothing. Why the architecture
+    matters is not established; the correlation holds across the two families
+    measured and is not a mechanism.
+
+    Sample sizes are small (n=4-8) with high per-offset variance, and all
+    numbers are fp32 while production runs bf16, which has a repair-path error
+    floor of its own (0.021 Qwen, 0.102 gemma-4).
     """
 
     def __init__(self, *args, sliding_window: int | None = None, **kwargs):
