@@ -441,6 +441,24 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    # Architectures whose spans key-rotation round trip has been verified to
+    # reproduce coherent output. Everything else is known-risky, not known-bad.
+    _SPANS_VERIFIED_ARCH_HINTS = ("gemma",)
+
+    def _warn_if_spans_unvalidated(self) -> None:
+        cfg = getattr(self.model_config, "hf_config", None)
+        arch = " ".join(getattr(cfg, "architectures", None) or []).lower()
+        if any(h in arch for h in self._SPANS_VERIFIED_ARCH_HINTS):
+            return
+        logger.warning(
+            "SPANS is enabled on '%s', where the deferred key rotation is "
+            "UNVALIDATED. On Qwen3-32B this produces fluent garbage rather than "
+            "an error, with zero spans marked, under both FLASH_ATTN and "
+            "TRITON_ATTN. Sanity-check a trivial completion before trusting any "
+            "benchmark number from this run.",
+            arch or "unknown architecture",
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -771,6 +789,14 @@ class GPUModelRunner(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
         if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS defers RoPE on the key (see rotary_embedding/base.py) and
+            # relies on the attention backend to re-apply it. That round trip is
+            # only validated on gemma-4. On Qwen3-32B it silently produces
+            # garbage - "The capital of France is" completes as " of the of the
+            # of the" with zero spans marked - under BOTH flash and triton, while
+            # the same build with the deferral disabled is coherent. It does not
+            # raise, so a broken model looks like a bad policy result.
+            self._warn_if_spans_unvalidated()
             # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
             self._attn_lower_bounds_gpu: torch.Tensor | None = None
             self._req_kv_starts_gpu: torch.Tensor | None = None
@@ -1995,8 +2021,7 @@ class GPUModelRunner(
             num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
             q_start = cu_num_tokens - num_scheduled_tokens  # per-req 1st query row
             req_states = [
-                self.requests[req_id]
-                for req_id in self.input_batch.req_ids[:num_reqs]
+                self.requests[req_id] for req_id in self.input_batch.req_ids[:num_reqs]
             ]
             (
                 attn_lb,
@@ -2014,9 +2039,11 @@ class GPUModelRunner(
             )
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True)
+                self.device, non_blocking=True
+            )
             self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True)
+                self.device, non_blocking=True
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2236,9 +2263,7 @@ class GPUModelRunner(
             and self._req_kv_starts_gpu is not None
         ):
             pos_slice = self.positions[:total_num_scheduled_tokens]
-            sched_kv_indices = (
-                self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
-            )
+            sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
             pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
                 pos_slice.dtype
             )
