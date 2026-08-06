@@ -438,6 +438,28 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+def compute_span_lb_regions(
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+    req_len: int,
+) -> list[tuple[int, int, int]]:
+    """SPANS: (start, end, lb) attention-lower-bound regions for a request.
+
+    A span's lb region ends at the NEXT boundary after it: the next span's
+    start (adjacent spans carry no cross of their own - the client skips
+    crosses that coincide with a span start) or the first cross past it.
+    Index-pairing crosses to spans paints lb wrongly over later spans and the
+    generated tail whenever spans are adjacent."""
+    crosses = sorted(cross_span_starts or [])
+    spans_sorted = sorted(span_starts)
+    out = []
+    for j, start in enumerate(spans_sorted):
+        nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
+        cross = next((c for c in crosses if c > start), req_len)
+        out.append((start, min(nxt, cross), start))
+    return out
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -2037,7 +2059,33 @@ class GPUModelRunner(
                 self._quest_top_k,
                 self.device,
             )
+            # SPANS prerotate: rotating K once per forward into a scratch is only
+            # valid when every query row of a request shares one lower bound. A
+            # request with mixed bounds must fall back to the per-tile rotation.
+            seq_lens_arr = num_computed + num_scheduled_tokens
+            spans_prerotate_safe = True
+            for i in range(num_reqs):
+                req = req_states[i]
+                params = req.sampling_params
+                if req.is_gap_recompute or params is None:
+                    continue
+                ea = params.extra_args
+                if not (ea and ea.get("span_starts")):
+                    continue
+                req_start = int(req_kv_starts[i])
+                q_lo = req_start + int(num_computed[i])
+                q_hi = req_start + int(seq_lens_arr[i])
+                if q_hi <= q_lo:
+                    continue
+                req_lbs = attn_lb[req_start:q_hi]
+                query_lbs = attn_lb[q_lo:q_hi]
+                if np.max(req_lbs) > 0 and (
+                    np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
+                ):
+                    spans_prerotate_safe = False
+            self._spans_prerotate_safe = spans_prerotate_safe
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._spans_prerotate_safe = spans_prerotate_safe
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
                 self.device, non_blocking=True
             )
@@ -2537,6 +2585,7 @@ class GPUModelRunner(
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
             quest_score_descs=getattr(self, "_quest_score_descs", None) or None,
             quest_span_scores=getattr(self, "_quest_span_scores", None) or None,
+            spans_prerotate_safe=getattr(self, "_spans_prerotate_safe", True),
         )
 
         if self.dcp_world_size > 1:

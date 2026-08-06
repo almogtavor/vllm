@@ -396,6 +396,7 @@ class CommonAttentionMetadata:
     # n span blocks, post-span query row) + per-descriptor layer-sum buffers.
     quest_score_descs: list[tuple[int, int, int, int]] | None = None
     quest_span_scores: list[torch.Tensor] | None = None
+    spans_prerotate_safe: bool = True
 
     causal: bool | torch.Tensor = True
 
