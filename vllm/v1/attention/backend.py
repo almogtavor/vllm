@@ -392,6 +392,11 @@ class CommonAttentionMetadata:
 
     attn_lower_bounds: torch.Tensor | None = None  # SPANS: per-KV-pos lower bound
     req_kv_starts: torch.Tensor | None = None  # SPANS: per-req start into attn_lb
+    # QUEST: span scoring descriptors (block_table row, first span block,
+    # n span blocks, post-span query row) + per-descriptor layer-sum buffers.
+    quest_score_descs: list[tuple[int, int, int, int]] | None = None
+    quest_span_scores: list[torch.Tensor] | None = None
+    spans_prerotate_safe: bool = True
 
     causal: bool | torch.Tensor = True
 

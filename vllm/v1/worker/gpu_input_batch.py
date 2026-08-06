@@ -56,7 +56,7 @@ class CachedRequestState:
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
     prompt_is_token_ids: list[bool] | None = None
 
-    is_gap_recompute: bool = False  # SPANS: skip span-local attention for Legolink
+    is_gap_recompute: bool = False  # SPANS: virtual row for cached gap repair
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

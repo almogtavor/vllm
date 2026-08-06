@@ -266,6 +266,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_BLOCK_SIZE: int = 0
     VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
     VLLM_V1_SPANS_GAP_LENGTH: int = 32
+    VLLM_V1_SPANS_PREROTATE: bool = True
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1723,6 +1724,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
         os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
     ),
+    # rotate K once per forward into a transient scratch (prefill batches)
+    # instead of per-tile inside the attention kernel
+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_PREROTATE", "True"
+    )
+    == "True",
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces
     # non-determinism (different tokens -> different model behaviour at

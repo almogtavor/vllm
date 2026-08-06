@@ -9,15 +9,160 @@ came from (local prefix cache, external connector, or both).
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import PrefixHitSource
+from vllm.v1.core.kv_cache_utils import BlockHash, PrefixHitSource
+from vllm.v1.core.sched.output import NewRequestData
 
 if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Sentinel: request has no span gaps, so the caller schedules it normally.
+NO_SPAN_GAPS = object()
+
+
+def split_gaps_for_budget(
+    gaps: list[tuple[int, int]], token_budget: int, block_size: int
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split gaps into a block-aligned chunk that fits token_budget and the rest."""
+    block_budget = max(0, token_budget) // block_size * block_size
+    if block_budget <= 0:
+        return [], gaps
+    scheduled: list[tuple[int, int]] = []
+    remaining: list[tuple[int, int]] = []
+    budget = block_budget
+    for start, end in gaps:
+        take = min(end - start, budget)
+        if take < end - start:
+            take = take // block_size * block_size
+        if take <= 0:
+            remaining.append((start, end))
+            continue
+        scheduled.append((start, start + take))
+        budget -= take
+        if start + take < end:
+            remaining.append((start + take, end))
+    return scheduled, remaining
+
+
+def append_virtual_gap_reqs(
+    parent_nrd: NewRequestData,
+    gaps: list[tuple[int, int]],
+    out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    num_scheduled_tokens: dict[str, int],
+) -> None:
+    """Emit one virtual gap-recompute request per gap, sharing the parent's blocks."""
+    logger.info(
+        "Processing computed_token_gaps for request %s: %s", parent_nrd.req_id, gaps
+    )
+    for start, end in gaps:
+        nrd = replace(parent_nrd)
+        nrd.req_id = parent_nrd.req_id + "." + str(start)
+        # Virtual gap requests share the parent's blocks and write directly
+        # to the gap slots in the parent's KV cache.
+        nrd.num_computed_tokens = start
+        nrd.is_gap_recompute = True
+        nrd.parent_req_id = parent_nrd.req_id
+        nrd.gap_start = start
+        nrd.block_ids = parent_nrd.block_ids
+        num_scheduled_tokens[nrd.req_id] = end - start
+        out.append(nrd)
+        virtual_gap_req_ids.add(nrd.req_id)
+
+
+def schedule_span_gaps(
+    sched: "Scheduler",
+    request: "Request",
+    did_prefix_lookup: bool,
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """Reserve gap-recompute work for `request` and defer the parent one step.
+
+    Gaps come from the request's pending remainder, the gap policy, and the
+    connector. Returns NO_SPAN_GAPS when there is nothing to recompute (the
+    caller schedules the request normally), None when there are gaps but no
+    room this step (the caller breaks), or the updated token_budget when the
+    parent was deferred (the caller sets token_budget and continues).
+    """
+    request_id = request.request_id
+    if request.pending_span_gaps:
+        span_gaps = request.pending_span_gaps
+    elif did_prefix_lookup and sched.gap_policy is not None:
+        span_gaps = sched.gap_policy.get_gaps(
+            request, num_computed_tokens, num_external_computed_tokens
+        )
+    else:
+        span_gaps = []
+    if did_prefix_lookup and sched.connector is not None:
+        connector_gaps = sched.connector.get_computed_token_gaps(request)
+        if connector_gaps:
+            logger.info(
+                "Connector %s returned gaps via get_computed_token_gaps(). "
+                "Consider migrating to use GapPolicy at scheduler level.",
+                type(sched.connector).__name__,
+            )
+            span_gaps.extend(connector_gaps)
+    if not span_gaps:
+        return NO_SPAN_GAPS
+
+    span_gaps = sched._merge_gaps(span_gaps)
+    gap_work, remaining_gaps = split_gaps_for_budget(
+        span_gaps, token_budget, sched.block_size
+    )
+    gap_overhead = sum(end - start for start, end in gap_work)
+    if gap_overhead <= 0:
+        return None
+
+    gap_blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        0,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        num_external_computed_tokens=num_external_computed_tokens,
+        span_gaps=gap_work,
+    )
+    if gap_blocks is None:
+        if request.has_encoder_inputs:
+            sched.encoder_cache_manager.free(request)
+        return None
+
+    if sched.connector is not None:
+        sched.connector.update_state_after_alloc(
+            request,
+            sched.kv_cache_manager.get_blocks(request_id),
+            num_external_computed_tokens,
+        )
+
+    request.num_computed_tokens = num_computed_tokens
+    request.pending_span_gaps = remaining_gaps
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request_id).get_block_ids()
+    )
+    append_virtual_gap_reqs(
+        parent_nrd,
+        gap_work,
+        virtual_reqs_out,
+        virtual_gap_req_ids,
+        num_scheduled_tokens,
+    )
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - gap_overhead
 
 
 class GapPolicy(ABC):
@@ -120,26 +265,18 @@ class SpanAwareGapPolicy(GapPolicy):
                 if idx + 1 < len(span_starts)
                 else num_computed_tokens
             )
-            gap_end = min(
-                gap_start + self.gap_length,
-                next_start,
-                num_computed_tokens,
-            )
-            if gap_end > gap_start:
-                gaps.append((gap_start, gap_end))
+            end_lim = min(next_start, num_computed_tokens)
+            gaps.extend(self._span_gap_ranges(request, gap_start, end_lim))
 
-        # SPANS: drop gaps whose blocks all hit a prefix-aware (pd) copy from an
+        # SPANS: skip blocks that already hold a prefix-aware (pd) copy from an
         # earlier recompute of this prefix - recompute-once-per-unique-prefix.
-        sources = request.prefix_hit_sources
-        if sources is not None:
-            bs = self.block_size
-            kept = []
-            for s, e in gaps:
-                blocks = range(s // bs, min(e // bs, len(sources)))
-                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
-                    continue
-                kept.append((s, e))
-            gaps = kept
+        # Trim the leading pd run instead of only dropping all-pd gaps: those
+        # blocks are already correct for this prefix and the rest of the gap can
+        # attend them, so redoing them is pure waste. It matters when a gap grows
+        # between turns (span_legoquest sizes each span from its attention, so a
+        # span repaired to 8 blocks may later want 12) - without trimming, the
+        # whole 12 is redone and the span is rewritten every turn.
+        gaps = self._trim_prefix_aware(request, gaps)
 
         logger.info(
             "Created %d gaps for request %s: %s", len(gaps), request.request_id, gaps
@@ -148,6 +285,35 @@ class SpanAwareGapPolicy(GapPolicy):
         self._print_gaps_representation(gaps, num_external_tokens, num_computed_tokens)
 
         return gaps
+
+    def _trim_prefix_aware(
+        self, request: "Request", gaps: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Drop leading blocks that already hold a prefix-aware (pd) copy.
+
+        Those blocks are already correct for this prefix and the rest of the gap
+        can attend them, so redoing them is pure waste. Trimming never leaves a
+        span half-repaired: the blocks it removes are the already-repaired ones.
+        """
+        sources = request.prefix_hit_sources
+        if sources is None:
+            return gaps
+        bs = self.block_size
+        kept = []
+        for s, e in gaps:
+            b0, b1 = s // bs, min(e // bs, len(sources))
+            while b0 < b1 and sources[b0] == PrefixHitSource.PD:
+                b0 += 1
+            if b0 >= b1:
+                continue  # whole gap is already prefix-aware
+            kept.append((max(s, b0 * bs), e))
+        return kept
+
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
+    ) -> list[tuple[int, int]]:
+        gap_end = min(span_start + self.gap_length, end_lim)
+        return [(span_start, gap_end)] if gap_end > span_start else []
 
     def _print_gaps_representation(
         self,
@@ -190,11 +356,234 @@ class SpanAwareGapPolicy(GapPolicy):
         )
 
 
+class QuestGapPolicy(SpanAwareGapPolicy):
+    """Recompute span blocks selected by the following query's Quest score.
+
+    Scores are measured worker-side at the span's first occurrence against its
+    first post-span query and stored here keyed by both the span's first pic
+    block hash and first following query tokens. A span with no stored
+    selection falls back to anchor blocks, or to the contiguous span_aware gap
+    when anchoring is disabled.
+    """
+
+    MAX_SELECTIONS = 4096
+    DEFAULT_ANCHOR_BLOCKS = 8
+
+    def __init__(
+        self,
+        *args,
+        anchor_blocks: int = DEFAULT_ANCHOR_BLOCKS,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.anchor_blocks = max(anchor_blocks, 0)
+        self.selections: dict[tuple[BlockHash, tuple[int, ...]], list[int]] = {}
+        logger.info("QuestGapPolicy initialized: anchor_blocks=%d", anchor_blocks)
+
+    def get_selection_key(
+        self,
+        request: "Request",
+        span_start: int,
+    ) -> tuple[BlockHash, tuple[int, ...]] | None:
+        bs = self.block_size
+        blk = span_start // bs
+        if blk >= len(request.block_hashes):
+            return None
+
+        cross = self._following_query_start(request, span_start)
+        if cross is None or cross >= request.num_tokens:
+            return None
+
+        query_tokens = tuple(request.all_token_ids[cross : cross + bs])
+        if not query_tokens:
+            return None
+        return request.block_hashes[blk], query_tokens
+
+    def _following_query_start(
+        self,
+        request: "Request",
+        span_start: int,
+    ) -> int | None:
+        spans = request.span_starts or []
+        crosses = request.cross_span_starts or []
+        for idx, start in enumerate(spans):
+            if start == span_start and idx < len(crosses):
+                cross = crosses[idx]
+                return cross if cross > span_start else None
+        return next((cross for cross in sorted(crosses) if cross > span_start), None)
+
+    def store_selection(
+        self,
+        key: tuple[BlockHash, tuple[int, ...]],
+        block_offsets: list[int],
+    ) -> None:
+        # First writer wins: re-scores of a reused span read blocks that are
+        # being gap-recomputed in the same step, so only the first-occurrence
+        # scores (prefix-free warmed K) are trustworthy.
+        if key in self.selections:
+            return
+        self.selections[key] = block_offsets
+        if len(self.selections) > self.MAX_SELECTIONS:
+            self.selections.pop(next(iter(self.selections)))
+
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
+    ) -> list[tuple[int, int]]:
+        bs = self.block_size
+        budget = self.gap_length // bs
+        if budget <= 0:
+            return []
+
+        n_blocks = (end_lim - span_start + bs - 1) // bs
+        if n_blocks <= 0:
+            return []
+
+        key = self.get_selection_key(request, span_start)
+        offsets = self.selections.get(key) if key is not None else None
+        if not offsets:
+            anchor_count = min(self.anchor_blocks, budget, n_blocks)
+            if anchor_count > 0:
+                return [
+                    (
+                        span_start,
+                        min(span_start + anchor_count * bs, end_lim),
+                    )
+                ]
+            return super()._span_gap_ranges(request, span_start, end_lim)
+
+        selected_offsets = []
+        # With a stored selection, the anchor takes at most half the budget so
+        # query-selected blocks always get the rest (at gap-128 the full
+        # 8-block anchor would otherwise consume the whole budget).
+        anchor_count = min(self.anchor_blocks, budget // 2, n_blocks)
+        for o in range(anchor_count):
+            selected_offsets.append(o)
+
+        selected = set(selected_offsets)
+        remaining = budget - len(selected_offsets)
+        for offset in offsets:
+            if remaining <= 0:
+                break
+            if offset < anchor_count or offset >= n_blocks or offset in selected:
+                continue
+            selected_offsets.append(offset)
+            selected.add(offset)
+            remaining -= 1
+
+        gaps: list[tuple[int, int]] = []
+        for o in sorted(selected_offsets):
+            s = span_start + o * bs
+            e = min(s + bs, end_lim)
+            if e <= s:
+                continue
+            if gaps and gaps[-1][1] == s:  # coalesce adjacent selected blocks
+                gaps[-1] = (gaps[-1][0], e)
+            else:
+                gaps.append((s, e))
+        return gaps
+
+
+class LegoQuestGapPolicy(QuestGapPolicy):
+    """LegoQuest: repair a span whole, or skip it on sliding-window models.
+
+    Whether a partial repair is worth its tokens depends on the architecture.
+    Measured offline (fp32, 1024-token prefix, greedy generation compared
+    against the true cache, fraction of matching tokens, first 256 tokens of
+    each span repaired):
+
+      Qwen3-32B, no sliding window, span 2048, n=8
+        no repair 0.4349   first 256 0.6068   (beats warm 4/8, loses 1/8)
+      gemma-4-31b-it, sliding_window=1024, span 2048, n=5
+        no repair 0.1292   first 256 0.1146   (beats warm 2/5, loses 2/5)
+      gemma-4-31b-it, span 1024 sitting inside the query's window, n=4
+        no repair 0.0911   first 256 0.0911   (beats warm 1/4, loses 1/4)
+
+    On the full-attention model the partial repair pays. On the sliding-window
+    model it buys nothing - the means are a wash and the win/loss record is even
+    - so those 256 tokens per span are spent for no measurable gain. Repairing
+    the whole span does work there (matched 1.000 at budget 2048), and the
+    recovery is a step rather than a curve: .125 / .021 / .135 / .042 / .125 /
+    1.000 at budgets 0 / 256 / 512 / 1024 / 1536 / 2048.
+
+    On a full-attention model the policy pays, and cheaply. Qwen3-32B, prefix
+    1024, span 2048, matched offsets, per offset:
+
+      offset   warm    12%     25%     50%    100%
+      0        0.354   0.990   1.000   1.000  1.000
+      1        1.000   1.000   1.000   1.000    -
+      2        0.052   0.542   0.542   0.542    -
+      3        0.188   0.688   0.688   0.750    -
+
+    Twelve percent coverage captures essentially the whole achievable gain -
+    quadrupling the budget to 50% adds 0.003 on average. So gap-256 against a
+    2048-token span buys most of the way to a correct cache for an eighth of the
+    prefill, which is the saving PIC is supposed to deliver. Two things it does
+    not do: it does not always reach 1.000 (offsets 2 and 3 plateau below it at
+    any budget), and it does nothing on the sliding-window model below.
+
+    Coverage is what decides it, and it behaves as a step. gemma-4-31b, prefix
+    1024, n=3 per cell, same generation metric:
+
+      span 256, budget 256   100% coverage   warm 0.3889 -> 1.0000
+      span 512, budget 512   100% coverage   warm 0.3854 -> 1.0000
+      span 512, budget 256    50% coverage   warm 0.3854 -> 0.3923
+      span 1024, budget 512   50% coverage   warm 0.0764 -> 0.0903
+
+    Full coverage reproduces the true cache exactly; half coverage is worth
+    almost nothing. So the way to make a span reusable without inflating token
+    counts is to keep spans no larger than the gap budget, not to spend the
+    budget more cleverly inside an oversized span. Note also how far warm falls
+    as spans grow (0.389 at 256 tokens, 0.076 at 1024): large spans are much
+    more damaged before any repair.
+
+    So: a span within budget is repaired end to end; an oversized span is
+    skipped on sliding-window models and left to span_aware elsewhere. Position
+    is not the discriminator - the span-1024 row above has the repair fully
+    inside the query's window and still gains nothing. Why the architecture
+    matters is not established; the correlation holds across the two families
+    measured and is not a mechanism.
+
+    Sample sizes are small (n=4-8) with high per-offset variance, and all
+    numbers are fp32 while production runs bf16, which has a repair-path error
+    floor of its own (0.021 Qwen, 0.102 gemma-4).
+    """
+
+    def __init__(self, *args, sliding_window: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sliding_window = sliding_window or 0
+
+    def _span_gap_ranges(
+        self, request: "Request", span_start: int, end_lim: int
+    ) -> list[tuple[int, int]]:
+        size = end_lim - span_start
+        if size <= 0:
+            return []
+        if size <= self.gap_length:
+            return [(span_start, end_lim)]  # fits: repair it whole
+
+        if self.sliding_window <= 0:
+            # Full attention: the query sees the repaired prefix, and partial
+            # repair measurably helps. Same ranges span_aware would emit.
+            return super(QuestGapPolicy, self)._span_gap_ranges(
+                request, span_start, end_lim
+            )
+
+        # Sliding-window model, span past the budget: leave it warm. Tested
+        # whether this could be narrowed to repairs that land behind the window
+        # - it cannot. On gemma-4 with a 1024-token span sitting entirely inside
+        # the query's window, repairing its first 256 tokens still matched warm
+        # exactly (0.0911 vs 0.0911 over 4 offsets), so position is not the
+        # discriminator and the gate stays on the architecture.
+        return []
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
     _POLICIES = {
         "none": NoGapPolicy,
+        "span_quest": QuestGapPolicy,
+        "span_legoquest": LegoQuestGapPolicy,
         "span_aware": SpanAwareGapPolicy,
     }
 

@@ -266,6 +266,10 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # QUEST: req_id -> [(span_start, ranked span-block offsets)], scored
+    # against the span's first following query (summed over layers).
+    quest_selections: dict[str, list[tuple[int, list[int]]]] | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

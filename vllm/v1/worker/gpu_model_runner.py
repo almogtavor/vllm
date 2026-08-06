@@ -209,6 +209,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.span_metadata import build_span_attention_metadata
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -437,9 +438,49 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+def compute_span_lb_regions(
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+    req_len: int,
+) -> list[tuple[int, int, int]]:
+    """SPANS: (start, end, lb) attention-lower-bound regions for a request.
+
+    A span's lb region ends at the NEXT boundary after it: the next span's
+    start (adjacent spans carry no cross of their own - the client skips
+    crosses that coincide with a span start) or the first cross past it.
+    Index-pairing crosses to spans paints lb wrongly over later spans and the
+    generated tail whenever spans are adjacent."""
+    crosses = sorted(cross_span_starts or [])
+    spans_sorted = sorted(span_starts)
+    out = []
+    for j, start in enumerate(spans_sorted):
+        nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
+        cross = next((c for c in crosses if c > start), req_len)
+        out.append((start, min(nxt, cross), start))
+    return out
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    # Architectures whose spans key-rotation round trip has been verified to
+    # reproduce coherent output. Everything else is known-risky, not known-bad.
+    _SPANS_VERIFIED_ARCH_HINTS = ("gemma",)
+
+    def _warn_if_spans_unvalidated(self) -> None:
+        cfg = getattr(self.model_config, "hf_config", None)
+        arch = " ".join(getattr(cfg, "architectures", None) or []).lower()
+        if any(h in arch for h in self._SPANS_VERIFIED_ARCH_HINTS):
+            return
+        logger.warning(
+            "SPANS is enabled on '%s', where the deferred key rotation is "
+            "UNVALIDATED. On Qwen3-32B this produces fluent garbage rather than "
+            "an error, with zero spans marked, under both FLASH_ATTN and "
+            "TRITON_ATTN. Sanity-check a trivial completion before trusting any "
+            "benchmark number from this run.",
+            arch or "unknown architecture",
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -572,7 +613,8 @@ class GPUModelRunner(
 
         if self._kv_hash_debug_enabled:
             logger.info(
-                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, output_file=%s, log_interval=%d",
+                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, "
+                "output_file=%s, log_interval=%d",
                 self._kv_hash_debug_layer,
                 self._kv_hash_debug_req_ids if self._kv_hash_debug_req_ids else "ALL",
                 self._kv_hash_debug_output_file
@@ -769,9 +811,31 @@ class GPUModelRunner(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
         if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS defers RoPE on the key (see rotary_embedding/base.py) and
+            # relies on the attention backend to re-apply it. That round trip is
+            # only validated on gemma-4. On Qwen3-32B it silently produces
+            # garbage - "The capital of France is" completes as " of the of the
+            # of the" with zero spans marked - under BOTH flash and triton, while
+            # the same build with the deferral disabled is coherent. It does not
+            # raise, so a broken model looks like a bad policy result.
+            self._warn_if_spans_unvalidated()
             # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
             self._attn_lower_bounds_gpu: torch.Tensor | None = None
             self._req_kv_starts_gpu: torch.Tensor | None = None
+            # QUEST: span-block budget; >0 only for policies that consume the
+            # per-span block scores. span_legoquest needs them too - it reads
+            # max(selected offset) to size each span's contiguous prefix, so
+            # without scoring it silently degrades to uniform span_aware.
+            _gap_cfg = self.scheduler_config.gap_policy_config or {}
+            self._quest_top_k = (
+                _gap_cfg.get("gap_length", 0)
+                // (_gap_cfg.get("block_size") or self.cache_config.block_size or 1)
+                if self.scheduler_config.gap_policy_name
+                in ("span_quest", "span_legoquest")
+                else 0
+            )
+            self._quest_score_descs: list[tuple[int, int, int, int]] = []
+            self._quest_span_scores: list[torch.Tensor] = []
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1977,29 +2041,57 @@ class GPUModelRunner(
 
         if envs.VLLM_V1_SPANS_ENABLED:
             num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            q_start = cu_num_tokens - num_scheduled_tokens  # per-req 1st query row
+            req_states = [
+                self.requests[req_id] for req_id in self.input_batch.req_ids[:num_reqs]
+            ]
+            (
+                attn_lb,
+                req_kv_starts,
+                self._quest_score_descs,
+                self._quest_span_scores,
+            ) = build_span_attention_metadata(
+                req_states,
+                num_computed,
+                num_scheduled_tokens,
+                q_start,
+                self.cache_config.block_size,
+                self._quest_top_k,
+                self.device,
+            )
+            # SPANS prerotate: rotating K once per forward into a scratch is only
+            # valid when every query row of a request shares one lower bound. A
+            # request with mixed bounds must fall back to the per-tile rotation.
             seq_lens_arr = num_computed + num_scheduled_tokens
-            req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
-            np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
-            attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            spans_prerotate_safe = True
             for i in range(num_reqs):
-                req = self.requests[self.input_batch.req_ids[i]]
+                req = req_states[i]
                 params = req.sampling_params
                 if req.is_gap_recompute or params is None:
                     continue
                 ea = params.extra_args
-                spans = ea.get("span_starts") if ea else None
-                if not spans:
+                if not (ea and ea.get("span_starts")):
                     continue
-                crosses = ea.get("cross_span_starts") or []
-                req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-                for j, span_start in enumerate(spans):
-                    cross = crosses[j] if j < len(crosses) else req_len
-                    attn_lb[req_start + span_start : req_start + cross] = span_start
+                req_start = int(req_kv_starts[i])
+                q_lo = req_start + int(num_computed[i])
+                q_hi = req_start + int(seq_lens_arr[i])
+                if q_hi <= q_lo:
+                    continue
+                req_lbs = attn_lb[req_start:q_hi]
+                query_lbs = attn_lb[q_lo:q_hi]
+                if np.max(req_lbs) > 0 and (
+                    np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
+                ):
+                    spans_prerotate_safe = False
+            self._spans_prerotate_safe = spans_prerotate_safe
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._spans_prerotate_safe = spans_prerotate_safe
             self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True)
+                self.device, non_blocking=True
+            )
             self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True)
+                self.device, non_blocking=True
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2219,9 +2311,7 @@ class GPUModelRunner(
             and self._req_kv_starts_gpu is not None
         ):
             pos_slice = self.positions[:total_num_scheduled_tokens]
-            sched_kv_indices = (
-                self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
-            )
+            sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
             pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
                 pos_slice.dtype
             )
@@ -2379,7 +2469,8 @@ class GPUModelRunner(
         # for name, module in self.model.named_modules():
         #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
         #     for attr_name, attr_value in module.__dict__.items():
-        #         logger.info("  .%s: %s = %s", attr_name, type(attr_value).__name__, repr(attr_value)[:100])
+        #         logger.info("  .%s: %s = %s", attr_name,
+        #                     type(attr_value).__name__, repr(attr_value)[:100])
 
         # # Find rotary
         # for name, module in self.model.named_modules():
@@ -2387,7 +2478,7 @@ class GPUModelRunner(
         #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
 
         if not hasattr(self, "rotate"):
-            # Get the layers list, handling both standard and Llama4-style model structures
+            # Handle both standard and Llama4-style model structures.
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                 layers = self.model.model.layers
             elif hasattr(self.model, "language_model") and hasattr(
@@ -2396,7 +2487,8 @@ class GPUModelRunner(
                 layers = self.model.language_model.model.layers
             else:
                 raise AttributeError(
-                    f"Cannot find layers in model structure: {type(self.model).__name__}"
+                    "Cannot find layers in model structure: "
+                    f"{type(self.model).__name__}"
                 )
 
             for lay in layers:
@@ -2491,6 +2583,9 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
+            quest_score_descs=getattr(self, "_quest_score_descs", None) or None,
+            quest_span_scores=getattr(self, "_quest_span_scores", None) or None,
+            spans_prerotate_safe=getattr(self, "_spans_prerotate_safe", True),
         )
 
         if self.dcp_world_size > 1:
@@ -4156,6 +4251,11 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        # SPANS uses per-step attention metadata tensors that are carried
+        # through ForwardContext, not explicit model inputs. CUDA graph replay
+        # would otherwise reuse metadata pointers captured from an earlier step.
+        force_eager = force_eager or envs.VLLM_V1_SPANS_ENABLED
+
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -4941,6 +5041,20 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        # QUEST: rank each scored span's blocks by the layer-summed Quest
+        # score; the scheduler stores the top-k offsets for later recomputes.
+        quest_selections = None
+        if getattr(self, "_quest_score_descs", None):
+            quest_selections = {}
+            bs = self.cache_config.block_size
+            for (row, s_blk, _, _), scores in zip(
+                self._quest_score_descs, self._quest_span_scores
+            ):
+                req_id = self.input_batch.req_ids[row]
+                offs = scores.topk(self._quest_top_k).indices.tolist()
+                quest_selections.setdefault(req_id, []).append((s_blk * bs, offs))
+            self._quest_score_descs, self._quest_span_scores = [], []
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4955,6 +5069,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                quest_selections=quest_selections,
             )
 
         # Handle virtual gap requests: cleanup only (KV written directly to parent)
@@ -6777,6 +6892,13 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED:
+            logger.warning(
+                "Skipping CUDA graph memory profiling for spans because span "
+                "attention metadata is not CUDA graph replay safe."
+            )
+            return 0
+
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -6926,6 +7048,13 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED:
+            logger.warning(
+                "Skipping CUDA graph capture for spans because span attention "
+                "metadata is not CUDA graph replay safe."
+            )
+            return 0
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "

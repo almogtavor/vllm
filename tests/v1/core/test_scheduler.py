@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm import envs
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -25,6 +26,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.gap_policy import SpanAwareGapPolicy
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
@@ -1188,6 +1190,108 @@ def _step_until_done(
 
 def _num_waiting_requests(scheduler: Scheduler) -> int:
     return len(scheduler.waiting) + len(scheduler.skipped_waiting)
+
+
+def test_span_gap_recompute_fences_parent_request():
+    block_size = 16
+    original_spans_enabled = envs.VLLM_V1_SPANS_ENABLED
+    envs.VLLM_V1_SPANS_ENABLED = True
+    init_none_hash(sha256)
+
+    def make_request(
+        req_id: str,
+        prompt_token_ids: list[int],
+        extra_args: dict | None = None,
+        max_tokens: int = 2,
+    ) -> Request:
+        sampling_params = SamplingParams(
+            ignore_eos=True,
+            max_tokens=max_tokens,
+            extra_args=extra_args,
+        )
+        sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+        return Request(
+            request_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(block_size, sha256),
+        )
+
+    def model_output(req_ids: list[str]) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[[1000] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    try:
+        scheduler = create_scheduler(
+            enable_prefix_caching=True,
+            block_size=block_size,
+            max_num_batched_tokens=block_size * 8,
+            max_model_len=block_size * 8,
+        )
+        scheduler.gap_policy = SpanAwareGapPolicy(
+            gap_length=block_size,
+            block_size=block_size,
+        )
+
+        prefix = [0] * block_size
+        chunk = [1] * block_size
+        suffix = [2] * (block_size * 2)
+
+        for request in (
+            make_request("warm-prefix", prefix),
+            make_request("warm-chunk", chunk),
+        ):
+            scheduler.add_request(request)
+            output = scheduler.schedule()
+            _step_until_done(scheduler, output, model_output([request.request_id]))
+            scheduler.schedule()
+
+        marked = make_request(
+            "marked",
+            prefix + chunk + suffix,
+            extra_args={
+                "span_starts": [block_size],
+                "cross_span_starts": [block_size * 2],
+            },
+        )
+        scheduler.add_request(marked)
+
+        gap_output = scheduler.schedule()
+        virtual_id = f"{marked.request_id}.{block_size}"
+
+        assert marked.status == RequestStatus.WAITING_FOR_GAP_RECOMPUTE
+        assert len(scheduler.running) == 0
+        assert _num_waiting_requests(scheduler) == 1
+        assert gap_output.num_scheduled_tokens == {virtual_id: block_size}
+        assert [req.req_id for req in gap_output.scheduled_new_reqs] == [virtual_id]
+        assert gap_output.virtual_gap_req_ids == {virtual_id}
+
+        scheduler.update_from_output(
+            gap_output,
+            dataclasses.replace(
+                model_output([virtual_id]),
+                sampled_token_ids=[[]],
+            ),
+        )
+
+        parent_output = scheduler.schedule()
+        assert marked.status == RequestStatus.RUNNING
+        assert parent_output.num_scheduled_tokens == {
+            marked.request_id: block_size * 2
+        }
+        assert [req.req_id for req in parent_output.scheduled_new_reqs] == [
+            marked.request_id
+        ]
+        assert not parent_output.virtual_gap_req_ids
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original_spans_enabled
 
 
 def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
