@@ -843,20 +843,6 @@ class GPUModelRunner(
                 # live length per slot, so a slot reused by a shorter request gets its
                 # stale tail cleared instead of inheriting phantom span bounds
                 self._spans_lb_len = [0] * self.max_num_reqs
-            # QUEST: span-block budget; >0 only for policies that consume the
-            # per-span block scores. span_legoquest needs them too - it reads
-            # max(selected offset) to size each span's contiguous prefix, so
-            # without scoring it silently degrades to uniform span_aware.
-            _gap_cfg = self.scheduler_config.gap_policy_config or {}
-            self._quest_top_k = (
-                _gap_cfg.get("gap_length", 0)
-                // (_gap_cfg.get("block_size") or self.cache_config.block_size or 1)
-                if self.scheduler_config.gap_policy_name
-                in ("span_quest", "span_legoquest")
-                else 0
-            )
-            self._quest_score_descs: list[tuple[int, int, int, int]] = []
-            self._quest_span_scores: list[torch.Tensor] = []
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -4281,17 +4267,25 @@ class GPUModelRunner(
         # The lower-bound buffer is now persistent and strided (fixed address, constant
         # req_kv_starts), so decode replay is safe. Two things still are not:
         #   - prefill-bearing batches build a data-dependent prerotate k_scratch
-        #   - QUEST allocates a fresh per-span score tensor each step
-        # Both are confined to prefill / scoring steps, so eager is kept only there.
+        # That is confined to prefill steps, so eager is kept only there.
         # Blanket-forcing eager cost ~3x on decode (45ms/tok vs upstream's 14.6).
-        if envs.VLLM_V1_SPANS_ENABLED and not force_eager:
+        # force_uniform_decode is set only on the capture/dummy_run paths. Those
+        # callers assert the dispatch returns the mode they asked for, so applying the
+        # spans rule there returns NONE against a PIECEWISE request and kills the
+        # engine at init ("Cudagraph runtime mode mismatch in dummy_run"). Gate the
+        # rule to real execution; capture proceeds exactly as upstream intends.
+        if (
+            envs.VLLM_V1_SPANS_ENABLED
+            and not force_eager
+            and force_uniform_decode is None
+        ):
             force_eager = (
                 # stride==0 means the oversized-config fallback kept the packed
                 # layout, whose address still moves every step
                 not getattr(self, "_spans_lb_stride", 0)
                 or not envs.VLLM_V1_SPANS_CUDAGRAPH
+                # prefill-bearing batches build data-dependent prerotate scratch
                 or max_num_scheduled_tokens > 1
-                or bool(getattr(self, "_quest_score_descs", None))
             )
 
         uniform_decode = self._is_uniform_decode(
