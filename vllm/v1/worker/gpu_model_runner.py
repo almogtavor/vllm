@@ -791,9 +791,72 @@ class GPUModelRunner(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
         if envs.VLLM_V1_SPANS_ENABLED:
-            # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
-            self._attn_lower_bounds_gpu: torch.Tensor | None = None
-            self._req_kv_starts_gpu: torch.Tensor | None = None
+            # SPANS defers RoPE on the key (see rotary_embedding/base.py) and
+            # relies on the attention backend to re-apply it. That round trip is
+            # only validated on gemma-4. On Qwen3-32B it silently produces
+            # garbage - "The capital of France is" completes as " of the of the
+            # of the" with zero spans marked - under BOTH flash and triton, while
+            # the same build with the deferral disabled is coherent. It does not
+            # raise, so a broken model looks like a bad policy result.
+            # SPANS: per-KV lower bound + per-req offsets, in STRIDED persistent buffers.
+            #
+            # These used to be packed (cumsum offsets) and reallocated every forward, so
+            # a single decode token appended to request 0 shifted every later offset and
+            # the tensor address moved. A captured CUDA graph bakes addresses in, which
+            # is why spans had to disable graph capture outright - and that costs ~3x on
+            # decode (45ms/tok vs upstream's 14.6), dwarfing every PIC saving.
+            #
+            # A [max_num_reqs, max_model_len] stride makes req_kv_starts constant
+            # (i*stride) and the base address fixed, so capture is safe. The kernel needs
+            # no change: it already indexes attn_lower_bounds[req_kv_starts[i] + pos].
+            self._spans_lb_stride = self.model_config.max_model_len
+            _lb_n = self.max_num_reqs * self._spans_lb_stride
+            # int32, so 32k ctx x 256 reqs = 33MB on each side. Bail out rather than
+            # pin gigabytes on a wide config; the eager path stays correct, just slow.
+            _LB_MAX = 1 << 28  # 256M int32 = 1GiB per side
+            if _lb_n > _LB_MAX:
+                # Fall back to the old packed/eager path rather than pin gigabytes.
+                # Correct, just slow - stride==0 is the sentinel every use site checks.
+                logger.warning(
+                    "SPANS: lower-bound buffer would be %.1f GiB "
+                    "(max_num_seqs=%d x max_model_len=%d); keeping the eager path.",
+                    _lb_n * 4 / 2**30, self.max_num_reqs, self._spans_lb_stride,
+                )
+                self._spans_lb_stride = 0
+                self._attn_lower_bounds_gpu: torch.Tensor | None = None
+                self._req_kv_starts_gpu: torch.Tensor | None = None
+                self._spans_lb_staging = None
+                self._spans_lb_len = []
+            else:
+                self._attn_lower_bounds_gpu = torch.zeros(
+                    _lb_n, dtype=torch.int32, device=self.device
+                )
+                # constant, never rewritten, so it cannot invalidate a captured graph
+                self._req_kv_starts_gpu = torch.arange(
+                    self.max_num_reqs + 1, dtype=torch.int32, device=self.device
+                ) * self._spans_lb_stride
+                # pinned: from pageable numpy memory non_blocking=True is silently
+                # ignored and the copy stalls the step
+                self._spans_lb_staging = torch.zeros(
+                    _lb_n, dtype=torch.int32, pin_memory=True
+                )
+                # live length per slot, so a slot reused by a shorter request gets its
+                # stale tail cleared instead of inheriting phantom span bounds
+                self._spans_lb_len = [0] * self.max_num_reqs
+            # QUEST: span-block budget; >0 only for policies that consume the
+            # per-span block scores. span_legoquest needs them too - it reads
+            # max(selected offset) to size each span's contiguous prefix, so
+            # without scoring it silently degrades to uniform span_aware.
+            _gap_cfg = self.scheduler_config.gap_policy_config or {}
+            self._quest_top_k = (
+                _gap_cfg.get("gap_length", 0)
+                // (_gap_cfg.get("block_size") or self.cache_config.block_size or 1)
+                if self.scheduler_config.gap_policy_name
+                in ("span_quest", "span_legoquest")
+                else 0
+            )
+            self._quest_score_descs: list[tuple[int, int, int, int]] = []
+            self._quest_span_scores: list[torch.Tensor] = []
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -2028,13 +2091,36 @@ class GPUModelRunner(
                     ):
                         spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
-            self._spans_prerotate_safe = spans_prerotate_safe
-            self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True
-            )
-            self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True
-            )
+            # Scatter the packed build into the STRIDED persistent buffer. The buffer's
+            # address never changes, so a captured graph stays valid; only the contents
+            # are refreshed. _req_kv_starts_gpu is constant (i*stride) and is not touched.
+            stride = self._spans_lb_stride
+            staging = self._spans_lb_staging
+            # oversized-config fallback: old packed layout, eager path
+            _scatter_reqs = num_reqs if stride else 0
+            if not stride:
+                self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
+                    self.device, non_blocking=True
+                )
+                self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
+                    self.device, non_blocking=True
+                )
+            for i in range(_scatter_reqs):
+                lo, hi = int(req_kv_starts[i]), int(req_kv_starts[i + 1])
+                n = min(hi - lo, stride)
+                base = i * stride
+                prev = self._spans_lb_len[i]
+                # a shrinking slot means a different request landed here; its stale
+                # bounds must not survive, or the new request attends a phantom span
+                if prev > n:
+                    self._attn_lower_bounds_gpu[base + n:base + prev].zero_()
+                self._spans_lb_len[i] = n
+                if n <= 0:
+                    continue
+                staging[base:base + n] = torch.from_numpy(attn_lb[lo:lo + n])
+                self._attn_lower_bounds_gpu[base:base + n].copy_(
+                    staging[base:base + n], non_blocking=True
+                )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -4190,6 +4276,24 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        # SPANS carries attention metadata through ForwardContext rather than as model
+        # inputs, so a captured graph would replay whatever pointers it saw at capture.
+        # The lower-bound buffer is now persistent and strided (fixed address, constant
+        # req_kv_starts), so decode replay is safe. Two things still are not:
+        #   - prefill-bearing batches build a data-dependent prerotate k_scratch
+        #   - QUEST allocates a fresh per-span score tensor each step
+        # Both are confined to prefill / scoring steps, so eager is kept only there.
+        # Blanket-forcing eager cost ~3x on decode (45ms/tok vs upstream's 14.6).
+        if envs.VLLM_V1_SPANS_ENABLED and not force_eager:
+            force_eager = (
+                # stride==0 means the oversized-config fallback kept the packed
+                # layout, whose address still moves every step
+                not getattr(self, "_spans_lb_stride", 0)
+                or not envs.VLLM_V1_SPANS_CUDAGRAPH
+                or max_num_scheduled_tokens > 1
+                or bool(getattr(self, "_quest_score_descs", None))
+            )
+
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -6960,6 +7064,14 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED and not envs.VLLM_V1_SPANS_CUDAGRAPH:
+            logger.warning(
+                "Skipping CUDA graph capture for spans (VLLM_V1_SPANS_CUDAGRAPH=0). "
+                "This costs ~3x on decode; the span lower-bound buffer is persistent "
+                "and strided, so capture is safe unless you are debugging."
+            )
+            return 0
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
