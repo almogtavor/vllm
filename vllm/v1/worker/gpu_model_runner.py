@@ -4324,7 +4324,16 @@ class GPUModelRunner(
         #   - QUEST allocates a fresh per-span score tensor each step
         # Both are confined to prefill / scoring steps, so eager is kept only there.
         # Blanket-forcing eager cost ~3x on decode (45ms/tok vs upstream's 14.6).
-        if envs.VLLM_V1_SPANS_ENABLED and not force_eager:
+        # force_uniform_decode is set only on the capture/dummy_run paths. Those
+        # callers assert the dispatch returns the mode they asked for, so applying the
+        # spans rule there returns NONE against a PIECEWISE request and kills the
+        # engine at init ("Cudagraph runtime mode mismatch in dummy_run"). Gate the
+        # rule to real execution; capture proceeds exactly as upstream intends.
+        if (
+            envs.VLLM_V1_SPANS_ENABLED
+            and not force_eager
+            and force_uniform_decode is None
+        ):
             force_eager = (
                 # stride==0 means the oversized-config fallback kept the packed
                 # layout, whose address still moves every step
