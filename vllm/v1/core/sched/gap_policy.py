@@ -335,12 +335,130 @@ class SpanAwareGapPolicy(GapPolicy):
         )
 
 
+class QCFusePolicy(GapPolicy):
+    """QCFuse: recompute a query-selected subset of tokens across ALL layers.
+
+    Unlike SpanAwareGapPolicy, which recomputes a fixed-length head at each span
+    boundary, QCFuse recomputes ``floor(rho * N)`` of the cached tokens chosen by
+    query-to-context attention mass. The critical layers are only the cheap
+    selection lens that produces that importance signal -- they are not
+    themselves what gets recomputed.
+
+    The importance vector is produced worker-side and handed back through
+    ``request.qcfuse_importance``. Until it arrives this returns no gaps, so the
+    request is scheduled normally and the probe runs first.
+
+    Selection is block-granular by default: ``_span_swap_indices`` and the PD
+    dedup filter both truncate via ``end // block_size``, so a sub-block gap
+    would skip the PIC->PD swap and clobber a shared warmed block. Block
+    granularity preserves the rho budget exactly (in block quanta) while keeping
+    the existing gap plumbing correct and the gap count far below max_num_seqs.
+    """
+
+    def __init__(
+        self,
+        rho: float = 0.1,
+        critical_layers: str | tuple[int, ...] = (),
+        block_size: int = 16,
+        granularity: str = "block",
+    ):
+        if isinstance(critical_layers, str):
+            critical_layers = tuple(
+                int(x) for x in critical_layers.split(",") if x.strip()
+            )
+        else:
+            critical_layers = tuple(critical_layers)
+        # A silently-empty lens would make this arm a no-op that still reports as
+        # QCFuse, so refuse it. ValueError is deliberate: create_policy() catches
+        # only TypeError, so this propagates instead of degrading to NoGapPolicy.
+        if not critical_layers:
+            raise ValueError(
+                "QCFusePolicy requires critical_layers (offline-profiled per "
+                "model); set VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS."
+            )
+        if not 0.0 < rho <= 1.0:
+            raise ValueError(f"QCFusePolicy rho must be in (0, 1], got {rho}")
+        if granularity not in ("block", "token"):
+            raise ValueError(
+                f"QCFusePolicy granularity must be block|token, got {granularity}"
+            )
+        self.rho = rho
+        self.critical_layers = critical_layers
+        self.block_size = block_size
+        self.granularity = granularity
+
+        logger.info(
+            "QCFusePolicy initialized: rho=%.3f critical_layers=%s granularity=%s",
+            rho,
+            list(critical_layers),
+            granularity,
+        )
+
+    def get_gaps(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> list[tuple[int, int]]:
+        if num_computed_tokens == 0:
+            return []
+
+        importance = getattr(request, "qcfuse_importance", None)
+        if importance is None:
+            # Probe has not run yet; schedule normally and select next step.
+            return []
+
+        budget = int(self.rho * num_computed_tokens)
+        if budget <= 0:
+            return []
+
+        bs = self.block_size
+        if self.granularity == "block":
+            num_blocks = num_computed_tokens // bs
+            if num_blocks == 0:
+                return []
+            scores = [
+                (sum(importance[b * bs : (b + 1) * bs]), b) for b in range(num_blocks)
+            ]
+            scores.sort(reverse=True)
+            keep = sorted(b for _, b in scores[: max(1, budget // bs)])
+            gaps = [(b * bs, (b + 1) * bs) for b in keep]
+        else:
+            ranked = sorted(
+                range(min(len(importance), num_computed_tokens)),
+                key=lambda t: importance[t],
+                reverse=True,
+            )[:budget]
+            gaps = [(t, t + 1) for t in sorted(ranked)]
+
+        # SPANS: same recompute-once-per-unique-prefix dedup as SpanAwareGapPolicy.
+        sources = request.prefix_hit_sources
+        if sources is not None:
+            kept = []
+            for s, e in gaps:
+                blocks = range(s // bs, min(e // bs, len(sources)))
+                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
+                    continue
+                kept.append((s, e))
+            gaps = kept
+
+        logger.info(
+            "QCFuse selected %d gaps (rho=%.3f, budget=%d tok) for request %s",
+            len(gaps),
+            self.rho,
+            budget,
+            request.request_id,
+        )
+        return gaps
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
     _POLICIES = {
         "none": NoGapPolicy,
         "span_aware": SpanAwareGapPolicy,
+        "qcfuse": QCFusePolicy,
     }
 
     @classmethod
