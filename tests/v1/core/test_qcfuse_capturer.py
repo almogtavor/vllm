@@ -66,17 +66,40 @@ def test_probe_is_a_noop_without_descriptors(critical_layers):
     assert cap.buffer.abs().sum().item() == 0.0
 
 
-def test_unexpected_kv_layout_is_a_silent_noop(critical_layers):
+def test_unreadable_kv_layout_raises_instead_of_degrading(critical_layers):
+    """A layout the probe cannot read must FAIL, not no-op.
+
+    With no importance the policy returns no gaps, so the arm quietly becomes
+    plain `spans` while still labelling itself QCFuse -- publishing a real
+    number for a method that never ran. gemma-4 hit exactly this: its cache is
+    (n_blocks, 2, block, heads, head) and the probe disabled itself with a
+    single WARNING line.
+    """
     cap = make_capturer()
     cap.begin_step(torch.arange(N_BLOCKS).view(1, N_BLOCKS), [(0, 0, 4, CTX)])
-    cap.capture(
-        1,
-        torch.randn(4, N_KV_HEADS * QUERIES_PER_KV, HEAD_DIM),
-        torch.zeros(N_BLOCKS, BLOCK_SIZE, N_KV_HEADS, HEAD_DIM),
-        QUERIES_PER_KV,
-        1.0,
+    with pytest.raises(RuntimeError, match="cannot read this model"):
+        cap.capture(
+            1,
+            torch.randn(4, N_KV_HEADS * QUERIES_PER_KV, HEAD_DIM),
+            torch.zeros(N_BLOCKS, BLOCK_SIZE, N_KV_HEADS, HEAD_DIM),
+            QUERIES_PER_KV,
+            1.0,
+        )
+
+
+def test_blocks_first_kv_layout_is_supported(critical_layers):
+    """gemma-4 stores (n_blocks, 2, block, kv_heads, head): K is kv[:, 0]."""
+    cap = make_capturer()
+    kv = torch.zeros(N_BLOCKS, 2, BLOCK_SIZE, N_KV_HEADS, HEAD_DIM)
+    kv[:, 0].normal_()
+    nq = 5
+    cap.begin_step(torch.arange(N_BLOCKS).view(1, N_BLOCKS), [(0, 0, nq, CTX)])
+    q = torch.randn(nq, N_KV_HEADS * QUERIES_PER_KV, HEAD_DIM)
+    cap.capture(1, q, kv, QUERIES_PER_KV, 1.0)
+    total = cap.buffer.abs().sum().item()
+    assert total == pytest.approx(nq * N_KV_HEADS, rel=1e-3), (
+        f"blocks-first layout captured {total}, expected {nq * N_KV_HEADS}"
     )
-    assert cap.buffer.abs().sum().item() == 0.0
 
 
 def test_mass_is_a_softmax_over_context(critical_layers):

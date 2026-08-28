@@ -118,14 +118,25 @@ class QCFuseImportanceCapturer:
         block_table = self.block_table
         if block_table is None:
             return
-        if kv_cache.dim() != 5 or kv_cache.shape[0] != 2:
-            self._warn_layout(f"unexpected kv_cache shape {tuple(kv_cache.shape)}")
-            return
         if kv_cache.dtype not in _SUPPORTED_KV_DTYPES:
             self._warn_layout(f"unsupported kv_cache dtype {kv_cache.dtype}")
             return
 
-        key_cache = kv_cache[0]
+        # Two paged layouts exist and rank alone does not separate them:
+        #   (2, n_blocks, block, kv_heads, head)  K/V-first (vLLM default)
+        #   (n_blocks, 2, block, kv_heads, head)  blocks-first (gemma-4)
+        # Guessing wrong scores garbage silently, so key off whichever axis holds
+        # the K/V pair. n_blocks == 2 is genuinely ambiguous; prefer K/V-first.
+        if kv_cache.dim() != 5:
+            self._warn_layout(f"unexpected kv_cache rank {tuple(kv_cache.shape)}")
+            return
+        if kv_cache.shape[0] == 2:
+            key_cache = kv_cache[0]
+        elif kv_cache.shape[1] == 2:
+            key_cache = kv_cache[:, 0]
+        else:
+            self._warn_layout(f"unexpected kv_cache shape {tuple(kv_cache.shape)}")
+            return
         bs = key_cache.shape[1]
         for row, q_start, q_end, ctx_len in self.descs:
             n_blk = min(ctx_len // bs, block_table.shape[1])
@@ -149,9 +160,15 @@ class QCFuseImportanceCapturer:
         return self.buffer[row, :ctx_len].tolist()
 
     def _warn_layout(self, why: str) -> None:
-        if not self._warned_layout:
-            self._warned_layout = True
-            logger.warning("QCFuse probe disabled for this model: %s", why)
+        # Do NOT degrade quietly. With no importance the policy returns no gaps,
+        # so the arm silently becomes plain `spans` while still labelling itself
+        # QCFuse -- it would publish a real-looking number for a method that
+        # never ran. A hard failure is recoverable; a fake arm is not.
+        raise RuntimeError(
+            f"QCFuse probe cannot read this model's KV cache: {why}. "
+            "Refusing to run: without the probe this arm silently degrades to "
+            "plain spans with zero recompute."
+        )
 
 
 _CAPTURER: QCFuseImportanceCapturer | None = None
