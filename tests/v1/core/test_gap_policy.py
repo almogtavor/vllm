@@ -5,12 +5,14 @@ import pytest
 
 import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.gap_policy import (
     GapPolicyFactory,
     NoGapPolicy,
     QCFusePolicy,
     SpanAwareGapPolicy,
 )
+from vllm.v1.core.sched.qcfuse_store import QCFuseImportanceStore
 from vllm.v1.request import Request
 
 pytestmark = pytest.mark.spans
@@ -190,3 +192,68 @@ class TestQCFusePolicy:
     def test_empty_critical_layers_rejected(self):
         with pytest.raises(ValueError):
             QCFusePolicy(rho=0.1, critical_layers="")
+
+
+class TestQCFuseImportanceStore:
+    """The probe cannot serve the request that produced it: get_gaps runs from
+    the waiting queue before that request's first forward. The store is what
+    carries importance to the next request over the same blocks."""
+
+    def setup_method(self):
+        self._original = envs.VLLM_V1_SPANS_ENABLED
+        envs.VLLM_V1_SPANS_ENABLED = True
+
+    def teardown_method(self):
+        envs.VLLM_V1_SPANS_ENABLED = self._original
+
+    @staticmethod
+    def _hashes(n: int, tag: bytes = b"h") -> list[BlockHash]:
+        return [BlockHash(tag + bytes([i])) for i in range(n)]
+
+    def test_lookup_is_none_before_anything_measured(self):
+        store = QCFuseImportanceStore(block_size=16)
+        assert store.lookup(self._hashes(16), 256) is None
+
+    def test_roundtrip_reproduces_the_measured_vector(self):
+        store = QCFuseImportanceStore(block_size=16)
+        hashes = self._hashes(16)
+        imp = _importance_with_hot_blocks(256, [2, 5, 9, 13])
+        store.store(hashes, imp)
+        assert store.lookup(hashes, 256) == imp
+
+    def test_measured_importance_drives_the_next_requests_gaps(self):
+        store = QCFuseImportanceStore(block_size=16)
+        hashes = self._hashes(16)
+        hot = [2, 5, 9, 13]
+        store.store(hashes, _importance_with_hot_blocks(256, hot))
+
+        policy = QCFusePolicy(rho=0.25, critical_layers="2,5", block_size=16)
+        nxt = make_span_request(256)
+        assert policy.get_gaps(nxt, 256, 0) == []
+        nxt.qcfuse_importance = store.lookup(hashes, 256)
+        assert policy.get_gaps(nxt, 256, 0) == [(b * 16, (b + 1) * 16) for b in hot]
+
+    def test_unmeasured_blocks_score_zero_and_are_never_picked(self):
+        store = QCFuseImportanceStore(block_size=16)
+        known = self._hashes(16)
+        store.store(known[:8], _importance_with_hot_blocks(128, [2, 5]))
+        mixed = known[:8] + self._hashes(8, tag=b"z")
+        out = store.lookup(mixed, 256)
+        assert out is not None and len(out) == 256
+        assert out[128:] == [0.0] * 128
+        policy = QCFusePolicy(rho=0.125, critical_layers="2", block_size=16)
+        req = make_span_request(256)
+        req.qcfuse_importance = out
+        assert policy.get_gaps(req, 256, 0) == [(32, 48), (80, 96)]
+
+    def test_lru_evicts_oldest_blocks(self):
+        store = QCFuseImportanceStore(block_size=16, max_blocks=4)
+        store.store(self._hashes(8), [1.0] * 128)
+        assert len(store._by_hash) == 4
+
+    def test_later_measurement_overwrites(self):
+        store = QCFuseImportanceStore(block_size=16)
+        hashes = self._hashes(2)
+        store.store(hashes, [1.0] * 32)
+        store.store(hashes, [7.0] * 32)
+        assert store.lookup(hashes, 32) == [7.0] * 32

@@ -280,6 +280,11 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # QCFUSE: req_id -> per-context-token query-attention mass measured by the
+    # worker probe on the critical layers. ``None`` unless
+    # VLLM_V1_SPANS_QCFUSE_ENABLE and a prefill-bearing step probed some row.
+    qcfuse_importance: dict[str, list[float]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,
