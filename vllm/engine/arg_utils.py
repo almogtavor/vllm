@@ -2060,14 +2060,23 @@ class EngineArgs:
         )
         # Allow gap policy configuration via env vars when not set via CLI
         gap_policy_name = self.gap_policy_name
-        if gap_policy_name is None and envs.VLLM_V1_SPANS_GAP_POLICY_ENABLE:
+        if gap_policy_name is None and envs.VLLM_V1_SPANS_QCFUSE_ENABLE:
+            gap_policy_name = "qcfuse"
+        elif gap_policy_name is None and envs.VLLM_V1_SPANS_GAP_POLICY_ENABLE:
             gap_policy_name = "span_aware"
 
         gap_policy_config = self.gap_policy_config
         if gap_policy_config is None and gap_policy_name is not None:
-            config: dict[str, Any] = {
-                "gap_length": envs.VLLM_V1_SPANS_GAP_LENGTH,
-            }
+            if gap_policy_name == "qcfuse":
+                config: dict[str, Any] = {
+                    "rho": envs.VLLM_V1_SPANS_QCFUSE_RHO,
+                    "critical_layers": envs.VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS,
+                    "granularity": envs.VLLM_V1_SPANS_QCFUSE_GRANULARITY,
+                }
+            else:
+                config = {
+                    "gap_length": envs.VLLM_V1_SPANS_GAP_LENGTH,
+                }
             if block_size is not None:
                 config["block_size"] = block_size
             gap_policy_config = config
