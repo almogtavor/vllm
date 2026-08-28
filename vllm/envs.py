@@ -275,6 +275,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_QCFUSE_RHO: float = 0.1
     VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
     VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
+    VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1710,8 +1711,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
-    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
-    .lower()
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get(
+        "VLLM_V1_SPANS_CUDAGRAPH", "True"
+    ).lower()
     in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
@@ -1760,6 +1762,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "token" is the fine-grained ablation and is guarded at init.
     "VLLM_V1_SPANS_QCFUSE_GRANULARITY": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_GRANULARITY", "block"
+    ),
+    # Budget-match this arm to legolink-K: K tokens per span, so both methods
+    # recompute the same total and the comparison isolates the selection rule.
+    # 0 falls back to the rho ratio.
+    "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces

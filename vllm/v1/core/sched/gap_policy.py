@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
 from vllm.v1.core.sched.output import NewRequestData
@@ -361,6 +362,7 @@ class QCFusePolicy(GapPolicy):
         critical_layers: str | tuple[int, ...] = (),
         block_size: int = 16,
         granularity: str = "block",
+        k_per_span: int = 0,
     ):
         if isinstance(critical_layers, str):
             critical_layers = tuple(
@@ -382,14 +384,31 @@ class QCFusePolicy(GapPolicy):
             raise ValueError(
                 f"QCFusePolicy granularity must be block|token, got {granularity}"
             )
+        if k_per_span < 0:
+            raise ValueError(f"QCFusePolicy k_per_span must be >= 0, got {k_per_span}")
+        # The premise of selecting purely by attention mass is that the span
+        # boundary carries no special positional error: prerotate remaps K from
+        # span-local to request positions (QCFuse's Pi), leaving only contextual
+        # staleness, which is spread across the span rather than concentrated at
+        # its head. Without prerotate that premise is false and this arm would be
+        # measuring something else, so refuse to run rather than mislead.
+        if not envs.VLLM_V1_SPANS_PREROTATE:
+            raise ValueError(
+                "QCFusePolicy requires VLLM_V1_SPANS_PREROTATE=True: without the "
+                "K position remap the span boundary carries a positional error "
+                "that attention-mass selection does not address."
+            )
         self.rho = rho
         self.critical_layers = critical_layers
         self.block_size = block_size
         self.granularity = granularity
+        self.k_per_span = k_per_span
 
         logger.info(
-            "QCFusePolicy initialized: rho=%.3f critical_layers=%s granularity=%s",
+            "QCFusePolicy initialized: rho=%.3f k_per_span=%d critical_layers=%s "
+            "granularity=%s",
             rho,
+            k_per_span,
             list(critical_layers),
             granularity,
         )
@@ -408,7 +427,16 @@ class QCFusePolicy(GapPolicy):
             # Probe has not run yet; schedule normally and select next step.
             return []
 
-        budget = int(self.rho * num_computed_tokens)
+        # k_per_span budget-matches this arm to legolink-K: legolink recomputes K
+        # tokens at each span head, so the same total is K * (number of spans).
+        # Matching the BUDGET is what makes the comparison a test of the
+        # selection rule (positional vs query-relevant) rather than of compute.
+        if self.k_per_span > 0:
+            spans = request.span_starts or []
+            n_spans = sum(1 for s in spans if s < num_computed_tokens) or 1
+            budget = min(self.k_per_span * n_spans, num_computed_tokens)
+        else:
+            budget = int(self.rho * num_computed_tokens)
         if budget <= 0:
             return []
 
