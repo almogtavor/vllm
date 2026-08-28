@@ -112,6 +112,10 @@ class Request:
         self.pic_token_ranges: list[tuple[int, int | None]] = []
         self.prefix_hit_sources: list[PrefixHitSource] | None = None
         self.pending_span_gaps: list[tuple[int, int]] = []
+        # QCFUSE: per-context-token query-attention importance consumed by
+        # QCFusePolicy. Supplied via extra_args (override / test path) or
+        # written by the worker-side probe through the scheduler.
+        self.qcfuse_importance: list[float] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -131,6 +135,9 @@ class Request:
                     self.span_starts = sampling_params.extra_args.get("span_starts")
                     self.cross_span_starts = sampling_params.extra_args.get(
                         "cross_span_starts"
+                    )
+                    self.qcfuse_importance = sampling_params.extra_args.get(
+                        "qcfuse_importance"
                     )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
