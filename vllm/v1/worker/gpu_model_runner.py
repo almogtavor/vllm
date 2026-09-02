@@ -147,6 +147,7 @@ from vllm.v1.attention.qcfuse import (
     parse_critical_layers,
 )
 from vllm.v1.attention.qcfuse import bind_capturer as qcfuse_bind_capturer
+from vllm.v1.attention.qcfuse import probe_enabled as qcfuse_probe_enabled
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -853,7 +854,7 @@ class GPUModelRunner(
         # attention op) only under the knob, so the off path costs nothing.
         self.qcfuse_capturer: QCFuseImportanceCapturer | None = None
         self._qcfuse_descs: list[tuple[int, int, int, int]] = []
-        if envs.VLLM_V1_SPANS_QCFUSE_ENABLE and parse_critical_layers():
+        if qcfuse_probe_enabled() and parse_critical_layers():
             self.qcfuse_capturer = QCFuseImportanceCapturer(
                 self.max_num_reqs,
                 self.max_model_len,

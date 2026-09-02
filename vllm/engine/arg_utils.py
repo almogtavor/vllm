@@ -2060,20 +2060,30 @@ class EngineArgs:
         )
         # Allow gap policy configuration via env vars when not set via CLI
         gap_policy_name = self.gap_policy_name
-        if gap_policy_name is None and envs.VLLM_V1_SPANS_QCFUSE_ENABLE:
+        if gap_policy_name is None and envs.VLLM_V1_SPANS_MASS_CLOSURE_ENABLE:
+            gap_policy_name = "mass_closure"
+        elif gap_policy_name is None and envs.VLLM_V1_SPANS_QCFUSE_ENABLE:
             gap_policy_name = "qcfuse"
         elif gap_policy_name is None and envs.VLLM_V1_SPANS_GAP_POLICY_ENABLE:
             gap_policy_name = "span_aware"
 
         gap_policy_config = self.gap_policy_config
         if gap_policy_config is None and gap_policy_name is not None:
-            if gap_policy_name == "qcfuse":
+            if gap_policy_name in ("qcfuse", "mass_closure"):
                 config: dict[str, Any] = {
                     "rho": envs.VLLM_V1_SPANS_QCFUSE_RHO,
                     "critical_layers": envs.VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS,
                     "granularity": envs.VLLM_V1_SPANS_QCFUSE_GRANULARITY,
                     "k_per_span": envs.VLLM_V1_SPANS_QCFUSE_K_PER_SPAN,
                 }
+                if gap_policy_name == "mass_closure":
+                    config.update(
+                        c=envs.VLLM_V1_SPANS_MASS_C,
+                        alpha=envs.VLLM_V1_SPANS_MASS_ALPHA,
+                        beta=envs.VLLM_V1_SPANS_MASS_BETA,
+                        sink=envs.VLLM_V1_SPANS_MASS_SINK,
+                        anchor_blocks=envs.VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS,
+                    )
             else:
                 config = {
                     "gap_length": envs.VLLM_V1_SPANS_GAP_LENGTH,

@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.qcfuse import get_capturer as get_qcfuse_capturer
 from vllm.v1.attention.qcfuse import parse_critical_layers
+from vllm.v1.attention.qcfuse import probe_enabled as qcfuse_probe_enabled
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -402,7 +403,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
         self.qcfuse_layer_idx = extract_layer_index(prefix)
         self.qcfuse_capture = (
-            envs.VLLM_V1_SPANS_QCFUSE_ENABLE
+            qcfuse_probe_enabled()
             and self.qcfuse_layer_idx in parse_critical_layers()
         )
 

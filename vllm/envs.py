@@ -276,6 +276,12 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
     VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
     VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
+    VLLM_V1_SPANS_MASS_CLOSURE_ENABLE: bool = False
+    VLLM_V1_SPANS_MASS_C: float = 0.1
+    VLLM_V1_SPANS_MASS_ALPHA: float = 0.33
+    VLLM_V1_SPANS_MASS_BETA: float = 1.6
+    VLLM_V1_SPANS_MASS_SINK: float = 0.08
+    VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS: int = 1
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1768,6 +1774,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 falls back to the rho ratio.
     "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
         os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
+    ),
+    # PIC mass-closure selection. Same importance probe and same per-span
+    # budget as QCFuse; the difference is the ranking, which weighs a block's
+    # attention by how stale it is and by how much of what it re-reads has
+    # already been repaired.
+    "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE", "False"
+    )
+    == "True",
+    # Attention mass a span block spends on the conversation prefix, which is
+    # correct without being repaired. Insensitive between 0.02 and 0.1; at 0.3
+    # and above the closure term washes out and the ranking degenerates to
+    # plain attention.
+    "VLLM_V1_SPANS_MASS_C": lambda: float(os.environ.get("VLLM_V1_SPANS_MASS_C", "0.1")),
+    # Staleness profile exponent: rho(b) = (1+b)^-alpha over the block's index
+    # within its span. Fitted to measured warm-vs-true KV error, which drops
+    # sharply after the span's first block and then decays slowly.
+    "VLLM_V1_SPANS_MASS_ALPHA": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_MASS_ALPHA", "0.33")
+    ),
+    # Closure kernel exponent: w(d) = d^-beta for a predecessor d blocks back.
+    "VLLM_V1_SPANS_MASS_BETA": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_MASS_BETA", "1.6")
+    ),
+    # Extra closure weight every block spends on its span's first block.
+    "VLLM_V1_SPANS_MASS_SINK": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_MASS_SINK", "0.08")
+    ),
+    # Contiguous blocks seeded at each span head before greedy selection, so
+    # this arm contains legolink-16 by construction. 0 disables the seed.
+    "VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS", "1")
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces

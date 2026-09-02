@@ -480,6 +480,228 @@ class QCFusePolicy(GapPolicy):
         return gaps
 
 
+class MassClosurePolicy(QCFusePolicy):
+    """PIC: pick span blocks by attention x staleness x closure.
+
+    QCFuse ranks blocks by attention mass alone. That is the right first term
+    and the wrong whole answer, because a repaired block re-reads everything
+    before it: recomputing block b with its in-span predecessors still warm
+    rewrites b from a context that is itself wrong. Legolink never has this
+    problem (a prefix is closed by construction) which is exactly why it beats
+    attention ranking at small budgets, and why it stops improving once its
+    head is repaired.
+
+    The value of repairing block ``b`` given the already-chosen set ``R`` is
+
+        gain(b | R) = a(b) * rho(b) * r(b | R)
+
+    ``a(b)``   attention mass the following query puts on block b -- the same
+               QCFuse importance signal, summed over the block.
+    ``rho(b)`` how wrong the warmed block is. Prefix-free warm-up denies a
+               block its conversation prefix, and the damage falls off with
+               the in-span context it does have, so rho(b) = (1+b)^-alpha with
+               b the block's index *within its span*. Only the ranking
+               matters, so the profile's scale drops out.
+    ``r(b|R)`` closure: the fraction of what b re-reads that is already
+               correct,
+
+                   r(b | R) = (c + sum_{j in R, j < b} w(b, j))
+                              / (c + sum_{j < b} w(b, j))
+
+               weighted by where b's attention actually goes. ``c`` is the
+               mass landing on the conversation prefix, which is correct for
+               free. A token-count closure ((P + B|R|)/(P + Bb)) does NOT
+               work: at P=8192 it never drops below 0.8, so it is effectively
+               constant and the ranking collapses back onto plain attention.
+
+    ``w(b, j) = (b - j)^-beta (+ sink at j = 0)`` is a decay kernel standing in
+    for the measured intra-span block-to-block attention. The measured matrix
+    needs the span's own queries, which exist only during its warm-up forward
+    and are gone by the time a later request reuses it; the kernel reproduces
+    its ranking without any worker-side probe, so this policy is entirely
+    scheduler-side.
+
+    Selection is greedy: take the argmax, add it to R, re-score. Adding a block
+    raises the closure of everything after it, which is what makes the method
+    build correct runs instead of scattering.
+
+    Budget is per span and matched to legolink-K, so a comparison against
+    legolink at the same K is a test of the selection rule, not of compute.
+    """
+
+    def __init__(
+        self,
+        *args,
+        c: float = 0.1,
+        alpha: float = 0.33,
+        beta: float = 1.6,
+        sink: float = 0.08,
+        anchor_blocks: int = 1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if c <= 0.0:
+            raise ValueError(f"MassClosurePolicy c must be > 0, got {c}")
+        if beta <= 0.0:
+            raise ValueError(f"MassClosurePolicy beta must be > 0, got {beta}")
+        if alpha < 0.0:
+            raise ValueError(f"MassClosurePolicy alpha must be >= 0, got {alpha}")
+        if sink < 0.0:
+            raise ValueError(f"MassClosurePolicy sink must be >= 0, got {sink}")
+        if anchor_blocks < 0:
+            raise ValueError(
+                f"MassClosurePolicy anchor_blocks must be >= 0, got {anchor_blocks}"
+            )
+        if self.k_per_span <= 0:
+            # rho is a whole-context ratio; this policy selects inside spans,
+            # so without a per-span budget it has nothing to spend.
+            raise ValueError(
+                "MassClosurePolicy requires k_per_span > 0 "
+                "(set VLLM_V1_SPANS_QCFUSE_K_PER_SPAN)."
+            )
+        self.c = c
+        self.alpha = alpha
+        self.beta = beta
+        self.sink = sink
+        self.anchor_blocks = anchor_blocks
+        logger.info(
+            "MassClosurePolicy initialized: k_per_span=%d c=%.3f alpha=%.2f "
+            "beta=%.2f sink=%.3f anchor_blocks=%d",
+            self.k_per_span,
+            c,
+            alpha,
+            beta,
+            sink,
+            anchor_blocks,
+        )
+
+    def _closure_weights(self, n: int) -> tuple[list[float], list[float]]:
+        """Decay kernel by distance, and the row totals it implies.
+
+        ``w[d]`` is the weight a block puts on the predecessor ``d`` blocks
+        back, so row ``b``'s total is ``sum(w[1..b])`` plus the sink that every
+        row spends on the span's first block.
+        """
+        w = [0.0] + [d ** -self.beta for d in range(1, n)]
+        rowtot = [0.0] * n
+        acc = 0.0
+        for b in range(1, n):
+            acc += w[b]
+            rowtot[b] = acc + self.sink
+        return w, rowtot
+
+    def _select_blocks(self, attn: list[float], budget_blocks: int) -> list[int]:
+        """Greedy gain(b|R) over one span's blocks; returns local indices."""
+        n = len(attn)
+        k = min(budget_blocks, n)
+        if k <= 0:
+            return []
+        w, rowtot = self._closure_weights(n)
+        val = [attn[b] * (1.0 + b) ** -self.alpha for b in range(n)]
+
+        # Seed with a short contiguous head. Legolink's benefit saturates
+        # around 16 tokens, so one block is nearly free and makes this arm
+        # contain legolink-16 by construction rather than by luck.
+        chosen = set(range(min(self.anchor_blocks, k, n)))
+        got = [0.0] * n
+        for j in chosen:
+            for b in range(j + 1, n):
+                got[b] += w[b - j] + (self.sink if j == 0 else 0.0)
+
+        while len(chosen) < k:
+            best, best_val = -1, -1.0
+            for b in range(n):
+                if b in chosen:
+                    continue
+                v = val[b] * (self.c + got[b]) / (self.c + rowtot[b])
+                if v > best_val:
+                    best, best_val = b, v
+            if best < 0:
+                break
+            chosen.add(best)
+            for b in range(best + 1, n):
+                got[b] += w[b - best] + (self.sink if best == 0 else 0.0)
+        return sorted(chosen)
+
+    def get_gaps(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> list[tuple[int, int]]:
+        if num_computed_tokens == 0:
+            return []
+
+        importance = getattr(request, "qcfuse_importance", None)
+        if importance is None:
+            # Probe has not run yet; schedule normally and select next step.
+            return []
+
+        span_starts = sorted(
+            s for s in (request.span_starts or []) if s < num_computed_tokens
+        )
+        if not span_starts:
+            return []
+
+        bs = self.block_size
+        budget_blocks = self.k_per_span // bs
+        if budget_blocks <= 0:
+            return []
+
+        selected: list[int] = []
+        for idx, start in enumerate(span_starts):
+            end = (
+                span_starts[idx + 1]
+                if idx + 1 < len(span_starts)
+                else num_computed_tokens
+            )
+            blk0 = start // bs
+            n_blk = min(end // bs, len(importance) // bs) - blk0
+            if n_blk <= 0:
+                continue
+            attn = [
+                sum(importance[(blk0 + b) * bs : (blk0 + b + 1) * bs])
+                for b in range(n_blk)
+            ]
+            selected.extend(
+                blk0 + b for b in self._select_blocks(attn, budget_blocks)
+            )
+
+        if not selected:
+            return []
+
+        # Coalesce runs so the scheduler sees as few gap requests as possible;
+        # a run of adjacent blocks is one interval, not one interval per block.
+        gaps: list[tuple[int, int]] = []
+        for blk in sorted(set(selected)):
+            if gaps and gaps[-1][1] == blk * bs:
+                gaps[-1] = (gaps[-1][0], (blk + 1) * bs)
+            else:
+                gaps.append((blk * bs, (blk + 1) * bs))
+
+        # SPANS: same recompute-once-per-unique-prefix dedup as the others.
+        sources = request.prefix_hit_sources
+        if sources is not None:
+            kept = []
+            for s, e in gaps:
+                blocks = range(s // bs, min(e // bs, len(sources)))
+                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
+                    continue
+                kept.append((s, e))
+            gaps = kept
+
+        logger.info(
+            "MassClosure selected %d gaps (%d blocks over %d spans, %d tok/span) "
+            "for request %s",
+            len(gaps),
+            len(set(selected)),
+            len(span_starts),
+            self.k_per_span,
+            request.request_id,
+        )
+        return gaps
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
@@ -487,6 +709,7 @@ class GapPolicyFactory:
         "none": NoGapPolicy,
         "span_aware": SpanAwareGapPolicy,
         "qcfuse": QCFusePolicy,
+        "mass_closure": MassClosurePolicy,
     }
 
     @classmethod
