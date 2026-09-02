@@ -28,6 +28,17 @@ def parse_critical_layers() -> tuple[int, ...]:
     return tuple(int(x) for x in raw.split(",") if x.strip())
 
 
+def probe_enabled() -> bool:
+    """Whether any policy needs the importance signal this probe produces.
+
+    Neighbor-aware ranks the same importance vector differently, so it needs the
+    probe just as much as QCFuse does. Gating on the QCFuse knob alone would
+    leave it with no signal, hence no gaps, hence a silently-inert arm that
+    still reports itself as a repair method.
+    """
+    return envs.VLLM_V1_SPANS_QCFUSE_ENABLE or envs.VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE
+
+
 class QCFuseImportanceCapturer:
     """Per-worker importance buffer, filled once per critical layer.
 
