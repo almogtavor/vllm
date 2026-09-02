@@ -1781,15 +1781,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # budget as QCFuse; the difference is the ranking, which weighs a block's
     # attention by how stale it is and by how much of what it re-reads has
     # already been repaired.
-    "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE": lambda: os.environ.get(
-        "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE", "False"
-    )
-    == "True",
+    "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE": lambda: (
+        os.environ.get("VLLM_V1_SPANS_MASS_CLOSURE_ENABLE", "False") == "True"
+    ),
     # Attention mass a span block spends on the conversation prefix, which is
     # correct without being repaired. Insensitive between 0.02 and 0.1; at 0.3
     # and above the closure term washes out and the ranking degenerates to
     # plain attention.
-    "VLLM_V1_SPANS_MASS_C": lambda: float(os.environ.get("VLLM_V1_SPANS_MASS_C", "0.1")),
+    "VLLM_V1_SPANS_MASS_C": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_MASS_C", "0.1")
+    ),
     # Staleness profile exponent: rho(b) = (1+b)^-alpha over the block's index
     # within its span. Fitted to measured warm-vs-true KV error, which drops
     # sharply after the span's first block and then decays slowly.

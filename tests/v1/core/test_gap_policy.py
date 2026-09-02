@@ -276,9 +276,7 @@ class TestMassClosurePolicy:
 
     @staticmethod
     def _policy(**kw) -> MassClosurePolicy:
-        cfg = dict(
-            rho=0.1, critical_layers="2,5", block_size=16, k_per_span=64
-        )
+        cfg = dict(rho=0.1, critical_layers="2,5", block_size=16, k_per_span=64)
         cfg.update(kw)
         return MassClosurePolicy(**cfg)
 
@@ -364,7 +362,9 @@ class TestMassClosurePolicy:
         hot = [3, 11, 20, 29]
         policy = self._policy(c=1000.0, anchor_blocks=0)
         req = make_span_request(
-            512, span_starts=[0], qcfuse_importance=_importance_with_hot_blocks(512, hot)
+            512,
+            span_starts=[0],
+            qcfuse_importance=_importance_with_hot_blocks(512, hot),
         )
         assert self._blocks(policy.get_gaps(req, 512, 0)) == hot
 
@@ -380,9 +380,7 @@ class TestMassClosurePolicy:
 
     def test_adjacent_blocks_coalesce_into_one_gap(self):
         policy = self._policy(anchor_blocks=4, k_per_span=64)
-        req = make_span_request(
-            512, span_starts=[0], qcfuse_importance=[1.0] * 512
-        )
+        req = make_span_request(512, span_starts=[0], qcfuse_importance=[1.0] * 512)
         gaps = policy.get_gaps(req, 512, 0)
         assert gaps[0] == (0, 64) and len(gaps) == 1
 
@@ -394,11 +392,13 @@ class TestMassClosurePolicy:
         for t in range(20 * 16, 21 * 16):
             imp[t] = 50.0
         policy = self._policy(anchor_blocks=0, k_per_span=32)
-        picked = self._blocks(policy.get_gaps(
-            make_span_request(512, span_starts=[0], qcfuse_importance=imp),
-            512,
-            0,
-        ))
+        picked = self._blocks(
+            policy.get_gaps(
+                make_span_request(512, span_starts=[0], qcfuse_importance=imp),
+                512,
+                0,
+            )
+        )
         assert picked[0] == 0
 
     def test_closure_kernel_matches_the_measured_shape(self):
