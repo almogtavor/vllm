@@ -386,6 +386,37 @@ class TestMassClosurePolicy:
         gaps = policy.get_gaps(req, 512, 0)
         assert gaps[0] == (0, 64) and len(gaps) == 1
 
+    def test_span_head_always_has_full_closure(self):
+        # Block 0 has no in-span predecessors, so its closure is 1 whatever the
+        # kernel says. Greedy therefore opens on it unless something else is
+        # overwhelmingly hot, which is what makes the anchor nearly free.
+        imp = [1.0] * 512
+        for t in range(20 * 16, 21 * 16):
+            imp[t] = 50.0
+        policy = self._policy(anchor_blocks=0, k_per_span=32)
+        picked = self._blocks(policy.get_gaps(
+            make_span_request(512, span_starts=[0], qcfuse_importance=imp),
+            512,
+            0,
+        ))
+        assert picked[0] == 0
+
+    def test_closure_kernel_matches_the_measured_shape(self):
+        # amp*d^-beta + floor: fast decay onto a floor, not a bare power law,
+        # plus a sink every row spends on the span head. Pinned because the
+        # sink is the constant the method depends on -- an order of magnitude
+        # too small and this degenerates to plain attention ranking.
+        policy = self._policy()
+        w, rowtot = policy._closure_weights(64)
+        assert w[0] == 0.0
+        assert w[1] > w[2] > w[8] > w[32] > policy.floor
+        # flat tail: the last third of a span contributes near-equally
+        assert w[32] / w[63] < 1.2
+        # every row total carries the sink, and the sink dominates a short row
+        assert rowtot[0] == 0.0
+        assert rowtot[1] == pytest.approx(w[1] + policy.sink)
+        assert policy.sink / rowtot[1] > 0.85
+
     def test_factory_creates_mass_closure(self):
         policy = GapPolicyFactory.create_policy(
             "mass_closure",

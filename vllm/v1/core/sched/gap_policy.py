@@ -514,12 +514,22 @@ class MassClosurePolicy(QCFusePolicy):
                work: at P=8192 it never drops below 0.8, so it is effectively
                constant and the ranking collapses back onto plain attention.
 
-    ``w(b, j) = (b - j)^-beta (+ sink at j = 0)`` is a decay kernel standing in
-    for the measured intra-span block-to-block attention. The measured matrix
-    needs the span's own queries, which exist only during its warm-up forward
-    and are gone by the time a later request reuses it; the kernel reproduces
-    its ranking without any worker-side probe, so this policy is entirely
-    scheduler-side.
+    ``w(b, j) = amp * (b - j)^-beta + floor``, plus ``sink`` at ``j = 0``, is a
+    decay kernel standing in for the measured intra-span block-to-block
+    attention. The measured matrix needs the span's own queries, which exist
+    only during its warm-up forward and are gone by the time a later request
+    reuses it; the kernel reproduces its ranking without any worker-side probe,
+    so this policy is entirely scheduler-side.
+
+    The kernel's constants are measured, not guessed. On Qwen3-32B the span's
+    first block is a large attention sink -- 0.55 of the intra-span mass, an
+    order of magnitude more than the block one step back -- and the decay
+    flattens onto a floor by about 15 blocks rather than continuing as a power
+    law. Getting the sink wrong is what separates this from plain attention
+    ranking: at sink=0.08 the arm scores 1.34x the measured matrix's KL
+    (14/80 windows, p<0.001), at the measured 0.554 it ties it (0.99x,
+    p=0.11). ``beta`` in contrast does nothing once the sink is right (1.0,
+    1.25 and 1.5 give identical selections).
 
     Selection is greedy: take the argmax, add it to R, re-score. Adding a block
     raises the closure of everything after it, which is what makes the method
@@ -534,8 +544,10 @@ class MassClosurePolicy(QCFusePolicy):
         *args,
         c: float = 0.1,
         alpha: float = 0.33,
-        beta: float = 1.6,
-        sink: float = 0.08,
+        beta: float = 1.25,
+        amp: float = 0.06,
+        floor: float = 0.0085,
+        sink: float = 0.554,
         anchor_blocks: int = 1,
         **kwargs,
     ):
@@ -546,6 +558,10 @@ class MassClosurePolicy(QCFusePolicy):
             raise ValueError(f"MassClosurePolicy beta must be > 0, got {beta}")
         if alpha < 0.0:
             raise ValueError(f"MassClosurePolicy alpha must be >= 0, got {alpha}")
+        if amp <= 0.0:
+            raise ValueError(f"MassClosurePolicy amp must be > 0, got {amp}")
+        if floor < 0.0:
+            raise ValueError(f"MassClosurePolicy floor must be >= 0, got {floor}")
         if sink < 0.0:
             raise ValueError(f"MassClosurePolicy sink must be >= 0, got {sink}")
         if anchor_blocks < 0:
@@ -562,15 +578,19 @@ class MassClosurePolicy(QCFusePolicy):
         self.c = c
         self.alpha = alpha
         self.beta = beta
+        self.amp = amp
+        self.floor = floor
         self.sink = sink
         self.anchor_blocks = anchor_blocks
         logger.info(
             "MassClosurePolicy initialized: k_per_span=%d c=%.3f alpha=%.2f "
-            "beta=%.2f sink=%.3f anchor_blocks=%d",
+            "beta=%.2f amp=%.4f floor=%.4f sink=%.3f anchor_blocks=%d",
             self.k_per_span,
             c,
             alpha,
             beta,
+            amp,
+            floor,
             sink,
             anchor_blocks,
         )
@@ -580,9 +600,11 @@ class MassClosurePolicy(QCFusePolicy):
 
         ``w[d]`` is the weight a block puts on the predecessor ``d`` blocks
         back, so row ``b``'s total is ``sum(w[1..b])`` plus the sink that every
-        row spends on the span's first block.
+        row spends on the span's first block. The floor matters: without it the
+        far two thirds of a long span contribute nothing to any row total, and
+        the closure term saturates.
         """
-        w = [0.0] + [d ** -self.beta for d in range(1, n)]
+        w = [0.0] + [self.amp * d**-self.beta + self.floor for d in range(1, n)]
         rowtot = [0.0] * n
         acc = 0.0
         for b in range(1, n):

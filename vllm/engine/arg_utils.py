@@ -2081,6 +2081,8 @@ class EngineArgs:
                         c=envs.VLLM_V1_SPANS_MASS_C,
                         alpha=envs.VLLM_V1_SPANS_MASS_ALPHA,
                         beta=envs.VLLM_V1_SPANS_MASS_BETA,
+                        amp=envs.VLLM_V1_SPANS_MASS_AMP,
+                        floor=envs.VLLM_V1_SPANS_MASS_FLOOR,
                         sink=envs.VLLM_V1_SPANS_MASS_SINK,
                         anchor_blocks=envs.VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS,
                     )

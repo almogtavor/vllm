@@ -279,8 +279,10 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_MASS_CLOSURE_ENABLE: bool = False
     VLLM_V1_SPANS_MASS_C: float = 0.1
     VLLM_V1_SPANS_MASS_ALPHA: float = 0.33
-    VLLM_V1_SPANS_MASS_BETA: float = 1.6
-    VLLM_V1_SPANS_MASS_SINK: float = 0.08
+    VLLM_V1_SPANS_MASS_BETA: float = 1.25
+    VLLM_V1_SPANS_MASS_AMP: float = 0.06
+    VLLM_V1_SPANS_MASS_FLOOR: float = 0.0085
+    VLLM_V1_SPANS_MASS_SINK: float = 0.554
     VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS: int = 1
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1794,13 +1796,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_MASS_ALPHA": lambda: float(
         os.environ.get("VLLM_V1_SPANS_MASS_ALPHA", "0.33")
     ),
-    # Closure kernel exponent: w(d) = d^-beta for a predecessor d blocks back.
+    # Closure kernel: w(d) = amp*d^-beta + floor for a predecessor d blocks
+    # back. Fitted to the measured intra-span block-to-block attention on
+    # Qwen3-32B, which decays fast for the first ~15 blocks and is flat after.
+    # beta is inert once the sink is right; the floor is not.
     "VLLM_V1_SPANS_MASS_BETA": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_BETA", "1.6")
+        os.environ.get("VLLM_V1_SPANS_MASS_BETA", "1.25")
     ),
-    # Extra closure weight every block spends on its span's first block.
+    "VLLM_V1_SPANS_MASS_AMP": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_MASS_AMP", "0.06")
+    ),
+    "VLLM_V1_SPANS_MASS_FLOOR": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_MASS_FLOOR", "0.0085")
+    ),
+    # Extra closure weight every block spends on its span's first block. The
+    # span head is a large attention sink -- measured at 0.55 of the intra-span
+    # mass, an order of magnitude above the block one step back -- and this is
+    # the constant the method actually depends on. Set it an order of magnitude
+    # too small and the arm degenerates to plain attention ranking.
     "VLLM_V1_SPANS_MASS_SINK": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_SINK", "0.08")
+        os.environ.get("VLLM_V1_SPANS_MASS_SINK", "0.554")
     ),
     # Contiguous blocks seeded at each span head before greedy selection, so
     # this arm contains legolink-16 by construction. 0 disables the seed.
