@@ -662,9 +662,7 @@ class NeighborAwarePolicy(QCFusePolicy):
                 sum(importance[(blk0 + b) * bs : (blk0 + b + 1) * bs])
                 for b in range(n_blk)
             ]
-            selected.extend(
-                blk0 + b for b in self._select_blocks(attn, budget_blocks)
-            )
+            selected.extend(blk0 + b for b in self._select_blocks(attn, budget_blocks))
 
         if not selected:
             return []
