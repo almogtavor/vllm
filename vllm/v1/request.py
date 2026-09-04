@@ -112,6 +112,8 @@ class Request:
         self.pic_token_ranges: list[tuple[int, int | None]] = []
         self.prefix_hit_sources: list[PrefixHitSource] | None = None
         self.pending_span_gaps: list[tuple[int, int]] = []
+        # gap selection memo (num_computed_tokens, gaps); avoids re-selecting while blocked
+        self.span_gaps_selection: tuple[int, list[tuple[int, int]]] | None = None
         # QCFUSE: per-token importance from the worker probe, read by QCFusePolicy
         self.qcfuse_importance: list[float] | None = None
 
