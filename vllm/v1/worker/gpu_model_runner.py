@@ -2096,6 +2096,7 @@ class GPUModelRunner(
                     ):
                         spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._spans_prerotate_safe = spans_prerotate_safe
             # Scatter the packed build into the STRIDED persistent buffer. The buffer's
             # address never changes, so a captured graph stays valid; only the contents
             # are refreshed. _req_kv_starts_gpu is constant (i*stride) and is not touched.
