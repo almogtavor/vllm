@@ -284,6 +284,43 @@ class TestMassClosurePolicy:
     def _blocks(gaps: list[tuple[int, int]], block_size: int = 16) -> list[int]:
         return [b for s, e in gaps for b in range(s // block_size, e // block_size)]
 
+    def test_selection_stops_at_the_cross_boundary(self):
+        # A span ends where the tool output ends (its cross), not where the
+        # next tool read begins - the conversation in between was never warmed
+        # prefix-free, so repairing it is both wasted and wrong. Importance
+        # peaks outside the span to make the old next-span-start extent visible.
+        importance = [0.0] * 1024
+        for t in range(320, 336):
+            importance[t] = 100.0
+        for t in range(0, 64):
+            importance[t] = 1.0
+        req = make_span_request(
+            1024,
+            span_starts=[0, 512],
+            cross_span_starts=[64, 1024],
+            qcfuse_importance=importance,
+        )
+        gaps = self._policy().get_gaps(req, 1024, 0)
+        picked = set(self._blocks(gaps))
+        assert picked, "the span itself is still repaired"
+        assert picked <= set(range(0, 4)) | set(range(32, 64)), (
+            f"selected blocks outside every span: {sorted(picked)}"
+        )
+        assert 20 not in picked, "block 20 is conversation between two spans"
+
+    def test_short_spans_do_not_inflate_the_budget(self):
+        # Four short reads far apart. Each span is one block, so the whole
+        # selection is four blocks however large k_per_span is; taking the next
+        # span's start as the extent would let each one claim its full budget.
+        req = make_span_request(
+            1024,
+            span_starts=[0, 256, 512, 768],
+            cross_span_starts=[16, 272, 528, 784],
+            qcfuse_importance=[1.0] * 1024,
+        )
+        gaps = self._policy().get_gaps(req, 1024, 0)
+        assert sorted(self._blocks(gaps)) == [0, 16, 32, 48]
+
     def test_no_gaps_before_probe_runs(self):
         policy = self._policy()
         req = make_span_request(512, span_starts=[0])

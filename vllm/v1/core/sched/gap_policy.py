@@ -104,9 +104,18 @@ def schedule_span_gaps(
     if request.pending_span_gaps:
         span_gaps = request.pending_span_gaps
     elif did_prefix_lookup and sched.gap_policy is not None:
-        span_gaps = sched.gap_policy.get_gaps(
-            request, num_computed_tokens, num_external_computed_tokens
-        )
+        # Select once per (request, prefix length). This path re-runs on every
+        # step until the gap work fits, and the worker probe rewrites
+        # qcfuse_importance between steps, so an unmemoized policy hands back a
+        # different block set each time instead of converging.
+        memo = request.span_gaps_selection
+        if memo is not None and memo[0] == num_computed_tokens:
+            span_gaps = list(memo[1])
+        else:
+            span_gaps = sched.gap_policy.get_gaps(
+                request, num_computed_tokens, num_external_computed_tokens
+            )
+            request.span_gaps_selection = (num_computed_tokens, list(span_gaps))
     else:
         span_gaps = []
     if did_prefix_lookup and sched.connector is not None:
@@ -645,6 +654,25 @@ class MassClosurePolicy(QCFusePolicy):
                 got[b] += w[b - best] + (self.sink if best == 0 else 0.0)
         return sorted(chosen)
 
+    @staticmethod
+    def _span_ranges(
+        request: "Request", num_computed_tokens: int
+    ) -> list[tuple[int, int]]:
+        """Computed [start, end) of each span, clipped to the computed prefix."""
+        ranges = getattr(request, "pic_token_ranges", None)
+        if not ranges:
+            starts = sorted(request.span_starts or [])
+            ranges = [
+                (s, starts[i + 1] if i + 1 < len(starts) else None)
+                for i, s in enumerate(starts)
+            ]
+        out = [
+            (s, num_computed_tokens if e is None else min(e, num_computed_tokens))
+            for s, e in ranges
+            if s < num_computed_tokens
+        ]
+        return sorted(r for r in out if r[1] > r[0])
+
     def get_gaps(
         self,
         request: "Request",
@@ -659,10 +687,16 @@ class MassClosurePolicy(QCFusePolicy):
             # Probe has not run yet; schedule normally and select next step.
             return []
 
-        span_starts = sorted(
-            s for s in (request.span_starts or []) if s < num_computed_tokens
-        )
-        if not span_starts:
+        # A span ends at its cross boundary, not at the next span's start:
+        # between two tool reads sits ordinary conversation that was never
+        # warmed prefix-free. pic_token_ranges is the extent the dual pd/pic
+        # lookup itself uses, so selection and lookup agree on what a span is.
+        # Taking the next span's start instead makes the whole intervening
+        # conversation eligible, which is both wrong to repair and unbounded:
+        # legolink survives the same approximation only because it never looks
+        # past gap_length tokens.
+        ranges = self._span_ranges(request, num_computed_tokens)
+        if not ranges:
             return []
 
         bs = self.block_size
@@ -671,12 +705,7 @@ class MassClosurePolicy(QCFusePolicy):
             return []
 
         selected: list[int] = []
-        for idx, start in enumerate(span_starts):
-            end = (
-                span_starts[idx + 1]
-                if idx + 1 < len(span_starts)
-                else num_computed_tokens
-            )
+        for start, end in ranges:
             blk0 = start // bs
             n_blk = min(end // bs, len(importance) // bs) - blk0
             if n_blk <= 0:
@@ -715,7 +744,7 @@ class MassClosurePolicy(QCFusePolicy):
             "for request %s",
             len(gaps),
             len(set(selected)),
-            len(span_starts),
+            len(ranges),
             self.k_per_span,
             request.request_id,
         )

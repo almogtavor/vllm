@@ -1164,6 +1164,10 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        # SPANS: the blocks those gaps addressed were just freed, and resetting
+        # num_computed_tokens sends the request back through prefix lookup.
+        request.pending_span_gaps = []
+        request.span_gaps_selection = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1

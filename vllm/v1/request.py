@@ -112,6 +112,11 @@ class Request:
         self.pic_token_ranges: list[tuple[int, int | None]] = []
         self.prefix_hit_sources: list[PrefixHitSource] | None = None
         self.pending_span_gaps: list[tuple[int, int]] = []
+        # Gap selection memo, as (num_computed_tokens, gaps). A step that
+        # cannot fit the gap work leaves the request at the head of the
+        # waiting queue untouched, so the policy would otherwise re-select
+        # on every step until it fits.
+        self.span_gaps_selection: tuple[int, list[tuple[int, int]]] | None = None
         # QCFUSE: per-context-token query-attention importance consumed by
         # QCFusePolicy. Supplied via extra_args (override / test path) or
         # written by the worker-side probe through the scheduler.
