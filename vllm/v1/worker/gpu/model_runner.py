@@ -492,9 +492,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         eplb_models_added |= self.eplb.maybe_register_model(
             self.model,
             self.model_config,
-            load_dummy_weights,
         )
-        self.eplb.maybe_start_async_loop(eplb_models_added)
+        self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
 
         if not self.is_first_pp_rank:
             # For non-first PP ranks, create intermediate tensors sized
@@ -2174,7 +2173,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         expanded_physical_to_logical: torch.Tensor,
     ) -> None:
         self.eplb.setup_from_mapping(
-            self.model,
             self.model_config,
             expanded_physical_to_logical,
         )
