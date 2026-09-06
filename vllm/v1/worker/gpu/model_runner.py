@@ -232,11 +232,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Persistent buffer for intermediate tensors (non-first PP ranks).
         self.intermediate_tensors: IntermediateTensors | None = None
 
-        # Data parallelism. Read through parallel_config (see the dp_size and
-        # dp_rank properties): elastic EP rewrites it in place on every
-        # reconfigure, and a cached copy would leave this rank sizing its DP
-        # collectives for the old world.
-
         # Dual batch overlap. Created in initialize_kv_cache(), once everything
         # it runs the microbatched forward with exists.
         self.ubatch_runner: UBatchRunner | None = None
@@ -508,6 +503,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         get_offloader().post_init()
 
+    # Not cached: elastic EP rewrites parallel_config in place on reconfigure.
     @property
     def dp_size(self) -> int:
         return self.parallel_config.data_parallel_size

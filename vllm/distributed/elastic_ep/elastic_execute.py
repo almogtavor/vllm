@@ -719,11 +719,8 @@ class ElasticEPScalingExecutor:
         # coordinate_batch_across_dp whenever data_parallel_size > 1
         # (gpu_model_runner.py:3663), which deadlocks if any rank skips it.
 
-        # Save and clear block tables so the dummy MoE forward doesn't
-        # write dummy slot mappings into real KV-cache blocks. MRV2 needs no
-        # such guard: its dummy runs go through prepare_dummy_attn(), which
-        # reads BlockTables.input_block_tables (the per-step gather
-        # destination) and leaves the persistent per-request block ids alone.
+        # Clear block tables so the dummy MoE forward doesn't write dummy slot
+        # mappings into real KV blocks. MRV2 uses a per-step buffer and is safe.
         multi_block_table = None
         saved_block_tables: list[tuple[torch.Tensor, torch.Tensor]] = []
         if not self.worker.use_v2_model_runner:
