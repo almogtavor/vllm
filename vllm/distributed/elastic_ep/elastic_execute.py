@@ -747,7 +747,9 @@ class ElasticEPScalingExecutor:
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
         runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        # The request warmup would claim pool slots and KV blocks that live
+        # requests hold. The _dummy_run above already grew the workspace.
+        self.worker.compile_or_warm_up_model(skip_request_warmup=True)
 
         lock_workspace()
 
