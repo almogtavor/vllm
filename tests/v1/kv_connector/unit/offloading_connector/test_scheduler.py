@@ -931,8 +931,9 @@ def test_on_request_finished_fires_after_final_block_store(
 
     request_finished() keeps req_status alive so _build_store_jobs can retry a
     block on the next step; the retry must be issued before the manager is told
-    the request is over. The first attempt is declined here so that the retry
-    lands in the finishing step, where the ordering matters.
+    the request is over. Every attempt made before the request finishes is
+    declined here, so the store that succeeds is the one from the finishing
+    step and the ordering has something to order.
     """
     block_size = 4
     runner = request_runner(
@@ -946,26 +947,31 @@ def test_on_request_finished_fires_after_final_block_store(
         ("on_request_finished", req_context.req_id)
     )
 
-    attempts = 0
+    runner.new_request(token_ids=[0] * block_size)
+    request = runner.scheduler.requests[str(runner.req_id)]
 
     def prepare_store(keys, req_context):
-        nonlocal attempts
-        attempts += 1
-        calls.append(("prepare_store", req_context.req_id))
-        return generate_store_output(keys) if attempts > 1 else None
+        finished = request.is_finished()
+        calls.append(
+            ("stored_after_finish" if finished else "prepare_store", req_context.req_id)
+        )
+        return generate_store_output(keys) if finished else None
 
     runner.manager.prepare_store.side_effect = prepare_store
 
-    runner.new_request(token_ids=[0] * block_size)
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
 
     req_id = str(runner.req_id)
     assert calls.count(("on_request_finished", req_id)) == 1, calls
+    assert calls.count(("stored_after_finish", req_id)) == 1, calls
 
     finished_idx = calls.index(("on_request_finished", req_id))
-    prepare_indices = [i for i, c in enumerate(calls) if c == ("prepare_store", req_id)]
-    assert prepare_indices, calls
-    assert finished_idx > max(prepare_indices), calls
+    store_indices = [
+        i
+        for i, c in enumerate(calls)
+        if c in (("prepare_store", req_id), ("stored_after_finish", req_id))
+    ]
+    assert finished_idx > max(store_indices), calls
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
