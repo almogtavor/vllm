@@ -208,6 +208,22 @@ class BlockPool:
             cached_blocks.append(block)
         return cached_blocks
 
+    def cache_blocks_under_hashes(
+        self,
+        blocks: Sequence[KVCacheBlock],
+        block_hashes: Sequence[BlockHash],
+        kv_cache_group_id: int,
+    ) -> None:
+        """SPANS: insert already-allocated, hash-less blocks under explicit
+        hashes (no kv-cache events; pd keys are private to spans)."""
+        for blk, block_hash in zip(blocks, block_hashes, strict=True):
+            assert blk.block_hash is None
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, kv_cache_group_id
+            )
+            blk.block_hash = block_hash_with_group_id
+            self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+
     def cache_full_blocks(
         self,
         request: Request,

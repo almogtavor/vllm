@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import PrefixHitSource
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -126,6 +127,19 @@ class SpanAwareGapPolicy(GapPolicy):
             )
             if gap_end > gap_start:
                 gaps.append((gap_start, gap_end))
+
+        # SPANS: drop gaps whose blocks all hit a prefix-aware (pd) copy from an
+        # earlier recompute of this prefix - recompute-once-per-unique-prefix.
+        sources = request.prefix_hit_sources
+        if sources is not None:
+            bs = self.block_size
+            kept = []
+            for s, e in gaps:
+                blocks = range(s // bs, min(e // bs, len(sources)))
+                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
+                    continue
+                kept.append((s, e))
+            gaps = kept
 
         logger.info(
             "Created %d gaps for request %s: %s", len(gaps), request.request_id, gaps

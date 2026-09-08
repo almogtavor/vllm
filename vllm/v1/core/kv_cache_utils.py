@@ -9,6 +9,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
+from enum import IntEnum
 from functools import partial
 from typing import Any, NewType, TypeAlias, cast, overload
 
@@ -92,11 +93,23 @@ logger = init_logger(__name__)
 #
 # The function `init_none_hash` initializes this variable globally.
 NONE_HASH: BlockHash
+
+# SPANS: salted root of the position-dependent (pd) sibling chain, so plain
+# chain hashes can never collide with pd keys.
+PD_NONE_HASH: BlockHash
+_PD_SALT = "vllm-spans-pd-salt"
 _CBOR_HASH_FUNCTIONS = frozenset({sha256_cbor, xxhash_cbor})
 
 
+class PrefixHitSource(IntEnum):
+    """SPANS: which key satisfied a block in the dual pd/pic lookup."""
+
+    PD = 0
+    PIC = 1
+
+
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
-    global NONE_HASH
+    global NONE_HASH, PD_NONE_HASH
 
     hash_seed = os.getenv("PYTHONHASHSEED")
     if hash_seed is None and hash_fn in _CBOR_HASH_FUNCTIONS:
@@ -111,6 +124,7 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
         NONE_HASH = BlockHash(os.urandom(32))
     else:
         NONE_HASH = BlockHash(hash_fn(hash_seed))
+    PD_NONE_HASH = BlockHash(hash_fn((_PD_SALT, NONE_HASH)))
 
 
 @dataclass(slots=True)
@@ -716,7 +730,13 @@ def get_request_block_hasher(
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None
         )
+        # SPANS: sibling pd chain - same tokens, no span resets or cross folds.
+        track_pd = bool(span_starts_set or cross_starts_set)
+        prev_pd_hash_value = (
+            request.pd_block_hashes[-1] if request.pd_block_hashes else PD_NONE_HASH
+        )
         new_block_hashes: list[BlockHash] = []
+        new_pd_block_hashes: list[BlockHash] = []
         while True:
             end_token_idx = start_token_idx + block_size
             if end_token_idx > num_tokens:
@@ -730,6 +750,16 @@ def get_request_block_hasher(
 
             # Compute the hash of the current block
             block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
+
+            if track_pd:
+                pd_block_hash = hash_block_tokens(
+                    caching_hash_fn,
+                    prev_pd_hash_value,
+                    block_tokens,
+                    extra_keys,
+                )
+                new_pd_block_hashes.append(pd_block_hash)
+                prev_pd_hash_value = pd_block_hash
 
             is_cross_span = start_token_idx in cross_starts_set
             extra_keys = recompute_token_handler(
@@ -751,6 +781,7 @@ def get_request_block_hasher(
             start_token_idx += block_size
             prev_block_hash_value = block_hash
 
+        request.pd_block_hashes.extend(new_pd_block_hashes)
         return new_block_hashes
 
     return request_block_hasher
