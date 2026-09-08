@@ -272,18 +272,9 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_GAP_LENGTH: int = 32
     VLLM_V1_SPANS_PREROTATE: bool = True
     VLLM_V1_SPANS_QCFUSE_ENABLE: bool = False
-    VLLM_V1_SPANS_QCFUSE_RHO: float = 0.1
     VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
-    VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
     VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
     VLLM_V1_SPANS_MASS_CLOSURE_ENABLE: bool = False
-    VLLM_V1_SPANS_MASS_C: float = 0.1
-    VLLM_V1_SPANS_MASS_ALPHA: float = 0.33
-    VLLM_V1_SPANS_MASS_BETA: float = 1.25
-    VLLM_V1_SPANS_MASS_AMP: float = 0.06
-    VLLM_V1_SPANS_MASS_FLOOR: float = 0.0085
-    VLLM_V1_SPANS_MASS_SINK: float = 0.554
-    VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS: int = 1
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1755,25 +1746,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"
     )
     == "True",
-    # rho: fraction of cached context tokens to recompute (QCFuse's analog of
-    # legolink's gap length).
-    "VLLM_V1_SPANS_QCFUSE_RHO": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_QCFUSE_RHO", "0.1")
-    ),
     # Comma-separated layer indices used as the importance selection lens.
     # Model-specific and offline-profiled; empty is rejected at init rather
     # than silently degrading to a no-op arm.
     "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", ""
     ),
-    # "block" keeps gaps block-aligned so the PIC/PD swap stays correct;
-    # "token" is the fine-grained ablation and is guarded at init.
-    "VLLM_V1_SPANS_QCFUSE_GRANULARITY": lambda: os.environ.get(
-        "VLLM_V1_SPANS_QCFUSE_GRANULARITY", "block"
-    ),
     # Budget-match this arm to legolink-K: K tokens per span, so both methods
     # recompute the same total and the comparison isolates the selection rule.
-    # 0 falls back to the rho ratio.
     "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
         os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
     ),
@@ -1783,45 +1763,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # already been repaired.
     "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE": lambda: (
         os.environ.get("VLLM_V1_SPANS_MASS_CLOSURE_ENABLE", "False") == "True"
-    ),
-    # Attention mass a span block spends on the conversation prefix, which is
-    # correct without being repaired. Insensitive between 0.02 and 0.1; at 0.3
-    # and above the closure term washes out and the ranking degenerates to
-    # plain attention.
-    "VLLM_V1_SPANS_MASS_C": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_C", "0.1")
-    ),
-    # Staleness profile exponent: rho(b) = (1+b)^-alpha over the block's index
-    # within its span. Fitted to measured warm-vs-true KV error, which drops
-    # sharply after the span's first block and then decays slowly.
-    "VLLM_V1_SPANS_MASS_ALPHA": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_ALPHA", "0.33")
-    ),
-    # Closure kernel: w(d) = amp*d^-beta + floor for a predecessor d blocks
-    # back. Fitted to the measured intra-span block-to-block attention on
-    # Qwen3-32B, which decays fast for the first ~15 blocks and is flat after.
-    # beta is inert once the sink is right; the floor is not.
-    "VLLM_V1_SPANS_MASS_BETA": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_BETA", "1.25")
-    ),
-    "VLLM_V1_SPANS_MASS_AMP": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_AMP", "0.06")
-    ),
-    "VLLM_V1_SPANS_MASS_FLOOR": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_FLOOR", "0.0085")
-    ),
-    # Extra closure weight every block spends on its span's first block. The
-    # span head is a large attention sink -- measured at 0.55 of the intra-span
-    # mass, an order of magnitude above the block one step back -- and this is
-    # the constant the method actually depends on. Set it an order of magnitude
-    # too small and the arm degenerates to plain attention ranking.
-    "VLLM_V1_SPANS_MASS_SINK": lambda: float(
-        os.environ.get("VLLM_V1_SPANS_MASS_SINK", "0.554")
-    ),
-    # Contiguous blocks seeded at each span head before greedy selection, so
-    # this arm contains legolink-16 by construction. 0 disables the seed.
-    "VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS": lambda: int(
-        os.environ.get("VLLM_V1_SPANS_MASS_ANCHOR_BLOCKS", "1")
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces

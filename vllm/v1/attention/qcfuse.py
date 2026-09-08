@@ -86,7 +86,6 @@ class QCFuseImportanceCapturer:
         )
         self.block_table: torch.Tensor | None = None
         self.descs: list[tuple[int, int, int, int]] = []
-        self._warned_layout = False
         logger.info(
             "QCFuseImportanceCapturer: buffer %.1f MB (reqs=%d, len=%d), "
             "critical_layers=%s",

@@ -118,8 +118,7 @@ class Request:
         # on every step until it fits.
         self.span_gaps_selection: tuple[int, list[tuple[int, int]]] | None = None
         # QCFUSE: per-context-token query-attention importance consumed by
-        # QCFusePolicy. Supplied via extra_args (override / test path) or
-        # written by the worker-side probe through the scheduler.
+        # QCFusePolicy, written by the worker-side probe through the scheduler.
         self.qcfuse_importance: list[float] | None = None
 
         if pooling_params is not None:
@@ -140,9 +139,6 @@ class Request:
                     self.span_starts = sampling_params.extra_args.get("span_starts")
                     self.cross_span_starts = sampling_params.extra_args.get(
                         "cross_span_starts"
-                    )
-                    self.qcfuse_importance = sampling_params.extra_args.get(
-                        "qcfuse_importance"
                     )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")

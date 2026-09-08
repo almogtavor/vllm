@@ -346,31 +346,22 @@ class SpanAwareGapPolicy(GapPolicy):
 
 
 class QCFusePolicy(GapPolicy):
-    """QCFuse: recompute a query-selected subset of tokens across ALL layers.
+    """Recompute a query-selected subset of tokens across ALL layers.
 
-    Unlike SpanAwareGapPolicy, which recomputes a fixed-length head at each span
-    boundary, QCFuse recomputes ``floor(rho * N)`` of the cached tokens chosen by
-    query-to-context attention mass. The critical layers are only the cheap
-    selection lens that produces that importance signal -- they are not
-    themselves what gets recomputed.
-
-    The importance vector is produced worker-side and handed back through
-    ``request.qcfuse_importance``. Until it arrives this returns no gaps, so the
-    request is scheduled normally and the probe runs first.
-
-    Selection is block-granular by default: ``_span_swap_indices`` and the PD
-    dedup filter both truncate via ``end // block_size``, so a sub-block gap
-    would skip the PIC->PD swap and clobber a shared warmed block. Block
-    granularity preserves the rho budget exactly (in block quanta) while keeping
-    the existing gap plumbing correct and the gap count far below max_num_seqs.
+    Unlike SpanAwareGapPolicy's fixed-length span heads, QCFuse recomputes
+    ``k_per_span`` tokens per span chosen by query-to-context attention mass;
+    the critical layers are only the cheap selection lens. The importance
+    vector is produced worker-side and handed back through
+    ``request.qcfuse_importance``; until it arrives this returns no gaps.
+    Selection is block-granular because ``_span_swap_indices`` and the PD
+    dedup filter truncate via ``end // block_size``, so a sub-block gap would
+    clobber a shared warmed block.
     """
 
     def __init__(
         self,
-        rho: float = 0.1,
         critical_layers: str | tuple[int, ...] = (),
         block_size: int = 16,
-        granularity: str = "block",
         k_per_span: int = 0,
     ):
         if isinstance(critical_layers, str):
@@ -387,14 +378,13 @@ class QCFusePolicy(GapPolicy):
                 "QCFusePolicy requires critical_layers (offline-profiled per "
                 "model); set VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS."
             )
-        if not 0.0 < rho <= 1.0:
-            raise ValueError(f"QCFusePolicy rho must be in (0, 1], got {rho}")
-        if granularity not in ("block", "token"):
+        if k_per_span <= 0:
+            # The budget is per span, matched to legolink-K; without it the
+            # policy has nothing to spend.
             raise ValueError(
-                f"QCFusePolicy granularity must be block|token, got {granularity}"
+                "QCFusePolicy requires k_per_span > 0 "
+                "(set VLLM_V1_SPANS_QCFUSE_K_PER_SPAN)."
             )
-        if k_per_span < 0:
-            raise ValueError(f"QCFusePolicy k_per_span must be >= 0, got {k_per_span}")
         # The premise of selecting purely by attention mass is that the span
         # boundary carries no special positional error: prerotate remaps K from
         # span-local to request positions (QCFuse's Pi), leaving only contextual
@@ -407,19 +397,14 @@ class QCFusePolicy(GapPolicy):
                 "K position remap the span boundary carries a positional error "
                 "that attention-mass selection does not address."
             )
-        self.rho = rho
         self.critical_layers = critical_layers
         self.block_size = block_size
-        self.granularity = granularity
         self.k_per_span = k_per_span
 
         logger.info(
-            "QCFusePolicy initialized: rho=%.3f k_per_span=%d critical_layers=%s "
-            "granularity=%s",
-            rho,
+            "QCFusePolicy initialized: k_per_span=%d critical_layers=%s",
             k_per_span,
             list(critical_layers),
-            granularity,
         )
 
     def get_gaps(
@@ -440,33 +425,22 @@ class QCFusePolicy(GapPolicy):
         # tokens at each span head, so the same total is K * (number of spans).
         # Matching the BUDGET is what makes the comparison a test of the
         # selection rule (positional vs query-relevant) rather than of compute.
-        if self.k_per_span > 0:
-            spans = request.span_starts or []
-            n_spans = sum(1 for s in spans if s < num_computed_tokens) or 1
-            budget = min(self.k_per_span * n_spans, num_computed_tokens)
-        else:
-            budget = int(self.rho * num_computed_tokens)
+        spans = request.span_starts or []
+        n_spans = sum(1 for s in spans if s < num_computed_tokens) or 1
+        budget = min(self.k_per_span * n_spans, num_computed_tokens)
         if budget <= 0:
             return []
 
         bs = self.block_size
-        if self.granularity == "block":
-            num_blocks = num_computed_tokens // bs
-            if num_blocks == 0:
-                return []
-            scores = [
-                (sum(importance[b * bs : (b + 1) * bs]), b) for b in range(num_blocks)
-            ]
-            scores.sort(reverse=True)
-            keep = sorted(b for _, b in scores[: max(1, budget // bs)])
-            gaps = [(b * bs, (b + 1) * bs) for b in keep]
-        else:
-            ranked = sorted(
-                range(min(len(importance), num_computed_tokens)),
-                key=lambda t: importance[t],
-                reverse=True,
-            )[:budget]
-            gaps = [(t, t + 1) for t in sorted(ranked)]
+        num_blocks = num_computed_tokens // bs
+        if num_blocks == 0:
+            return []
+        scores = [
+            (sum(importance[b * bs : (b + 1) * bs]), b) for b in range(num_blocks)
+        ]
+        scores.sort(reverse=True)
+        keep = sorted(b for _, b in scores[: max(1, budget // bs)])
+        gaps = [(b * bs, (b + 1) * bs) for b in keep]
 
         # SPANS: same recompute-once-per-unique-prefix dedup as SpanAwareGapPolicy.
         sources = request.prefix_hit_sources
@@ -480,9 +454,8 @@ class QCFusePolicy(GapPolicy):
             gaps = kept
 
         logger.info(
-            "QCFuse selected %d gaps (rho=%.3f, budget=%d tok) for request %s",
+            "QCFuse selected %d gaps (budget=%d tok) for request %s",
             len(gaps),
-            self.rho,
             budget,
             request.request_id,
         )
@@ -490,118 +463,34 @@ class QCFusePolicy(GapPolicy):
 
 
 class MassClosurePolicy(QCFusePolicy):
-    """PIC: pick span blocks by attention x staleness x closure.
+    """Pick span blocks by attention x staleness x closure, greedily.
 
-    QCFuse ranks blocks by attention mass alone. That is the right first term
-    and the wrong whole answer, because a repaired block re-reads everything
-    before it: recomputing block b with its in-span predecessors still warm
-    rewrites b from a context that is itself wrong. Legolink never has this
-    problem (a prefix is closed by construction) which is exactly why it beats
-    attention ranking at small budgets, and why it stops improving once its
-    head is repaired.
-
-    The value of repairing block ``b`` given the already-chosen set ``R`` is
-
-        gain(b | R) = a(b) * rho(b) * r(b | R)
-
-    ``a(b)``   attention mass the following query puts on block b -- the same
-               QCFuse importance signal, summed over the block.
-    ``rho(b)`` how wrong the warmed block is. Prefix-free warm-up denies a
-               block its conversation prefix, and the damage falls off with
-               the in-span context it does have, so rho(b) = (1+b)^-alpha with
-               b the block's index *within its span*. Only the ranking
-               matters, so the profile's scale drops out.
-    ``r(b|R)`` closure: the fraction of what b re-reads that is already
-               correct,
-
-                   r(b | R) = (c + sum_{j in R, j < b} w(b, j))
-                              / (c + sum_{j < b} w(b, j))
-
-               weighted by where b's attention actually goes. ``c`` is the
-               mass landing on the conversation prefix, which is correct for
-               free. A token-count closure ((P + B|R|)/(P + Bb)) does NOT
-               work: at P=8192 it never drops below 0.8, so it is effectively
-               constant and the ranking collapses back onto plain attention.
-
-    ``w(b, j) = amp * (b - j)^-beta + floor``, plus ``sink`` at ``j = 0``, is a
-    decay kernel standing in for the measured intra-span block-to-block
-    attention. The measured matrix needs the span's own queries, which exist
-    only during its warm-up forward and are gone by the time a later request
-    reuses it; the kernel reproduces its ranking without any worker-side probe,
-    so this policy is entirely scheduler-side.
-
-    The kernel's constants are measured, not guessed. On Qwen3-32B the span's
-    first block is a large attention sink -- 0.55 of the intra-span mass, an
-    order of magnitude more than the block one step back -- and the decay
-    flattens onto a floor by about 15 blocks rather than continuing as a power
-    law. Getting the sink wrong is what separates this from plain attention
-    ranking: at sink=0.08 the arm scores 1.34x the measured matrix's KL
-    (14/80 windows, p<0.001), at the measured 0.554 it ties it (0.99x,
-    p=0.11). ``beta`` in contrast does nothing once the sink is right (1.0,
-    1.25 and 1.5 give identical selections).
-
-    Selection is greedy: take the argmax, add it to R, re-score. Adding a block
-    raises the closure of everything after it, which is what makes the method
-    build correct runs instead of scattering.
-
-    Budget is per span and matched to legolink-K, so a comparison against
-    legolink at the same K is a test of the selection rule, not of compute.
+    QCFuse ranks blocks by attention mass alone, but a repaired block re-reads
+    everything before it: recomputing b with its in-span predecessors still
+    warm rewrites b from a context that is itself wrong. The gain of block b
+    given the chosen set R is a(b) * (1+b)^-alpha * r(b|R), where a(b) is the
+    probe's attention mass and r(b|R) is the fraction of the mass b re-reads
+    that is already correct, under a measured decay kernel
+    w(d) = amp * d^-beta + floor with an attention sink on the span's first
+    block. Selection is greedy (argmax, add to R, re-score), so the method
+    builds correct runs instead of scattering. Budget is k_per_span, matched
+    to legolink-K.
     """
 
-    def __init__(
-        self,
-        *args,
-        c: float = 0.1,
-        alpha: float = 0.33,
-        beta: float = 1.25,
-        amp: float = 0.06,
-        floor: float = 0.0085,
-        sink: float = 0.554,
-        anchor_blocks: int = 1,
-        **kwargs,
-    ):
+    # Measured on Qwen3-32B (see the docstring); the selection is insensitive
+    # to everything here except the sink.
+    c = 0.1
+    alpha = 0.33
+    beta = 1.25
+    amp = 0.06
+    floor = 0.0085
+    sink = 0.554
+    anchor_blocks = 1
+
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if c <= 0.0:
-            raise ValueError(f"MassClosurePolicy c must be > 0, got {c}")
-        if beta <= 0.0:
-            raise ValueError(f"MassClosurePolicy beta must be > 0, got {beta}")
-        if alpha < 0.0:
-            raise ValueError(f"MassClosurePolicy alpha must be >= 0, got {alpha}")
-        if amp <= 0.0:
-            raise ValueError(f"MassClosurePolicy amp must be > 0, got {amp}")
-        if floor < 0.0:
-            raise ValueError(f"MassClosurePolicy floor must be >= 0, got {floor}")
-        if sink < 0.0:
-            raise ValueError(f"MassClosurePolicy sink must be >= 0, got {sink}")
-        if anchor_blocks < 0:
-            raise ValueError(
-                f"MassClosurePolicy anchor_blocks must be >= 0, got {anchor_blocks}"
-            )
-        if self.k_per_span <= 0:
-            # rho is a whole-context ratio; this policy selects inside spans,
-            # so without a per-span budget it has nothing to spend.
-            raise ValueError(
-                "MassClosurePolicy requires k_per_span > 0 "
-                "(set VLLM_V1_SPANS_QCFUSE_K_PER_SPAN)."
-            )
-        self.c = c
-        self.alpha = alpha
-        self.beta = beta
-        self.amp = amp
-        self.floor = floor
-        self.sink = sink
-        self.anchor_blocks = anchor_blocks
         logger.info(
-            "MassClosurePolicy initialized: k_per_span=%d c=%.3f alpha=%.2f "
-            "beta=%.2f amp=%.4f floor=%.4f sink=%.3f anchor_blocks=%d",
-            self.k_per_span,
-            c,
-            alpha,
-            beta,
-            amp,
-            floor,
-            sink,
-            anchor_blocks,
+            "MassClosurePolicy initialized: k_per_span=%d", self.k_per_span
         )
 
     def _closure_weights(self, n: int) -> tuple[list[float], list[float]]:
