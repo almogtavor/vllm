@@ -24,7 +24,9 @@ class AsyncScheduler(Scheduler):
             -1
         ] * scheduler_output.num_spec_tokens_to_schedule
         for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
             if request.is_prefill_chunk:
                 continue
 

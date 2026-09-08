@@ -3,7 +3,9 @@
 
 import functools
 import gc
+import hashlib
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -11,6 +13,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
+from datetime import datetime
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -92,6 +95,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -233,6 +237,24 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+_ATTN_ATTR_CANDIDATES = ("self_attn", "attn")
+
+
+def _get_attn_module(layer):
+    """Return the attention submodule of ``layer`` regardless of naming.
+
+    Most decoder blocks expose attention as ``self_attn`` (Llama-style),
+    but some (e.g. gpt-oss's ``TransformerBlock``) name it ``attn``.
+    """
+    for attr in _ATTN_ATTR_CANDIDATES:
+        if hasattr(layer, attr):
+            return getattr(layer, attr)
+    raise AttributeError(
+        f"{type(layer).__name__} has no recognized attention attribute "
+        f"(tried {', '.join(repr(a) for a in _ATTN_ATTR_CANDIDATES)})"
+    )
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -534,6 +556,31 @@ class GPUModelRunner(
         self.encoder_cache: dict[str, torch.Tensor] = {}
         self.late_interaction_runner = LateInteractionRunner()
 
+        # KV Cache Hash Debugging Configuration
+        self._kv_hash_debug_enabled = (
+            os.getenv("VLLM_DEBUG_KV_HASH_ENABLED", "False").lower() == "true"
+        )
+        self._kv_hash_debug_layer = int(os.getenv("VLLM_DEBUG_KV_HASH_LAYER", "1"))
+        self._kv_hash_debug_req_ids = os.getenv("VLLM_DEBUG_KV_HASH_REQ_IDS", "")
+        self._kv_hash_debug_output_file = os.getenv(
+            "VLLM_DEBUG_KV_HASH_OUTPUT_FILE", "kv_cache.csv"
+        )
+        self._kv_hash_debug_log_interval = int(
+            os.getenv("VLLM_DEBUG_KV_HASH_LOG_INTERVAL", "1")
+        )
+        self._kv_hash_debug_counter = 0
+
+        if self._kv_hash_debug_enabled:
+            logger.info(
+                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, output_file=%s, log_interval=%d",
+                self._kv_hash_debug_layer,
+                self._kv_hash_debug_req_ids if self._kv_hash_debug_req_ids else "ALL",
+                self._kv_hash_debug_output_file
+                if self._kv_hash_debug_output_file
+                else "CONSOLE_ONLY",
+                self._kv_hash_debug_log_interval,
+            )
+
         # Encoder CUDA graph manager (initialized after model load if enabled)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
@@ -721,6 +768,10 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
+            self._attn_lower_bounds_gpu: torch.Tensor | None = None
+            self._req_kv_starts_gpu: torch.Tensor | None = None
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1234,6 +1285,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1923,6 +1975,32 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
+        if envs.VLLM_V1_SPANS_ENABLED:
+            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            seq_lens_arr = num_computed + num_scheduled_tokens
+            req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
+            np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
+            attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            for i in range(num_reqs):
+                req = self.requests[self.input_batch.req_ids[i]]
+                params = req.sampling_params
+                if req.is_gap_recompute or params is None:
+                    continue
+                ea = params.extra_args
+                spans = ea.get("span_starts") if ea else None
+                if not spans:
+                    continue
+                crosses = ea.get("cross_span_starts") or []
+                req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
+                for j, span_start in enumerate(spans):
+                    cross = crosses[j] if j < len(crosses) else req_len
+                    attn_lb[req_start + span_start : req_start + cross] = span_start
+            self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
+                self.device, non_blocking=True)
+            self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
+                self.device, non_blocking=True)
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1998,6 +2076,15 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
+        # NOTE(merge on-the-fly-warmup): the on-the-fly branch computed the
+        # slot mapping on the CPU here via
+        # ``block_table.compute_slot_mapping(req_indices, positions_np)`` +
+        # ``commit_slot_mapping(...)`` and then shifted ``positions_np`` to
+        # span-relative. HEAD instead computes the slot mapping on the GPU
+        # (see ``compute_slot_mapping(num_reqs, query_start_loc, positions)``
+        # below), so those CPU calls are dropped. The span-relative Q-position
+        # shift is applied to the GPU ``self.positions`` right after that GPU
+        # slot mapping (which requires absolute positions).
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -2120,6 +2207,24 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+
+        # SPANS: shift Q positions to span-relative on the GPU, after the slot
+        # mapping (which requires absolute positions). On-the-fly-warmup did
+        # this on the CPU ``positions_np`` before ``copy_to_gpu``; HEAD keeps
+        # ``self.positions`` as a GPU tensor computed from ``query_pos.gpu``,
+        # so the shift is applied here to the GPU tensor instead.
+        if (
+            envs.VLLM_V1_SPANS_ENABLED
+            and self._attn_lower_bounds_gpu is not None
+            and self._req_kv_starts_gpu is not None
+        ):
+            pos_slice = self.positions[:total_num_scheduled_tokens]
+            sched_kv_indices = (
+                self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
+            )
+            pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
+                pos_slice.dtype
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2268,6 +2373,44 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
+        # print("==================MODULES===============")
+
+        # # Dump full structure
+        # for name, module in self.model.named_modules():
+        #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
+        #     for attr_name, attr_value in module.__dict__.items():
+        #         logger.info("  .%s: %s = %s", attr_name, type(attr_value).__name__, repr(attr_value)[:100])
+
+        # # Find rotary
+        # for name, module in self.model.named_modules():
+        #     if "rotary" in type(module).__name__.lower() or "rotary" in name.lower():
+        #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
+
+        if not hasattr(self, "rotate"):
+            # Get the layers list, handling both standard and Llama4-style model structures
+            if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                layers = self.model.model.layers
+            elif hasattr(self.model, "language_model") and hasattr(
+                self.model.language_model, "model"
+            ):
+                layers = self.model.language_model.model.layers
+            else:
+                raise AttributeError(
+                    f"Cannot find layers in model structure: {type(self.model).__name__}"
+                )
+
+            for lay in layers:
+                if not isinstance(lay, PPMissingLayer):
+                    self.rotate = _get_attn_module(lay).rotary_emb
+                    break
+            else:
+                raise AttributeError(
+                    "All layers are PPMissingLayer, cannot find rotary_emb"
+                )
+
+            self._cos_sin_cache = self.rotate.cos_sin_cache
+            self._rotary_dim = self.rotate.rotary_dim
+
         if self.routed_experts_initialized:
             # Copy this step's attention slot_mapping into our private
             # device buffer. The shared ``slot_mappings[attn_gid]`` is
@@ -2341,9 +2484,13 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
+            cos_sin_cache=self._cos_sin_cache,
+            rotary_dim=self._rotary_dim,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
+            attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
+            req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
         )
 
         if self.dcp_world_size > 1:
@@ -3754,6 +3901,186 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    def _should_debug_kv_hash(self) -> bool:
+        """Check if KV hash debugging should be performed this step."""
+        if not self._kv_hash_debug_enabled:
+            return False
+
+        self._kv_hash_debug_counter += 1
+        return self._kv_hash_debug_counter % self._kv_hash_debug_log_interval == 0
+
+    def _compute_kv_cache_hash_for_layer(
+        self, layer_idx: int, req_ids: list[str] | None = None
+    ) -> dict[int, tuple[str, str]]:
+        """
+        Compute SHA256 hash of K,V cache for a specific layer.
+
+        Args:
+            layer_idx: Layer index to compute hash for (0-based)
+            req_ids: Optional list of request IDs to filter
+
+        Returns:
+            Dictionary mapping block_idx -> (k_hash, v_hash)
+        """
+        try:
+            if layer_idx >= len(self.kv_caches):
+                logger.warning(
+                    "KV Hash Debug: Layer index %d out of range (total layers: %d)",
+                    layer_idx,
+                    len(self.kv_caches),
+                )
+                return {}
+
+            kv_cache = self.kv_caches[layer_idx]
+
+            if kv_cache is None:
+                logger.warning(
+                    "KV Hash Debug: KV cache for layer %d is None", layer_idx
+                )
+                return {}
+
+            # Move to CPU and convert dtype if needed
+            kv_cache_cpu = kv_cache.detach().cpu()
+            if kv_cache_cpu.dtype == torch.bfloat16:
+                kv_cache_cpu = kv_cache_cpu.to(torch.float32)
+
+            # Get shape info
+            # Typical shape: [num_blocks, 2, num_kv_heads, block_size, head_dim]
+            # where dim 1 has K at index 0 and V at index 1
+            shape = kv_cache_cpu.shape
+            num_blocks = shape[0] if len(shape) > 0 else 1
+
+            block_hashes = {}
+
+            # Compute hash for each block
+            for block_idx in range(num_blocks):
+                block_tensor = kv_cache_cpu[block_idx]
+
+                # Split K and V if they're in the same tensor
+                if len(shape) > 1 and shape[1] == 2:
+                    # K is at index 0, V is at index 1
+                    k_tensor = block_tensor[0]
+                    v_tensor = block_tensor[1]
+                else:
+                    # Assume entire block is K,V concatenated or single tensor
+                    k_tensor = block_tensor
+                    v_tensor = block_tensor
+
+                # Compute hashes
+                k_bytes = k_tensor.numpy().tobytes()
+                v_bytes = v_tensor.numpy().tobytes()
+                k_hash = hashlib.sha256(k_bytes).hexdigest()[:16]  # First 16 chars
+                v_hash = hashlib.sha256(v_bytes).hexdigest()[:16]
+
+                block_hashes[block_idx] = (k_hash, v_hash)
+
+            return block_hashes
+
+        except Exception as e:
+            logger.error(
+                "KV Hash Debug: Error computing hash for layer %d: %s", layer_idx, e
+            )
+            import traceback
+
+            traceback.print_exc()
+            return {}
+
+    def _debug_kv_cache_hash(self, scheduler_output: "SchedulerOutput") -> None:
+        """
+        Debug function to compute and log KV cache hashes after execute_model.
+
+        Args:
+            scheduler_output: The scheduler output containing request information
+        """
+        try:
+            layer_idx = self._kv_hash_debug_layer
+
+            # Get layer name if available
+            layer_name = f"layer_{layer_idx}"
+            if hasattr(self, "model") and hasattr(self.model, "layers"):
+                try:
+                    # Try to get actual layer name from model
+                    attn_layers = get_layers_from_vllm_config(
+                        self.vllm_config, Attention
+                    )
+                    layer_names = list(attn_layers.keys())
+                    if layer_idx < len(layer_names):
+                        layer_name = layer_names[layer_idx]
+                except Exception:
+                    pass
+
+            # Compute hashes
+            block_hashes = self._compute_kv_cache_hash_for_layer(layer_idx)
+
+            if not block_hashes:
+                logger.warning(
+                    "KV Hash Debug: No hashes computed for layer %d", layer_idx
+                )
+                return
+
+            # Prepare log message
+            timestamp = datetime.now().isoformat()
+            step = self._kv_hash_debug_counter
+
+            # Console output
+            logger.info("=" * 80)
+            logger.info(
+                "[KV_HASH_DEBUG] Step: %d, Layer: %d (%s)", step, layer_idx, layer_name
+            )
+            logger.info("  Timestamp: %s", timestamp)
+            logger.info("  Total blocks: %d", len(block_hashes))
+
+            # Log first few blocks to console
+            max_console_blocks = 15
+            for block_idx, (k_hash, v_hash) in list(block_hashes.items())[
+                :max_console_blocks
+            ]:
+                logger.info("    Block %d: K=%s, V=%s", block_idx, k_hash, v_hash)
+
+            if len(block_hashes) > max_console_blocks:
+                logger.info(
+                    "    ... (%d more blocks)", len(block_hashes) - max_console_blocks
+                )
+
+            logger.info("=" * 80)
+
+            # File output (CSV format)
+            if self._kv_hash_debug_output_file:
+                try:
+                    # Check if file exists to determine if we need to write header
+                    file_exists = os.path.exists(self._kv_hash_debug_output_file)
+
+                    with open(self._kv_hash_debug_output_file, "a") as f:
+                        # Write header if new file
+                        if not file_exists:
+                            f.write(
+                                "timestamp,step,layer_idx,layer_name,block_idx,k_hash,v_hash\n"
+                            )
+
+                        # Write data for all blocks
+                        for block_idx, (k_hash, v_hash) in block_hashes.items():
+                            f.write(
+                                f"{timestamp},{step},{layer_idx},{layer_name},{block_idx},{k_hash},{v_hash}\n"
+                            )
+
+                    logger.info(
+                        "KV Hash Debug: Data written to %s",
+                        self._kv_hash_debug_output_file,
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        "KV Hash Debug: Error writing to file %s: %s",
+                        self._kv_hash_debug_output_file,
+                        e,
+                    )
+
+        except Exception as e:
+            logger.error("KV Hash Debug: Error in _debug_kv_cache_hash: %s", e)
+            import traceback
+
+            traceback.print_exc()
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4325,6 +4652,11 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        # === DEBUG: KV Cache Hash ===
+        if self._should_debug_kv_hash():
+            self._debug_kv_cache_hash(scheduler_output)
+        # === END DEBUG ===
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4382,6 +4714,9 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        # NOTE: Virtual gap request cleanup is done in sample_tokens AFTER
+        # bookkeeping, because _bookkeeping_sync needs access to self.requests
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4621,6 +4956,15 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
+
+        # Handle virtual gap requests: cleanup only (KV written directly to parent)
+        # Virtual gap requests share parent's blocks and write directly to parent's
+        # KV cache during model execution. Only need cleanup.
+        if scheduler_output.virtual_gap_req_ids is not None:
+            for req_id in scheduler_output.virtual_gap_req_ids:
+                self.requests.pop(req_id, None)
+                self.num_prompt_logprobs.pop(req_id, None)
+                self.input_batch.remove_request(req_id)
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:

@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
 
 
 @triton.jit
@@ -274,6 +275,20 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    # Fused span-relative RoPE (spans / Legolink). When ``FUSE_ROPE`` is set,
+    # K is stored un-rotated and rotated here per-tile using ``cos_sin_cache``
+    # indexed by span-relative key position; Q/K are loaded in halves and the
+    # score is the sum of the two half dots. Disabled (constexpr False) leaves
+    # the upstream path untouched (dead-code-eliminated at compile time).
+    cos_sin_cache_ptr=None,
+    stride_cs_cache_0: tl.int64 = 0,
+    stride_cs_cache_1: tl.constexpr = 0,
+    FUSE_ROPE: tl.constexpr = False,
+    ROTARY_DIM: tl.constexpr = 0,  # 0 means rotary_dim == head_size
+    KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
+    attn_lower_bounds_ptr: torch.Tensor | None = None,  # SPANS: per-KV-pos lb
+    req_kv_starts_ptr: torch.Tensor | None = None,  # SPANS: per-req KV start
+    USE_SPAN: tl.constexpr = False,  # bool
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -398,10 +413,30 @@ def kernel_unified_attention(
         CHUNK_SIZE,
     )
 
+    # SPANS: skip whole KV tiles before the Q-block's smallest lower bound;
+    # span_starts are block-aligned so span_offset is tile-aligned. This
+    # narrows HEAD's ``loop_lo`` (already computed by compute_tile_loop_bounds
+    # with sliding-window / mm-prefix / 3D-segment pruning) on top of those.
+    span_offset: tl.int32 = 0
+    if USE_SPAN:
+        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
+        q_lb_vec = tl.load(
+            attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
+            mask=query_mask_0, other=INT32_MAX)
+        # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
+        span_offset = tl.min(q_lb_vec)
+        span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
+        loop_lo = tl.maximum(loop_lo, span_offset // TILE_SIZE)
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
+
+        if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
+            key_span_lb = tl.load(
+                attn_lower_bounds_ptr + req_kv_start + seq_offset,
+                mask=tile_mask, other=0)
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -453,25 +488,100 @@ def kernel_unified_attention(
                 + offs_d[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
+            if FUSE_ROPE:
+                # K is stored un-rotated. Rotate the FULL K tile in fp32 here to
+                # match the FR CUDA rotary kernel
+                # (csrc/libtorch_stable/pos_encoding_kernels.cu), which upcasts
+                # to float, rotates, and rounds to the cache dtype once. Then use
+                # a single full dot (matching FR's tl.dot(Q, K)) so the fp32
+                # accumulation order is identical. ROTARY_DIM <= 0 (or >= head)
+                # means rotary covers the whole head; otherwise only [0,
+                # ROTARY_DIM) rotates and the rest passes through (cos -> 1.0,
+                # sin -> 0.0 outside the rotary span).
+                ROT: tl.constexpr = (
+                    HEAD_SIZE
+                    if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE)
+                    else ROTARY_DIM
+                )
+                HALF_ROT: tl.constexpr = ROT // 2
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_raw_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                # neox pairing: x-part (d < HALF_ROT) pairs with d + HALF_ROT,
+                # y-part ([HALF_ROT, ROT)) pairs with d - HALF_ROT.
+                x_part = offs_d < HALF_ROT
+                partner_d = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + partner_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                rope_mask = (offs_d[:, None] < ROT) & tile_mask[None, :]
+                cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
+                # SPANS: shift the cos/sin cache index to the span-relative key
+                # position. Per-key ``key_span_lb`` when USE_SPAN, else the
+                # (tile-aligned) scalar ``span_offset`` (0 outside spans).
+                key_pos_shift = key_span_lb[None, :] if USE_SPAN else span_offset
+                cos_offset = (
+                    (seq_offset[None, :] - key_pos_shift) * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
+                )
+                sin_offset = (
+                    (seq_offset[None, :] - key_pos_shift) * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset, mask=rope_mask, other=1.0
+                ).to(tl.float32)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset, mask=rope_mask, other=0.0
+                ).to(tl.float32)
+                rope_sign = tl.where(x_part, -1.0, 1.0)
+                if K_raw_load.dtype.is_fp8():
+                    k_sc = tl.load(k_scale)
+                    K_raw_f = K_raw_load.to(tl.float32) * k_sc
+                    K_partner_f = K_partner_load.to(tl.float32) * k_sc
+                else:
+                    K_raw_f = K_raw_load.to(tl.float32)
+                    K_partner_f = K_partner_load.to(tl.float32)
+                K_rot = (
+                    K_raw_f * cos + rope_sign[:, None] * K_partner_f * sin
+                ).to(KV_COMPUTE_DTYPE)
+            else:
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
             # V : (TILE_SIZE, HEAD_SIZE)
             V_load = tl.load(
                 value_cache_ptr + v_offset,
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+        if not FUSE_ROPE:
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
@@ -512,7 +622,9 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if FUSE_ROPE:
+            S += score_scale * tl.dot(Q, K_rot)
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -818,14 +930,36 @@ def unified_attention(
     # The non-TD branch is dead-code-eliminated at Triton compile time so
     # disabling this flag costs nothing.
     use_td: bool = False,
+    # Fused span-relative RoPE (spans / Legolink). When ``cos_sin_cache`` is
+    # provided, K is stored un-rotated and rotated inside the kernel using
+    # ``cos_sin_cache`` indexed by span-relative key position. ``rotary_dim``
+    # of 0 means rotary_dim == head_size (full rotary).
+    cos_sin_cache=None,
+    rotary_dim=0,
+    attn_lower_bounds=None,  # SPANS: flat per-KV-pos lower bound
+    req_kv_starts=None,  # SPANS: per-req start into attn_lower_bounds
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
     per_seq_causal_ptr = causal if use_per_seq_causal else None
+    # SPANS: on-the-fly span attention when lower bounds are provided.
+    use_span = attn_lower_bounds is not None
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+    fuse_rope = cos_sin_cache is not None
+    # Compute dtype for in-kernel RoPE + key cast, matching the layer-side RoPE
+    # dtype. For fp8 caches keep fp16 (the dequant path lands there).
+    if k.dtype == torch.bfloat16:
+        kv_compute_dtype = tl.bfloat16
+    elif k.dtype == torch.float16:
+        kv_compute_dtype = tl.float16
+    elif k.dtype == torch.float32:
+        kv_compute_dtype = tl.float32
+    else:
+        kv_compute_dtype = tl.float16
 
     use_per_token_head_scales = kv_quant_mode in (
         KVQuantMode.INT8_PER_TOKEN_HEAD,
@@ -1088,6 +1222,15 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        cos_sin_cache_ptr=cos_sin_cache,
+        stride_cs_cache_0=cos_sin_cache.stride(0) if fuse_rope else 0,
+        stride_cs_cache_1=cos_sin_cache.stride(1) if fuse_rope else 0,
+        FUSE_ROPE=fuse_rope,
+        ROTARY_DIM=rotary_dim,
+        KV_COMPUTE_DTYPE=kv_compute_dtype,
+        attn_lower_bounds_ptr=attn_lower_bounds,
+        req_kv_starts_ptr=req_kv_starts,
+        USE_SPAN=use_span,
         **launch_kwargs,
     )
 

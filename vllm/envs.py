@@ -258,6 +258,15 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+
+    # spans vars
+    VLLM_V1_SPANS_ENABLED: bool = False
+    VLLM_V1_SPANS_DEBUG: bool = False
+    VLLM_V1_SPANS_PAD_TOKEN: int = -1
+    VLLM_V1_SPANS_BLOCK_SIZE: int = 0
+    VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
+    VLLM_V1_SPANS_GAP_LENGTH: int = 32
+
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
@@ -1688,6 +1697,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allows harmony instructions to be injected on system messages
     "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
         int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
+    ),
+    # whether to enable block-attention (span detection, fan-in, repositioning)
+    "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
+    == "True",
+    # whether to print details pertaining to the block-attention
+    # implementation
+    "VLLM_V1_SPANS_DEBUG": lambda: os.environ.get("VLLM_V1_SPANS_DEBUG", "False")
+    == "True",
+    # for block-attention, the token used for padding sequences
+    # to block boundaries (client-side)
+    "VLLM_V1_SPANS_PAD_TOKEN": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PAD_TOKEN", "-1")
+    ),
+    # override block size for spans (0 = use default/CLI value)
+    "VLLM_V1_SPANS_BLOCK_SIZE": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_BLOCK_SIZE", "0")
+    ),
+    # enable span-aware gap policy via env var
+    "VLLM_V1_SPANS_GAP_POLICY_ENABLE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_GAP_POLICY_ENABLE", "False"
+    )
+    == "True",
+    # gap length for span-aware gap policy
+    "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces

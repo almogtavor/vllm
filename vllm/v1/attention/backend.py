@@ -387,6 +387,12 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    cos_sin_cache: torch.Tensor | None = None
+    rotary_dim: int = 0
+
+    attn_lower_bounds: torch.Tensor | None = None  # SPANS: per-KV-pos lower bound
+    req_kv_starts: torch.Tensor | None = None  # SPANS: per-req start into attn_lb
+
     causal: bool | torch.Tensor = True
 
     # Needed by FastPrefillAttentionBuilder

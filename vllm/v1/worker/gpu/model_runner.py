@@ -1311,6 +1311,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            virtual_gap_req_ids=scheduler_output.virtual_gap_req_ids,
         )
 
         if not self.is_last_pp_rank:
@@ -1333,6 +1334,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        virtual_gap_req_ids = self.execute_model_state.virtual_gap_req_ids
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1461,6 +1463,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
 
+        # Handle virtual gap requests: cleanup only (KV written directly to parent)
+        if virtual_gap_req_ids is not None:
+            # Virtual gap requests share parent's blocks and write directly
+            # to parent's KV cache during model execution. Only need cleanup.
+            for req_id in virtual_gap_req_ids:
+                self.req_states.remove_request(req_id)
+                if self.supports_mm_inputs:
+                    self.encoder_runner.remove_request(req_id)
+
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -1572,3 +1583,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    virtual_gap_req_ids: set[str] | None

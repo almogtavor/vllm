@@ -12,9 +12,11 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    PrefixHitSource,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -485,6 +487,44 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=self.pcp_world_size,
         )
         return hit_blocks, len(hit_blocks[0]) * self.block_size
+
+    def supports_dual_cache_hit(self) -> bool:
+        return (
+            isinstance(self.single_type_managers[0], FullAttentionManager)
+            and self.dcp_world_size * self.pcp_world_size == 1
+            and not self.eagle_group_ids
+        )
+
+    def find_longest_cache_hit_dual(
+        self,
+        request: Request,
+        max_cache_hit_length: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, list[PrefixHitSource]]:
+        """SPANS: `find_longest_cache_hit`, but a block inside a
+        [span_start, cross_span_start) range is looked up under its
+        position-dependent (pd) key first, falling back to the shared
+        position-independent (pic) key; also returns each block's hit source."""
+        bs = self.block_size
+        ranges = request.pic_token_ranges
+        computed: list[KVCacheBlock] = []
+        sources: list[PrefixHitSource] = []
+        for i in range(min(max_cache_hit_length // bs, len(request.block_hashes))):
+            in_span = any(s <= i * bs and (e is None or i * bs < e) for s, e in ranges)
+            block = None
+            source = PrefixHitSource.PD
+            if in_span and i < len(request.pd_block_hashes):
+                block = self.block_pool.get_cached_block(
+                    request.pd_block_hashes[i], [0]
+                )
+            if block is None:
+                block = self.block_pool.get_cached_block(request.block_hashes[i], [0])
+                if in_span:
+                    source = PrefixHitSource.PIC
+            if block is None:
+                break
+            computed.append(block[0])
+            sources.append(source)
+        return (computed,), len(computed) * bs, sources
 
 
 class SpecGroup(NamedTuple):

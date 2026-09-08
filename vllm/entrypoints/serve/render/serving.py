@@ -6,6 +6,7 @@ from http import HTTPStatus
 from typing import Any, cast
 
 from openai_harmony import Message as OpenAIMessage
+from pydantic import BaseModel
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -27,6 +28,7 @@ from vllm.entrypoints.openai.completion.protocol import (
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
+    ToolCall,
     UsageInfo,
 )
 from vllm.entrypoints.openai.engine.serving import resolve_token_id_placeholder
@@ -74,6 +76,31 @@ from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.utils.mistral import mt as _mt
 
 logger = init_logger(__name__)
+
+
+class ParseRequest(BaseModel):
+    """Request for the GPU-less postprocessing endpoint.
+
+    Given raw model output text, run the server's configured reasoning and
+    tool-call parsers and return the structured pieces — the postprocessing
+    counterpart to the render (preprocessing) endpoints. Lets a spans
+    middleware that generates via raw /v1/completions still get the same
+    structured response /v1/chat/completions would produce, without
+    re-implementing the parsers.
+    """
+
+    text: str
+    model: str | None = None
+    # Tools the request advertised — used by tool parsers for argument
+    # type coercion (anyOf/oneOf/enum). Optional.
+    tools: list[Any] | None = None
+
+
+class ParseResponse(BaseModel):
+    reasoning_content: str | None = None
+    content: str | None = None
+    tool_calls: list[ToolCall] = []
+    tools_called: bool = False
 
 
 def _resolve_logprobs(
@@ -197,6 +224,11 @@ class OpenAIServingRender:
             model_name=model_config.model,
             is_harmony=self.use_harmony,
         )
+        # Reasoning parser class (built by name); used by the /parse endpoint to
+        # split <think> reasoning from content on raw model output.
+        self.reasoning_parser_cls = ParserManager.get_reasoning_parser(
+            reasoning_parser_name=reasoning_parser,
+        )
         self.default_chat_template_kwargs: dict[str, Any] = (
             default_chat_template_kwargs or {}
         )
@@ -210,6 +242,71 @@ class OpenAIServingRender:
             self.default_sampling_params.get("max_tokens")
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
+        )
+
+    async def parse_chat_output(
+        self, request: ParseRequest
+    ) -> ParseResponse | ErrorResponse:
+        """Postprocess raw model output into structured fields.
+
+        Runs the server's configured reasoning parser (split <think> reasoning
+        from content) and tool-call parser (extract structured tool_calls),
+        mirroring what /v1/chat/completions does — but on text the caller
+        already has. No engine/GPU required.
+        """
+        try:
+            tokenizer = self.renderer.get_tokenizer()
+        except Exception as e:  # pragma: no cover
+            return self.create_error_response(f"Tokenizer unavailable: {e}")
+
+        # Minimal chat request to carry tools/tool_choice to the parsers.
+        parser_request = ChatCompletionRequest(
+            model=request.model or self.model_config.model,
+            messages=[],
+            tools=request.tools,
+        )
+
+        reasoning_content: str | None = None
+        content: str | None = request.text
+
+        if self.reasoning_parser_cls is not None:
+            reasoning_parser = self.reasoning_parser_cls(tokenizer)
+            start_tok = getattr(reasoning_parser, "start_token", None)
+            end_tok = getattr(reasoning_parser, "end_token", None)
+            start_tok = start_tok if isinstance(start_tok, str) else None
+            end_tok = end_tok if isinstance(end_tok, str) else None
+            # Skip the parser when neither marker is in the text: a thinking
+            # parser would otherwise claim plain content as reasoning. A lone
+            # <think> still runs the parser (truncated mid-thought -> reasoning).
+            has_markers = start_tok is not None or end_tok is not None
+            text_has_marker = (start_tok and start_tok in request.text) or (
+                end_tok and end_tok in request.text
+            )
+            if not has_markers or text_has_marker:
+                reasoning_content, content = reasoning_parser.extract_reasoning(
+                    request.text, request=parser_request
+                )
+
+        tool_calls: list[ToolCall] = []
+        tools_called = False
+        # The harmony refactor (PR #45464) folded the tool/reasoning parsers into
+        # the combined self.parser; the tool parser class is reached via
+        # self.parser.tool_parser_cls (see render_chat_request / build_parser).
+        tool_parser_cls = (
+            self.parser.tool_parser_cls if self.parser is not None else None
+        )
+        if tool_parser_cls is not None and content is not None:
+            tool_parser = tool_parser_cls(tokenizer)
+            info = tool_parser.extract_tool_calls(content, request=parser_request)
+            tools_called = info.tools_called
+            tool_calls = info.tool_calls
+            content = info.content
+
+        return ParseResponse(
+            reasoning_content=reasoning_content,
+            content=content,
+            tool_calls=tool_calls,
+            tools_called=tools_called,
         )
 
     async def render_chat_request(
