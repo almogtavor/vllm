@@ -271,6 +271,10 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
     VLLM_V1_SPANS_GAP_LENGTH: int = 32
     VLLM_V1_SPANS_PREROTATE: bool = True
+    VLLM_V1_SPANS_QCFUSE_ENABLE: bool = False
+    VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
+    VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
+    VLLM_V1_SPANS_MASS_CLOSURE_ENABLE: bool = False
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1706,8 +1710,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
-    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
-    .lower()
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get(
+        "VLLM_V1_SPANS_CUDAGRAPH", "True"
+    ).lower()
     in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
@@ -1733,10 +1738,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # rotate K once per forward into a transient scratch (prefill batches)
     # instead of per-tile inside the attention kernel
-    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get(
-        "VLLM_V1_SPANS_PREROTATE", "True"
+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
+    == "True",
+    # QCFuse: recompute a query-selected SUBSET OF TOKENS across all layers.
+    # The critical layers are only the selection lens, not what gets recomputed.
+    "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"
     )
     == "True",
+    # Comma-separated layer indices used as the importance selection lens.
+    # Model-specific and offline-profiled; empty is rejected at init rather
+    # than silently degrading to a no-op arm.
+    "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", ""
+    ),
+    # Budget-match this arm to legolink-K: K tokens per span, so both methods
+    # recompute the same total and the comparison isolates the selection rule.
+    "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
+    ),
+    # PIC mass-closure selection. Same importance probe and same per-span
+    # budget as QCFuse; the difference is the ranking, which weighs a block's
+    # attention by how stale it is and by how much of what it re-reads has
+    # already been repaired.
+    "VLLM_V1_SPANS_MASS_CLOSURE_ENABLE": lambda: (
+        os.environ.get("VLLM_V1_SPANS_MASS_CLOSURE_ENABLE", "False") == "True"
+    ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces
     # non-determinism (different tokens -> different model behaviour at
