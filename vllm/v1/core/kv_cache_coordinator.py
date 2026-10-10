@@ -503,13 +503,13 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         """SPANS: `find_longest_cache_hit`, but a block inside a
         [span_start, cross_span_start) range is looked up under its
         position-dependent (pd) key first, falling back to the shared
-        position-independent (pic) key; also returns each block's hit source."""
+        position-independent (pic) key; also returns each block's hit source.
+        Misses before the last hit become null MISS placeholders."""
         bs = self.block_size
-        ranges = request.pic_token_ranges
         computed: list[KVCacheBlock] = []
         sources: list[PrefixHitSource] = []
         for i in range(min(max_cache_hit_length // bs, len(request.block_hashes))):
-            in_span = any(s <= i * bs and (e is None or i * bs < e) for s, e in ranges)
+            in_span = request.in_pic_span(i * bs)
             block = None
             source = PrefixHitSource.PD
             if in_span and i < len(request.pd_block_hashes):
@@ -521,9 +521,15 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
                 if in_span:
                     source = PrefixHitSource.PIC
             if block is None:
-                break
+                # a miss no longer ends the walk: hits behind it are kept
+                computed.append(self.block_pool.null_block)
+                sources.append(PrefixHitSource.MISS)
+                continue
             computed.append(block[0])
             sources.append(source)
+        while sources and sources[-1] == PrefixHitSource.MISS:
+            computed.pop()
+            sources.pop()
         return (computed,), len(computed) * bs, sources
 
 

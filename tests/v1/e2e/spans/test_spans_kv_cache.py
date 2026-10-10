@@ -221,11 +221,12 @@ def test_repeated_pic_span_reuse_and_gap_recompute_e2e(model, monkeypatch):
     )
 
 
-def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
+def test_unwarmed_prefix_does_not_halt_pic_chunk_reuse_e2e(model, monkeypatch):
     """Unwarmed PIC chunk, span in the middle (SPANS-PC, 3 requests A/B/C).
     A: cold prompt prefills fully and stores the chunk NONE_HASH-rooted; the
        span's K/V must match the chunk computed standalone.
-    B: a new-prefix request run as-is reuses nothing (block 0 misses, run halts).
+    B: a new-prefix request run as-is recomputes the missed prefix as forced gaps
+       and still reuses the chunk behind it; the prefix is then cached.
     C: a third-prefix request with its prefix warmed reuses both prefix+chunk."""
     _force_in_process_engine(monkeypatch)
     chunk = list(range(500, 500 + BLOCK_SIZE * 2))
@@ -266,8 +267,12 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
         # Span K/V as computed inside A's cold prefill (positions 32..63).
         inprompt_chunk_kv = [_block_kv(llm, h) for h in stored[2:4]]
 
-        # B: different prefix, run as-is (unwarmed) - block 0 misses, no reuse.
+        # B: different prefix, run as-is (unwarmed) - prefix misses, chunk still hits.
         cached_b = _generate_num_cached_tokens(llm, prefix_b + chunk + tail, sp)
+        hashes_b = _request_block_hashes(
+            prefix_b + chunk + tail, [BLOCK_SIZE * 2], [BLOCK_SIZE * 4]
+        )
+        prefix_b_cached = all(cached(h) for h in hashes_b[:2])
 
         # C: third prefix, warmed first -> prefix + chunk both hit.
         _warmup_prompt(llm, prefix_c)
@@ -277,7 +282,10 @@ def test_unwarmed_pic_chunk_halts_prefix_cache_reuse_e2e(model, monkeypatch):
     assert cached_a == 0, f"cold run should reuse nothing, got {cached_a}"
     assert full_prefill, "cold run did not fully prefill the prompt"
     assert chunk_none_rooted, "chunk not stored under its NONE_HASH-rooted hash"
-    assert cached_b == 0, f"unwarmed new prefix must halt at block 0, got {cached_b}"
+    assert cached_b == BLOCK_SIZE * 2, (
+        f"a missed prefix must not halt the chunk hit behind it, got {cached_b}"
+    )
+    assert prefix_b_cached, "missed prefix blocks not cached after gap recompute"
     assert cached_c == BLOCK_SIZE * 4, (
         f"warmed prefix should reuse prefix + chunk, got {cached_c}"
     )
