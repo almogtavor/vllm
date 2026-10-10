@@ -274,6 +274,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
     VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
     VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
+    VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1760,6 +1761,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recompute budget of K tokens per span, matching legolink-K; 0 uses rho
     "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
         os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
+    ),
+    # PIC neighbor-aware gap policy (QCFuse probe, closure-aware ranking)
+    "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
+        os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces

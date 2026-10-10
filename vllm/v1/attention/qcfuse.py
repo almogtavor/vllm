@@ -28,6 +28,11 @@ def parse_critical_layers() -> tuple[int, ...]:
     return tuple(int(x) for x in raw.split(",") if x.strip())
 
 
+def probe_enabled() -> bool:
+    """True when QCFuse or neighbor-aware needs the importance probe."""
+    return envs.VLLM_V1_SPANS_QCFUSE_ENABLE or envs.VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE
+
+
 class QCFuseImportanceCapturer:
     """Per-worker importance buffer, filled once per critical layer.
 

@@ -104,9 +104,15 @@ def schedule_span_gaps(
     if request.pending_span_gaps:
         span_gaps = request.pending_span_gaps
     elif did_prefix_lookup and sched.gap_policy is not None:
-        span_gaps = sched.gap_policy.get_gaps(
-            request, num_computed_tokens, num_external_computed_tokens
-        )
+        # memoize per (request, prefix length): the probe rewrites importance between retries
+        memo = request.span_gaps_selection
+        if memo is not None and memo[0] == num_computed_tokens:
+            span_gaps = list(memo[1])
+        else:
+            span_gaps = sched.gap_policy.get_gaps(
+                request, num_computed_tokens, num_external_computed_tokens
+            )
+            request.span_gaps_selection = (num_computed_tokens, list(span_gaps))
     else:
         span_gaps = []
     if did_prefix_lookup and sched.connector is not None:
@@ -457,6 +463,156 @@ class QCFusePolicy(GapPolicy):
         return gaps
 
 
+class NeighborAwarePolicy(QCFusePolicy):
+    """Greedy span-block selection by attention x staleness x closure."""
+
+    # kernel constants measured on Qwen3-32B; only the sink matters
+    c = 0.1
+    alpha = 0.33
+    beta = 1.25
+    amp = 0.06
+    floor = 0.0085
+    sink = 0.554
+    anchor_blocks = 1
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.k_per_span <= 0:
+            raise ValueError(
+                "NeighborAwarePolicy requires k_per_span > 0 "
+                "(set VLLM_V1_SPANS_QCFUSE_K_PER_SPAN)."
+            )
+        logger.info("NeighborAwarePolicy initialized: k_per_span=%d", self.k_per_span)
+
+    def _closure_weights(self, n: int) -> tuple[list[float], list[float]]:
+        """Kernel weight by block distance, and each row's total incl. the sink."""
+        w = [0.0] + [self.amp * d**-self.beta + self.floor for d in range(1, n)]
+        rowtot = [0.0] * n
+        acc = 0.0
+        for b in range(1, n):
+            acc += w[b]
+            rowtot[b] = acc + self.sink
+        return w, rowtot
+
+    def _select_blocks(self, attn: list[float], budget_blocks: int) -> list[int]:
+        """Greedy gain(b|R) over one span's blocks; returns local indices."""
+        n = len(attn)
+        k = min(budget_blocks, n)
+        if k <= 0:
+            return []
+        w, rowtot = self._closure_weights(n)
+        val = [attn[b] * (1.0 + b) ** -self.alpha for b in range(n)]
+
+        # seed the span head so this arm contains legolink-16
+        chosen = set(range(min(self.anchor_blocks, k, n)))
+        got = [0.0] * n
+        for j in chosen:
+            for b in range(j + 1, n):
+                got[b] += w[b - j] + (self.sink if j == 0 else 0.0)
+
+        while len(chosen) < k:
+            best, best_val = -1, -1.0
+            for b in range(n):
+                if b in chosen:
+                    continue
+                v = val[b] * (self.c + got[b]) / (self.c + rowtot[b])
+                if v > best_val:
+                    best, best_val = b, v
+            if best < 0:
+                break
+            chosen.add(best)
+            for b in range(best + 1, n):
+                got[b] += w[b - best] + (self.sink if best == 0 else 0.0)
+        return sorted(chosen)
+
+    @staticmethod
+    def _span_ranges(
+        request: "Request", num_computed_tokens: int
+    ) -> list[tuple[int, int]]:
+        """Computed [start, end) of each span, clipped to the computed prefix."""
+        ranges = getattr(request, "pic_token_ranges", None)
+        if not ranges:
+            starts = sorted(request.span_starts or [])
+            ranges = [
+                (s, starts[i + 1] if i + 1 < len(starts) else None)
+                for i, s in enumerate(starts)
+            ]
+        out = [
+            (s, num_computed_tokens if e is None else min(e, num_computed_tokens))
+            for s, e in ranges
+            if s < num_computed_tokens
+        ]
+        return sorted(r for r in out if r[1] > r[0])
+
+    def get_gaps(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> list[tuple[int, int]]:
+        if num_computed_tokens == 0:
+            return []
+
+        importance = getattr(request, "qcfuse_importance", None)
+        if importance is None:
+            return []
+
+        # spans end at their cross boundary (pic_token_ranges), not the next start
+        ranges = self._span_ranges(request, num_computed_tokens)
+        if not ranges:
+            return []
+
+        bs = self.block_size
+        budget_blocks = self.k_per_span // bs
+        if budget_blocks <= 0:
+            return []
+
+        selected: list[int] = []
+        for start, end in ranges:
+            blk0 = start // bs
+            n_blk = min(end // bs, len(importance) // bs) - blk0
+            if n_blk <= 0:
+                continue
+            attn = [
+                sum(importance[(blk0 + b) * bs : (blk0 + b + 1) * bs])
+                for b in range(n_blk)
+            ]
+            selected.extend(blk0 + b for b in self._select_blocks(attn, budget_blocks))
+
+        if not selected:
+            return []
+
+        # coalesce adjacent blocks into one gap
+        gaps: list[tuple[int, int]] = []
+        for blk in sorted(set(selected)):
+            if gaps and gaps[-1][1] == blk * bs:
+                gaps[-1] = (gaps[-1][0], (blk + 1) * bs)
+            else:
+                gaps.append((blk * bs, (blk + 1) * bs))
+
+        # SPANS: same recompute-once-per-unique-prefix dedup as the others.
+        sources = request.prefix_hit_sources
+        if sources is not None:
+            kept = []
+            for s, e in gaps:
+                blocks = range(s // bs, min(e // bs, len(sources)))
+                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
+                    continue
+                kept.append((s, e))
+            gaps = kept
+
+        logger.info(
+            "NeighborAware selected %d gaps (%d blocks over %d spans, %d tok/span) "
+            "for request %s",
+            len(gaps),
+            len(set(selected)),
+            len(ranges),
+            self.k_per_span,
+            request.request_id,
+        )
+        return gaps
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
@@ -464,6 +620,7 @@ class GapPolicyFactory:
         "none": NoGapPolicy,
         "span_aware": SpanAwareGapPolicy,
         "qcfuse": QCFusePolicy,
+        "neighbor_aware": NeighborAwarePolicy,
     }
 
     @classmethod
