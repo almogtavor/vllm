@@ -42,6 +42,7 @@ from vllm.v1.core.sched.gap_policy import (
     NO_SPAN_GAPS,
     GapPolicy,
     GapPolicyFactory,
+    QCFusePolicy,
     schedule_span_gaps,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -51,6 +52,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.qcfuse_store import QCFuseImportanceStore
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -168,6 +170,11 @@ class Scheduler(SchedulerInterface):
                 self.scheduler_config.gap_policy_name,
                 self.scheduler_config.gap_policy_config,
             )
+
+        # QCFUSE: importance from the worker probe, keyed by block hash
+        self.qcfuse_store: QCFuseImportanceStore | None = None
+        if isinstance(self.gap_policy, QCFusePolicy):
+            self.qcfuse_store = QCFuseImportanceStore(self.gap_policy.block_size)
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -802,6 +809,16 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
+                    # QCFUSE: reuse importance measured on earlier requests
+                    if (
+                        self.qcfuse_store is not None
+                        and did_prefix_lookup
+                        and request.qcfuse_importance is None
+                    ):
+                        request.qcfuse_importance = self.qcfuse_store.lookup(
+                            request.block_hashes, num_computed_tokens
+                        )
+
                     # SPANS: reserve gap-recompute work and defer the parent one
                     # step so the recompute runs before the parent prefill/decode.
                     gap_result = schedule_span_gaps(
@@ -1144,6 +1161,9 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        # SPANS: gap blocks were freed; the request re-selects on its next prefix lookup
+        request.pending_span_gaps = []
+        request.span_gaps_selection = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1557,6 +1577,15 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
             )
+
+        # QCFUSE: store the worker probe's importance for later requests
+        if model_runner_output.qcfuse_importance and self.qcfuse_store is not None:
+            for req_id, importance in model_runner_output.qcfuse_importance.items():
+                req = self.requests.get(req_id)
+                if req is None:
+                    continue
+                req.qcfuse_importance = importance
+                self.qcfuse_store.store(req.block_hashes, importance)
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).

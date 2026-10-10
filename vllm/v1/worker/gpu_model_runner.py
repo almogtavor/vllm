@@ -125,6 +125,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1.attention import qcfuse
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -820,6 +821,14 @@ class GPUModelRunner(
                 )
                 # per-slot live length, to clear stale tails on slot reuse
                 self._spans_lb_len = [0] * self.max_num_reqs
+        # QCFUSE: importance probe, allocated only under the knob
+        self.qcfuse_capturer = None
+        self._qcfuse_descs: list[tuple[int, int, int, int]] = []
+        if qcfuse.probe_enabled() and qcfuse.parse_critical_layers():
+            self.qcfuse_capturer = qcfuse.QCFuseImportanceCapturer(
+                self.max_num_reqs, self.max_model_len, self.device
+            )
+            qcfuse.bind_capturer(self.qcfuse_capturer)
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -2081,6 +2090,21 @@ class GPUModelRunner(
                     staging[base:base + n], non_blocking=True
                 )
 
+        # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
+        if self.qcfuse_capturer is not None:
+            descs = []
+            bs = self.cache_config.block_size
+            for i in range(num_reqs):
+                nsched = int(num_scheduled_tokens[i])
+                ctx = int(self.input_batch.num_computed_tokens_cpu[i])
+                req = self.requests[self.input_batch.req_ids[i]]
+                if req.is_gap_recompute or nsched <= 1 or ctx < bs:
+                    continue
+                q_end = int(cu_num_tokens[i])
+                q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
+                descs.append((i, q_start, q_end, min(ctx, self.max_model_len)))
+            self._qcfuse_descs = descs
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2450,6 +2474,9 @@ class GPUModelRunner(
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
+
+        if self.qcfuse_capturer is not None:
+            self.qcfuse_capturer.begin_step(block_table_gid_0, self._qcfuse_descs)
 
         # print("==================MODULES===============")
 
@@ -5032,6 +5059,17 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        # QCFUSE: copy the probed importance to host
+        qcfuse_importance = None
+        if self.qcfuse_capturer is not None and self._qcfuse_descs:
+            buf = self.qcfuse_capturer.buffer
+            qcfuse_importance = {
+                self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
+                for row, _, _, ctx in self._qcfuse_descs
+            }
+            self._qcfuse_descs = []
+            self.qcfuse_capturer.end_step()
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -5046,6 +5084,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                qcfuse_importance=qcfuse_importance,
             )
 
         # Handle virtual gap requests: cleanup only (KV written directly to parent)
