@@ -791,9 +791,35 @@ class GPUModelRunner(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
         if envs.VLLM_V1_SPANS_ENABLED:
-            # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
-            self._attn_lower_bounds_gpu: torch.Tensor | None = None
-            self._req_kv_starts_gpu: torch.Tensor | None = None
+            # SPANS: fixed-address strided lower bounds, so CUDA graphs stay valid
+            self._spans_lb_stride = self.model_config.max_model_len
+            _lb_n = self.max_num_reqs * self._spans_lb_stride
+            _LB_MAX = 1 << 28  # 1 GiB of int32
+            if _lb_n > _LB_MAX:
+                # stride 0 = packed per-forward layout, eager only
+                logger.warning(
+                    "SPANS: lower-bound buffer would be %.1f GiB "
+                    "(max_num_seqs=%d x max_model_len=%d); keeping the eager path.",
+                    _lb_n * 4 / 2**30, self.max_num_reqs, self._spans_lb_stride,
+                )
+                self._spans_lb_stride = 0
+                self._attn_lower_bounds_gpu: torch.Tensor | None = None
+                self._req_kv_starts_gpu: torch.Tensor | None = None
+                self._spans_lb_staging = None
+                self._spans_lb_len = []
+            else:
+                self._attn_lower_bounds_gpu = torch.zeros(
+                    _lb_n, dtype=torch.int32, device=self.device
+                )
+                self._req_kv_starts_gpu = torch.arange(
+                    self.max_num_reqs + 1, dtype=torch.int32, device=self.device
+                ) * self._spans_lb_stride
+                # pinned, or non_blocking copies are synchronous
+                self._spans_lb_staging = torch.zeros(
+                    _lb_n, dtype=torch.int32, pin_memory=True
+                )
+                # per-slot live length, to clear stale tails on slot reuse
+                self._spans_lb_len = [0] * self.max_num_reqs
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -2029,12 +2055,31 @@ class GPUModelRunner(
                         spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._spans_prerotate_safe = spans_prerotate_safe
-            self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True
-            )
-            self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True
-            )
+            # copy the packed bounds into the strided buffer in place
+            stride = self._spans_lb_stride
+            staging = self._spans_lb_staging
+            _scatter_reqs = num_reqs if stride else 0
+            if not stride:
+                self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
+                    self.device, non_blocking=True
+                )
+                self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
+                    self.device, non_blocking=True
+                )
+            for i in range(_scatter_reqs):
+                lo, hi = int(req_kv_starts[i]), int(req_kv_starts[i + 1])
+                n = min(hi - lo, stride)
+                base = i * stride
+                prev = self._spans_lb_len[i]
+                if prev > n:
+                    self._attn_lower_bounds_gpu[base + n:base + prev].zero_()
+                self._spans_lb_len[i] = n
+                if n <= 0:
+                    continue
+                staging[base:base + n] = torch.from_numpy(attn_lb[lo:lo + n])
+                self._attn_lower_bounds_gpu[base:base + n].copy_(
+                    staging[base:base + n], non_blocking=True
+                )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -4190,6 +4235,18 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        # SPANS: decode-only graphs; capture (force_uniform_decode) is left alone
+        if (
+            envs.VLLM_V1_SPANS_ENABLED
+            and not force_eager
+            and force_uniform_decode is None
+        ):
+            force_eager = (
+                not getattr(self, "_spans_lb_stride", 0)
+                or not envs.VLLM_V1_SPANS_CUDAGRAPH
+                or max_num_scheduled_tokens > 1
+            )
+
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -6960,6 +7017,12 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED and not envs.VLLM_V1_SPANS_CUDAGRAPH:
+            logger.warning(
+                "Skipping CUDA graph capture for spans (VLLM_V1_SPANS_CUDAGRAPH=0)."
+            )
+            return 0
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "

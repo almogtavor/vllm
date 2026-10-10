@@ -261,6 +261,8 @@ if TYPE_CHECKING:
 
     # spans vars
     VLLM_V1_SPANS_ENABLED: bool = False
+    # CUDA graphs on spans decode; 0 forces eager
+    VLLM_V1_SPANS_CUDAGRAPH: bool = True
     VLLM_V1_SPANS_DEBUG: bool = False
     VLLM_V1_SPANS_PAD_TOKEN: int = -1
     VLLM_V1_SPANS_BLOCK_SIZE: int = 0
@@ -1702,6 +1704,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
+    .lower()
+    in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
     "VLLM_V1_SPANS_DEBUG": lambda: os.environ.get("VLLM_V1_SPANS_DEBUG", "False")
