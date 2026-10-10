@@ -104,10 +104,7 @@ def schedule_span_gaps(
     if request.pending_span_gaps:
         span_gaps = request.pending_span_gaps
     elif did_prefix_lookup and sched.gap_policy is not None:
-        # Select once per (request, prefix length). This path re-runs on every
-        # step until the gap work fits, and the worker probe rewrites
-        # qcfuse_importance between steps, so an unmemoized policy hands back a
-        # different block set each time instead of converging.
+        # memoize per (request, prefix length): the probe rewrites importance between retries
         memo = request.span_gaps_selection
         if memo is not None and memo[0] == num_computed_tokens:
             span_gaps = list(memo[1])
