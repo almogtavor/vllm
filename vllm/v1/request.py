@@ -277,6 +277,9 @@ class Request:
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
 
+    def in_pic_span(self, pos: int) -> bool:
+        return any(s <= pos and (e is None or pos < e) for s, e in self.pic_token_ranges)
+
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None

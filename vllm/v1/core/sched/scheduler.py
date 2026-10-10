@@ -43,6 +43,7 @@ from vllm.v1.core.sched.gap_policy import (
     GapPolicy,
     GapPolicyFactory,
     QCFusePolicy,
+    miss_gaps,
     schedule_span_gaps,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -777,7 +778,9 @@ class Scheduler(SchedulerInterface):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            # MISS placeholders are recomputed, not cached
+                            num_local_cached_tokens=num_new_local_computed_tokens
+                            - len(miss_gaps(request, self.block_size)) * self.block_size,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                 else:

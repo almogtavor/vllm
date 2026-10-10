@@ -51,6 +51,16 @@ def split_gaps_for_budget(
     return scheduled, remaining
 
 
+def miss_gaps(request: "Request", block_size: int) -> list[tuple[int, int]]:
+    """Forced gaps over the dual lookup's MISS placeholders, whatever the policy."""
+    sources = request.prefix_hit_sources or []
+    return [
+        (i * block_size, (i + 1) * block_size)
+        for i, src in enumerate(sources)
+        if src == PrefixHitSource.MISS
+    ]
+
+
 def append_virtual_gap_reqs(
     parent_nrd: NewRequestData,
     gaps: list[tuple[int, int]],
@@ -115,6 +125,8 @@ def schedule_span_gaps(
             request.span_gaps_selection = (num_computed_tokens, list(span_gaps))
     else:
         span_gaps = []
+    if did_prefix_lookup and not request.pending_span_gaps:
+        span_gaps = span_gaps + miss_gaps(request, sched.block_size)
     if did_prefix_lookup and sched.connector is not None:
         connector_gaps = sched.connector.get_computed_token_gaps(request)
         if connector_gaps:
