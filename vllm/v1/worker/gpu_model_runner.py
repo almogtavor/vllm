@@ -2054,6 +2054,7 @@ class GPUModelRunner(
                     ):
                         spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
+            self._spans_prerotate_safe = spans_prerotate_safe
             # copy the packed bounds into the strided buffer in place
             stride = self._spans_lb_stride
             staging = self._spans_lb_staging
