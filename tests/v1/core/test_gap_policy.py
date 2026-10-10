@@ -104,3 +104,16 @@ def test_miss_gaps_cover_only_miss_blocks():
     assert miss_gaps(req, 16) == [(0, 16), (16, 32), (64, 80)]
     req.prefix_hit_sources = None
     assert miss_gaps(req, 16) == []
+
+
+def test_qcfuse_selects_inside_spans_only(monkeypatch):
+    from vllm.v1.core.sched.gap_policy import QCFusePolicy
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    req = make_span_request(160, span_starts=[64])
+    imp = [0.0] * 160
+    imp[0] = 100.0  # the sink: exact prefix, never worth recomputing
+    imp[85] = 1.0
+    assert QCFusePolicy(k_per_span=16)._select(req, imp, 160) == [(80, 96)]
+    assert QCFusePolicy(rho=0.2)._select(req, imp, 160) == [(80, 96)]

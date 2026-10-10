@@ -374,7 +374,7 @@ def _drop_pd_gaps(
 class QCFusePolicy(GapPolicy):
     """Recompute the cached tokens with the most query attention.
 
-    Budget is ``k_per_span`` tokens per span, else ``rho`` of the cached tokens.
+    Budget is ``k_per_span`` tokens per span, else ``rho`` of each span's tokens.
     """
 
     def __init__(
@@ -417,32 +417,44 @@ class QCFusePolicy(GapPolicy):
         )
         return gaps
 
+    @staticmethod
+    def _span_ranges(
+        request: "Request", num_computed_tokens: int
+    ) -> list[tuple[int, int]]:
+        """Computed [start, end) of each span, clipped to the computed prefix."""
+        ranges = getattr(request, "pic_token_ranges", None)
+        if not ranges:
+            starts = sorted(request.span_starts or [])
+            ranges = [
+                (s, starts[i + 1] if i + 1 < len(starts) else None)
+                for i, s in enumerate(starts)
+            ]
+        out = [
+            (s, num_computed_tokens if e is None else min(e, num_computed_tokens))
+            for s, e in ranges
+            if s < num_computed_tokens
+        ]
+        return sorted(r for r in out if r[1] > r[0])
+
     def _select(
         self, request: "Request", importance: list[float], n: int
     ) -> list[tuple[int, int]]:
-        # same total budget as legolink-K: K tokens per span
-        if self.k_per_span > 0:
-            n_spans = sum(1 for s in request.span_starts or [] if s < n) or 1
-            budget = min(self.k_per_span * n_spans, n)
-        else:
-            budget = int(self.rho * n)
-        if budget <= 0:
-            return []
-
-        bs = self.block_size
-        if self.granularity == "token":
-            ranked = sorted(
-                range(min(len(importance), n)),
-                key=lambda t: importance[t],
-                reverse=True,
-            )[:budget]
-            return [(t, t + 1) for t in sorted(ranked)]
-        scores = sorted(
-            ((sum(importance[b * bs : (b + 1) * bs]), b) for b in range(n // bs)),
-            reverse=True,
-        )
-        keep = sorted(b for _, b in scores[: max(1, budget // bs)])
-        return [(b * bs, (b + 1) * bs) for b in keep]
+        # TopK inside each span: prefix blocks are already exact
+        bs, gaps = self.block_size, []
+        for start, end in self._span_ranges(request, n):
+            budget = self.k_per_span or int(self.rho * (end - start))
+            if budget <= 0:
+                continue
+            if self.granularity == "token":
+                end = min(end, len(importance))
+                ranked = sorted(range(start, end), key=lambda t: -importance[t])
+                gaps += [(t, t + 1) for t in sorted(ranked[:budget])]
+                continue
+            blocks = range(start // bs, min(end // bs, len(importance) // bs))
+            mass = {b: sum(importance[b * bs : (b + 1) * bs]) for b in blocks}
+            top = sorted(blocks, key=lambda b: -mass[b])[: max(1, budget // bs)]
+            gaps += [(b * bs, (b + 1) * bs) for b in sorted(top)]
+        return gaps
 
 
 class NeighborAwarePolicy(QCFusePolicy):
@@ -499,25 +511,6 @@ class NeighborAwarePolicy(QCFusePolicy):
                 )
             )
         return sorted(chosen)
-
-    @staticmethod
-    def _span_ranges(
-        request: "Request", num_computed_tokens: int
-    ) -> list[tuple[int, int]]:
-        """Computed [start, end) of each span, clipped to the computed prefix."""
-        ranges = getattr(request, "pic_token_ranges", None)
-        if not ranges:
-            starts = sorted(request.span_starts or [])
-            ranges = [
-                (s, starts[i + 1] if i + 1 < len(starts) else None)
-                for i, s in enumerate(starts)
-            ]
-        out = [
-            (s, num_computed_tokens if e is None else min(e, num_computed_tokens))
-            for s, e in ranges
-            if s < num_computed_tokens
-        ]
-        return sorted(r for r in out if r[1] > r[0])
 
     def _select(
         self, request: "Request", importance: list[float], n: int
