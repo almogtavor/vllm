@@ -39,8 +39,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.qcfuse import get_capturer as get_qcfuse_capturer
-from vllm.v1.attention.qcfuse import parse_critical_layers
-from vllm.v1.attention.qcfuse import probe_enabled as qcfuse_probe_enabled
+from vllm.v1.attention.qcfuse import parse_critical_layers, probe_enabled
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -399,10 +398,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # QCFUSE: probe only critical layers; off keeps the graph unchanged
         from vllm.model_executor.models.utils import extract_layer_index
 
-        self.qcfuse_layer_idx = extract_layer_index(prefix)
-        self.qcfuse_capture = (
-            qcfuse_probe_enabled()
-            and self.qcfuse_layer_idx in parse_critical_layers()
+        self.qcfuse_capture = probe_enabled() and (
+            extract_layer_index(prefix) in parse_critical_layers()
         )
 
         compilation_config = vllm_config.compilation_config
@@ -756,17 +753,12 @@ def qcfuse_capture_importance(
     kv_cache_dummy_dep: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
-    """QCFUSE: accumulate query-to-context attention mass; reads K only.
-
-    Threads the kv-cache dummy dep so it stays ordered after the KV write.
-    """
-    del kv_cache_dummy_dep
+    """QCFUSE: accumulate attention mass; the dummy dep orders it after the KV write."""
     layer_name = _resolve_layer_name(layer_name)
     _, attn_layer, kv_cache, _ = get_attention_context(layer_name)
     capturer = get_qcfuse_capturer()
     if capturer is not None:
         capturer.capture(
-            attn_layer.qcfuse_layer_idx,
             query,
             kv_cache,
             attn_layer.num_heads // attn_layer.num_kv_heads,

@@ -2072,7 +2072,6 @@ class EngineArgs:
             if gap_policy_name in ("qcfuse", "neighbor_aware"):
                 config: dict[str, Any] = {
                     "rho": envs.VLLM_V1_SPANS_QCFUSE_RHO,
-                    "critical_layers": envs.VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS,
                     "granularity": envs.VLLM_V1_SPANS_QCFUSE_GRANULARITY,
                     "k_per_span": envs.VLLM_V1_SPANS_QCFUSE_K_PER_SPAN,
                 }

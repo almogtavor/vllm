@@ -342,63 +342,52 @@ class SpanAwareGapPolicy(GapPolicy):
         )
 
 
-class QCFusePolicy(GapPolicy):
-    """Recompute the cached tokens with the most query attention, on all layers.
+def _drop_pd_gaps(
+    request: "Request", gaps: list[tuple[int, int]], bs: int
+) -> list[tuple[int, int]]:
+    """Drop gaps whose blocks all hit a pd copy (recompute once per prefix)."""
+    sources = request.prefix_hit_sources
+    if sources is None:
+        return gaps
+    return [
+        (s, e)
+        for s, e in gaps
+        if not (
+            (blocks := range(s // bs, min(e // bs, len(sources))))
+            and all(sources[b] == PrefixHitSource.PD for b in blocks)
+        )
+    ]
 
-    The budget is ``k_per_span`` tokens per span, or ``rho`` of the cached
-    tokens when ``k_per_span`` is 0. Block granularity keeps gaps aligned with
-    the PIC/PD swap; token granularity is an ablation.
+
+class QCFusePolicy(GapPolicy):
+    """Recompute the cached tokens with the most query attention.
+
+    Budget is ``k_per_span`` tokens per span, else ``rho`` of the cached tokens.
     """
 
     def __init__(
         self,
         rho: float = 0.1,
-        critical_layers: str | tuple[int, ...] = (),
         block_size: int = 16,
         granularity: str = "block",
         k_per_span: int = 0,
     ):
-        if isinstance(critical_layers, str):
-            critical_layers = tuple(
-                int(x) for x in critical_layers.split(",") if x.strip()
-            )
-        else:
-            critical_layers = tuple(critical_layers)
+        from vllm.v1.attention.qcfuse import parse_critical_layers
+
         # ValueError, since create_policy() swallows TypeError into NoGapPolicy
-        if not critical_layers:
-            raise ValueError(
-                "QCFusePolicy requires critical_layers (offline-profiled per "
-                "model); set VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS."
-            )
-        if not 0.0 < rho <= 1.0:
-            raise ValueError(f"QCFusePolicy rho must be in (0, 1], got {rho}")
-        if granularity not in ("block", "token"):
-            raise ValueError(
-                f"QCFusePolicy granularity must be block|token, got {granularity}"
-            )
+        if not parse_critical_layers():
+            raise ValueError("QCFuse needs VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS")
+        if not 0.0 < rho <= 1.0 or granularity not in ("block", "token"):
+            raise ValueError(f"QCFuse: bad rho={rho} or granularity={granularity}")
         if k_per_span < 0:
-            raise ValueError(f"QCFusePolicy k_per_span must be >= 0, got {k_per_span}")
+            raise ValueError(f"QCFuse: k_per_span must be >= 0, got {k_per_span}")
         # without prerotate the span head carries a positional error QCFuse ignores
         if not envs.VLLM_V1_SPANS_PREROTATE:
-            raise ValueError(
-                "QCFusePolicy requires VLLM_V1_SPANS_PREROTATE=True: without the "
-                "K position remap the span boundary carries a positional error "
-                "that attention-mass selection does not address."
-            )
+            raise ValueError("QCFuse requires VLLM_V1_SPANS_PREROTATE=True")
         self.rho = rho
-        self.critical_layers = critical_layers
         self.block_size = block_size
         self.granularity = granularity
         self.k_per_span = k_per_span
-
-        logger.info(
-            "QCFusePolicy initialized: rho=%.3f k_per_span=%d critical_layers=%s "
-            "granularity=%s",
-            rho,
-            k_per_span,
-            list(critical_layers),
-            granularity,
-        )
 
     def get_gaps(
         self,
@@ -406,61 +395,42 @@ class QCFusePolicy(GapPolicy):
         num_computed_tokens: int,
         num_external_tokens: int,
     ) -> list[tuple[int, int]]:
-        if num_computed_tokens == 0:
-            return []
-
         importance = getattr(request, "qcfuse_importance", None)
-        if importance is None:
+        if num_computed_tokens == 0 or importance is None:
             return []
+        gaps = self._select(request, importance, num_computed_tokens)
+        gaps = _drop_pd_gaps(request, gaps, self.block_size)
+        logger.info(
+            "%s: %d gaps for %s", type(self).__name__, len(gaps), request.request_id
+        )
+        return gaps
 
+    def _select(
+        self, request: "Request", importance: list[float], n: int
+    ) -> list[tuple[int, int]]:
         # same total budget as legolink-K: K tokens per span
         if self.k_per_span > 0:
-            spans = request.span_starts or []
-            n_spans = sum(1 for s in spans if s < num_computed_tokens) or 1
-            budget = min(self.k_per_span * n_spans, num_computed_tokens)
+            n_spans = sum(1 for s in request.span_starts or [] if s < n) or 1
+            budget = min(self.k_per_span * n_spans, n)
         else:
-            budget = int(self.rho * num_computed_tokens)
+            budget = int(self.rho * n)
         if budget <= 0:
             return []
 
         bs = self.block_size
-        if self.granularity == "block":
-            num_blocks = num_computed_tokens // bs
-            if num_blocks == 0:
-                return []
-            scores = [
-                (sum(importance[b * bs : (b + 1) * bs]), b) for b in range(num_blocks)
-            ]
-            scores.sort(reverse=True)
-            keep = sorted(b for _, b in scores[: max(1, budget // bs)])
-            gaps = [(b * bs, (b + 1) * bs) for b in keep]
-        else:
+        if self.granularity == "token":
             ranked = sorted(
-                range(min(len(importance), num_computed_tokens)),
+                range(min(len(importance), n)),
                 key=lambda t: importance[t],
                 reverse=True,
             )[:budget]
-            gaps = [(t, t + 1) for t in sorted(ranked)]
-
-        # SPANS: same recompute-once-per-unique-prefix dedup as SpanAwareGapPolicy.
-        sources = request.prefix_hit_sources
-        if sources is not None:
-            kept = []
-            for s, e in gaps:
-                blocks = range(s // bs, min(e // bs, len(sources)))
-                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
-                    continue
-                kept.append((s, e))
-            gaps = kept
-
-        logger.info(
-            "QCFuse selected %d gaps (rho=%.3f, budget=%d tok) for request %s",
-            len(gaps),
-            self.rho,
-            budget,
-            request.request_id,
+            return [(t, t + 1) for t in sorted(ranked)]
+        scores = sorted(
+            ((sum(importance[b * bs : (b + 1) * bs]), b) for b in range(n // bs)),
+            reverse=True,
         )
-        return gaps
+        keep = sorted(b for _, b in scores[: max(1, budget // bs)])
+        return [(b * bs, (b + 1) * bs) for b in keep]
 
 
 class NeighborAwarePolicy(QCFusePolicy):
@@ -478,11 +448,7 @@ class NeighborAwarePolicy(QCFusePolicy):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.k_per_span <= 0:
-            raise ValueError(
-                "NeighborAwarePolicy requires k_per_span > 0 "
-                "(set VLLM_V1_SPANS_QCFUSE_K_PER_SPAN)."
-            )
-        logger.info("NeighborAwarePolicy initialized: k_per_span=%d", self.k_per_span)
+            raise ValueError("NeighborAware needs VLLM_V1_SPANS_QCFUSE_K_PER_SPAN")
 
     def _closure_weights(self, n: int) -> tuple[list[float], list[float]]:
         """Kernel weight by block distance, and each row's total incl. the sink."""
@@ -502,27 +468,24 @@ class NeighborAwarePolicy(QCFusePolicy):
             return []
         w, rowtot = self._closure_weights(n)
         val = [attn[b] * (1.0 + b) ** -self.alpha for b in range(n)]
-
-        # seed the span head so this arm contains legolink-16
-        chosen = set(range(min(self.anchor_blocks, k, n)))
         got = [0.0] * n
-        for j in chosen:
+        chosen: set[int] = set()
+
+        def add(j: int) -> None:
+            chosen.add(j)
             for b in range(j + 1, n):
                 got[b] += w[b - j] + (self.sink if j == 0 else 0.0)
 
+        # seed the span head so this arm contains legolink-16
+        for j in range(min(self.anchor_blocks, k)):
+            add(j)
         while len(chosen) < k:
-            best, best_val = -1, -1.0
-            for b in range(n):
-                if b in chosen:
-                    continue
-                v = val[b] * (self.c + got[b]) / (self.c + rowtot[b])
-                if v > best_val:
-                    best, best_val = b, v
-            if best < 0:
-                break
-            chosen.add(best)
-            for b in range(best + 1, n):
-                got[b] += w[b - best] + (self.sink if best == 0 else 0.0)
+            add(
+                max(
+                    (b for b in range(n) if b not in chosen),
+                    key=lambda b: val[b] * (self.c + got[b]) / (self.c + rowtot[b]),
+                )
+            )
         return sorted(chosen)
 
     @staticmethod
@@ -544,72 +507,30 @@ class NeighborAwarePolicy(QCFusePolicy):
         ]
         return sorted(r for r in out if r[1] > r[0])
 
-    def get_gaps(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-        num_external_tokens: int,
+    def _select(
+        self, request: "Request", importance: list[float], n: int
     ) -> list[tuple[int, int]]:
-        if num_computed_tokens == 0:
-            return []
-
-        importance = getattr(request, "qcfuse_importance", None)
-        if importance is None:
-            return []
-
-        # spans end at their cross boundary (pic_token_ranges), not the next start
-        ranges = self._span_ranges(request, num_computed_tokens)
-        if not ranges:
-            return []
-
         bs = self.block_size
-        budget_blocks = self.k_per_span // bs
-        if budget_blocks <= 0:
-            return []
-
-        selected: list[int] = []
-        for start, end in ranges:
+        selected: set[int] = set()
+        # spans end at their cross boundary (pic_token_ranges), not the next start
+        for start, end in self._span_ranges(request, n):
             blk0 = start // bs
             n_blk = min(end // bs, len(importance) // bs) - blk0
-            if n_blk <= 0:
-                continue
             attn = [
                 sum(importance[(blk0 + b) * bs : (blk0 + b + 1) * bs])
-                for b in range(n_blk)
+                for b in range(max(0, n_blk))
             ]
-            selected.extend(blk0 + b for b in self._select_blocks(attn, budget_blocks))
-
-        if not selected:
-            return []
+            selected.update(
+                blk0 + b for b in self._select_blocks(attn, self.k_per_span // bs)
+            )
 
         # coalesce adjacent blocks into one gap
         gaps: list[tuple[int, int]] = []
-        for blk in sorted(set(selected)):
+        for blk in sorted(selected):
             if gaps and gaps[-1][1] == blk * bs:
                 gaps[-1] = (gaps[-1][0], (blk + 1) * bs)
             else:
                 gaps.append((blk * bs, (blk + 1) * bs))
-
-        # SPANS: same recompute-once-per-unique-prefix dedup as the others.
-        sources = request.prefix_hit_sources
-        if sources is not None:
-            kept = []
-            for s, e in gaps:
-                blocks = range(s // bs, min(e // bs, len(sources)))
-                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
-                    continue
-                kept.append((s, e))
-            gaps = kept
-
-        logger.info(
-            "NeighborAware selected %d gaps (%d blocks over %d spans, %d tok/span) "
-            "for request %s",
-            len(gaps),
-            len(set(selected)),
-            len(ranges),
-            self.k_per_span,
-            request.request_id,
-        )
         return gaps
 
 

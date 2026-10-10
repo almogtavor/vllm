@@ -125,6 +125,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1.attention import qcfuse
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -141,13 +142,6 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.attention.qcfuse import (
-    QCFUSE_MAX_QUERY_TOKENS,
-    QCFuseImportanceCapturer,
-    parse_critical_layers,
-)
-from vllm.v1.attention.qcfuse import bind_capturer as qcfuse_bind_capturer
-from vllm.v1.attention.qcfuse import probe_enabled as qcfuse_probe_enabled
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -828,16 +822,13 @@ class GPUModelRunner(
                 # per-slot live length, to clear stale tails on slot reuse
                 self._spans_lb_len = [0] * self.max_num_reqs
         # QCFUSE: importance probe, allocated only under the knob
-        self.qcfuse_capturer: QCFuseImportanceCapturer | None = None
+        self.qcfuse_capturer = None
         self._qcfuse_descs: list[tuple[int, int, int, int]] = []
-        if qcfuse_probe_enabled() and parse_critical_layers():
-            self.qcfuse_capturer = QCFuseImportanceCapturer(
-                self.max_num_reqs,
-                self.max_model_len,
-                self.cache_config.block_size,
-                self.device,
+        if qcfuse.probe_enabled() and qcfuse.parse_critical_layers():
+            self.qcfuse_capturer = qcfuse.QCFuseImportanceCapturer(
+                self.max_num_reqs, self.max_model_len, self.device
             )
-            qcfuse_bind_capturer(self.qcfuse_capturer)
+            qcfuse.bind_capturer(self.qcfuse_capturer)
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -2101,7 +2092,7 @@ class GPUModelRunner(
 
         # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
         if self.qcfuse_capturer is not None:
-            descs: list[tuple[int, int, int, int]] = []
+            descs = []
             bs = self.cache_config.block_size
             for i in range(num_reqs):
                 nsched = int(num_scheduled_tokens[i])
@@ -2110,7 +2101,7 @@ class GPUModelRunner(
                 if req.is_gap_recompute or nsched <= 1 or ctx < bs:
                     continue
                 q_end = int(cu_num_tokens[i])
-                q_start = max(q_end - nsched, q_end - QCFUSE_MAX_QUERY_TOKENS)
+                q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
                 descs.append((i, q_start, q_end, min(ctx, self.max_model_len)))
             self._qcfuse_descs = descs
 
@@ -2484,7 +2475,6 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
-        # QCFUSE: hand this step's block table and probe rows to the capturer.
         if self.qcfuse_capturer is not None:
             self.qcfuse_capturer.begin_step(block_table_gid_0, self._qcfuse_descs)
 
@@ -5072,11 +5062,10 @@ class GPUModelRunner(
         # QCFUSE: copy the probed importance to host
         qcfuse_importance = None
         if self.qcfuse_capturer is not None and self._qcfuse_descs:
+            buf = self.qcfuse_capturer.buffer
             qcfuse_importance = {
-                self.input_batch.req_ids[row]: self.qcfuse_capturer.read_importance(
-                    row, ctx_len
-                )
-                for row, _, _, ctx_len in self._qcfuse_descs
+                self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
+                for row, _, _, ctx in self._qcfuse_descs
             }
             self._qcfuse_descs = []
             self.qcfuse_capturer.end_step()
