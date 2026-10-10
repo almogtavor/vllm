@@ -826,8 +826,7 @@ class GPUModelRunner(
                 )
                 # per-slot live length, to clear stale tails on slot reuse
                 self._spans_lb_len = [0] * self.max_num_reqs
-        # QCFUSE: worker-side importance probe. Allocated (and bound to the
-        # attention op) only under the knob, so the off path costs nothing.
+        # QCFUSE: importance probe, allocated only under the knob
         self.qcfuse_capturer: QCFuseImportanceCapturer | None = None
         self._qcfuse_descs: list[tuple[int, int, int, int]] = []
         if envs.VLLM_V1_SPANS_QCFUSE_ENABLE and parse_critical_layers():
@@ -2099,10 +2098,7 @@ class GPUModelRunner(
                     staging[base:base + n], non_blocking=True
                 )
 
-        # QCFUSE: pick the rows to probe this step. Only prefill-bearing rows
-        # qualify (nsched > 1), which is exactly the condition under which
-        # _select_cudagraph_mode already forces eager, so the probe can never
-        # run inside a captured graph.
+        # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
         if self.qcfuse_capturer is not None:
             descs: list[tuple[int, int, int, int]] = []
             bs = self.cache_config.block_size
@@ -5072,8 +5068,7 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        # QCFUSE: drain the probe rows to host. Only prefill steps carry
-        # descriptors, so decode pays nothing.
+        # QCFUSE: copy the probed importance to host
         qcfuse_importance = None
         if self.qcfuse_capturer is not None and self._qcfuse_descs:
             qcfuse_importance = {

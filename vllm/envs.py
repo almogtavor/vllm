@@ -1709,9 +1709,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
-    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get(
-        "VLLM_V1_SPANS_CUDAGRAPH", "True"
-    ).lower()
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
+    .lower()
     in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
@@ -1737,33 +1736,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # rotate K once per forward into a transient scratch (prefill batches)
     # instead of per-tile inside the attention kernel
-    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_PREROTATE", "True"
+    )
     == "True",
-    # QCFuse: recompute a query-selected SUBSET OF TOKENS across all layers.
-    # The critical layers are only the selection lens, not what gets recomputed.
+    # QCFuse: recompute a query-selected subset of cached tokens on all layers
     "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"
     )
     == "True",
-    # rho: fraction of cached context tokens to recompute (QCFuse's analog of
-    # legolink's gap length).
+    # fraction of cached tokens to recompute when K_PER_SPAN is 0
     "VLLM_V1_SPANS_QCFUSE_RHO": lambda: float(
         os.environ.get("VLLM_V1_SPANS_QCFUSE_RHO", "0.1")
     ),
-    # Comma-separated layer indices used as the importance selection lens.
-    # Model-specific and offline-profiled; empty is rejected at init rather
-    # than silently degrading to a no-op arm.
+    # comma-separated layers the importance probe runs on; required
     "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", ""
     ),
-    # "block" keeps gaps block-aligned so the PIC/PD swap stays correct;
-    # "token" is the fine-grained ablation and is guarded at init.
+    # "block" (block-aligned gaps) or "token"
     "VLLM_V1_SPANS_QCFUSE_GRANULARITY": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_GRANULARITY", "block"
     ),
-    # Budget-match this arm to legolink-K: K tokens per span, so both methods
-    # recompute the same total and the comparison isolates the selection rule.
-    # 0 falls back to the rho ratio.
+    # recompute budget of K tokens per span, matching legolink-K; 0 uses rho
     "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
         os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
     ),

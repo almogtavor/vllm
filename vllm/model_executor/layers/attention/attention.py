@@ -395,9 +395,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # and let torch.compile handle them.
         self.use_direct_call = not current_platform.opaque_attention_op()
 
-        # QCFUSE: static per-layer gate for the importance probe. When the knob
-        # is off this is False for every layer, so the op below never enters the
-        # traced graph and the forward is byte-identical to upstream.
+        # QCFUSE: probe only critical layers; off keeps the graph unchanged
         from vllm.model_executor.models.utils import extract_layer_index
 
         self.qcfuse_layer_idx = extract_layer_index(prefix)
@@ -757,12 +755,9 @@ def qcfuse_capture_importance(
     kv_cache_dummy_dep: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
-    """QCFUSE: accumulate this layer's query-to-context attention mass.
+    """QCFUSE: accumulate query-to-context attention mass; reads K only.
 
-    Selection-only: reads the paged K, writes nothing back to the cache. Takes
-    and returns the kv-cache dummy dep so torch.compile keeps this ordered
-    after the KV write and cannot eliminate the call; the returned dummy is
-    forwarded to ``unified_attention_with_output``.
+    Threads the kv-cache dummy dep so it stays ordered after the KV write.
     """
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)

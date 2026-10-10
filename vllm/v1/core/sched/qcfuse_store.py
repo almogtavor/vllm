@@ -1,18 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Content-keyed store for QCFuse importance.
+"""QCFuse importance keyed by prefix-cache block hash.
 
-``get_gaps`` is called once per request, from the waiting queue, *before* any
-forward pass for that request has run (``did_prefix_lookup`` is
-``request.num_computed_tokens == 0``). So a request can never consume its own
-probe. The probe's output is only useful to a *later* request that reuses the
-same cached prefix, which is exactly what this store keys on: per-block
-importance under that block's prefix-cache hash, mirroring how LegoQuest keyed
-its span-block selections.
-
-Nothing here changes ``QCFusePolicy.get_gaps``' contract - the scheduler
-populates ``request.qcfuse_importance`` from this store and the policy reads
-that field as before.
+A request's gaps are chosen before its own probe runs, so importance measured
+on one request is reused by later requests over the same blocks.
 """
 
 from collections import OrderedDict
@@ -34,12 +25,7 @@ class QCFuseImportanceStore:
         self._by_hash: OrderedDict[BlockHash, list[float]] = OrderedDict()
 
     def store(self, block_hashes: list[BlockHash], importance: list[float]) -> None:
-        """Split one request's importance vector into per-block entries.
-
-        Later measurements overwrite earlier ones: attention mass is measured
-        against whatever query followed the block, and the freshest query is
-        the better predictor of the next one.
-        """
+        """Store per-block importance; the newest measurement wins."""
         bs = self.block_size
         n = min(len(importance) // bs, len(block_hashes))
         for b in range(n):
@@ -52,12 +38,7 @@ class QCFuseImportanceStore:
     def lookup(
         self, block_hashes: list[BlockHash], num_computed_tokens: int
     ) -> list[float] | None:
-        """Reassemble an importance vector for a request's cached prefix.
-
-        Returns ``None`` when no block of the prefix has ever been measured, so
-        the policy falls back to "probe first, no gaps". Unmeasured blocks
-        inside a partially-known prefix score zero and are simply never picked.
-        """
+        """Importance for the cached prefix; unmeasured blocks score 0, None if all are."""
         bs = self.block_size
         n_blocks = num_computed_tokens // bs
         if n_blocks <= 0:

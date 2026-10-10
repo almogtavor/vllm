@@ -171,8 +171,7 @@ class Scheduler(SchedulerInterface):
                 self.scheduler_config.gap_policy_config,
             )
 
-        # QCFUSE: content-keyed importance measured by the worker probe. Only
-        # allocated for the qcfuse policy, so no other arm sees it.
+        # QCFUSE: importance from the worker probe, keyed by block hash
         self.qcfuse_store: QCFuseImportanceStore | None = None
         if isinstance(self.gap_policy, QCFusePolicy):
             self.qcfuse_store = QCFuseImportanceStore(self.gap_policy.block_size)
@@ -810,9 +809,7 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
-                    # QCFUSE: seed the request from importance the worker probe
-                    # measured on an earlier request over the same blocks, so
-                    # get_gaps below has a signal to select from.
+                    # QCFUSE: reuse importance measured on earlier requests
                     if (
                         self.qcfuse_store is not None
                         and did_prefix_lookup
@@ -1578,11 +1575,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
-        # QCFUSE: ingest the worker probe. The measuring request keeps its own
-        # copy (an override / debug handle); the durable path is the per-block
-        # store, which is what a later request reusing these blocks reads.
-        # Output field first: some tests drive update_from_output on a bare
-        # object.__new__(Scheduler) that never ran __init__.
+        # QCFUSE: store the worker probe's importance for later requests
         if model_runner_output.qcfuse_importance and self.qcfuse_store is not None:
             for req_id, importance in model_runner_output.qcfuse_importance.items():
                 req = self.requests.get(req_id)

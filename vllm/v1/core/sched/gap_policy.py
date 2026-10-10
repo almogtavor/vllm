@@ -337,23 +337,11 @@ class SpanAwareGapPolicy(GapPolicy):
 
 
 class QCFusePolicy(GapPolicy):
-    """QCFuse: recompute a query-selected subset of tokens across ALL layers.
+    """Recompute the cached tokens with the most query attention, on all layers.
 
-    Unlike SpanAwareGapPolicy, which recomputes a fixed-length head at each span
-    boundary, QCFuse recomputes ``floor(rho * N)`` of the cached tokens chosen by
-    query-to-context attention mass. The critical layers are only the cheap
-    selection lens that produces that importance signal -- they are not
-    themselves what gets recomputed.
-
-    The importance vector is produced worker-side and handed back through
-    ``request.qcfuse_importance``. Until it arrives this returns no gaps, so the
-    request is scheduled normally and the probe runs first.
-
-    Selection is block-granular by default: ``_span_swap_indices`` and the PD
-    dedup filter both truncate via ``end // block_size``, so a sub-block gap
-    would skip the PIC->PD swap and clobber a shared warmed block. Block
-    granularity preserves the rho budget exactly (in block quanta) while keeping
-    the existing gap plumbing correct and the gap count far below max_num_seqs.
+    The budget is ``k_per_span`` tokens per span, or ``rho`` of the cached
+    tokens when ``k_per_span`` is 0. Block granularity keeps gaps aligned with
+    the PIC/PD swap; token granularity is an ablation.
     """
 
     def __init__(
@@ -370,9 +358,7 @@ class QCFusePolicy(GapPolicy):
             )
         else:
             critical_layers = tuple(critical_layers)
-        # A silently-empty lens would make this arm a no-op that still reports as
-        # QCFuse, so refuse it. ValueError is deliberate: create_policy() catches
-        # only TypeError, so this propagates instead of degrading to NoGapPolicy.
+        # ValueError, since create_policy() swallows TypeError into NoGapPolicy
         if not critical_layers:
             raise ValueError(
                 "QCFusePolicy requires critical_layers (offline-profiled per "
@@ -386,12 +372,7 @@ class QCFusePolicy(GapPolicy):
             )
         if k_per_span < 0:
             raise ValueError(f"QCFusePolicy k_per_span must be >= 0, got {k_per_span}")
-        # The premise of selecting purely by attention mass is that the span
-        # boundary carries no special positional error: prerotate remaps K from
-        # span-local to request positions (QCFuse's Pi), leaving only contextual
-        # staleness, which is spread across the span rather than concentrated at
-        # its head. Without prerotate that premise is false and this arm would be
-        # measuring something else, so refuse to run rather than mislead.
+        # without prerotate the span head carries a positional error QCFuse ignores
         if not envs.VLLM_V1_SPANS_PREROTATE:
             raise ValueError(
                 "QCFusePolicy requires VLLM_V1_SPANS_PREROTATE=True: without the "
@@ -424,13 +405,9 @@ class QCFusePolicy(GapPolicy):
 
         importance = getattr(request, "qcfuse_importance", None)
         if importance is None:
-            # Probe has not run yet; schedule normally and select next step.
             return []
 
-        # k_per_span budget-matches this arm to legolink-K: legolink recomputes K
-        # tokens at each span head, so the same total is K * (number of spans).
-        # Matching the BUDGET is what makes the comparison a test of the
-        # selection rule (positional vs query-relevant) rather than of compute.
+        # same total budget as legolink-K: K tokens per span
         if self.k_per_span > 0:
             spans = request.span_starts or []
             n_spans = sum(1 for s in spans if s < num_computed_tokens) or 1
