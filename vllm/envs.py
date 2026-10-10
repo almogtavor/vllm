@@ -261,9 +261,7 @@ if TYPE_CHECKING:
 
     # spans vars
     VLLM_V1_SPANS_ENABLED: bool = False
-    # Capture CUDA graphs even with spans on. Safe since the span lower-bound
-    # buffer became persistent+strided (stable address, constant req_kv_starts).
-    # Set 0 to fall back to the old always-eager path when debugging spans.
+    # CUDA graphs on spans decode; 0 forces eager
     VLLM_V1_SPANS_CUDAGRAPH: bool = True
     VLLM_V1_SPANS_DEBUG: bool = False
     VLLM_V1_SPANS_PAD_TOKEN: int = -1
