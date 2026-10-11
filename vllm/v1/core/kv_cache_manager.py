@@ -238,7 +238,9 @@ class KVCacheManager:
                 )
             )
             request.prefix_hit_sources = hit_sources
-            num_misses = hit_sources.count(PrefixHitSource.MISS)
+            miss_tokens = (
+                hit_sources.count(PrefixHitSource.MISS) * self.coordinator.block_size
+            )
         else:
             computed_blocks, num_new_computed_tokens = (
                 self.coordinator.find_longest_cache_hit(
@@ -246,14 +248,13 @@ class KVCacheManager:
                 )
             )
             request.prefix_hit_sources = None
-            num_misses = 0
+            miss_tokens = 0  # hybrid coordinators have no block_size
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens
-                - num_misses * self.coordinator.block_size,
+                num_hits=num_new_computed_tokens - miss_tokens,
                 preempted=request.num_preemptions > 0,
             )
 
