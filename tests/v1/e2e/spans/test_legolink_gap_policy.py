@@ -126,9 +126,7 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
         ), "warmed span K/V already matches the reference; recompute is a no-op"
 
         # Phase 3: marked LL request hits prefix+span, recomputes, prefills, decodes.
-        marked_hashes = _request_block_hashes(
-            prompt, span_starts=span_starts, cross_span_starts=cross_span_starts
-        )
+        captured = _capture_request_block_ids(monkeypatch, llm)
         marked_out = generate_single_output(
             llm,
             prompt,
@@ -142,8 +140,13 @@ def test_legolink_recompute_precedes_cross_tail_and_decode_e2e(model, monkeypatc
         )
         cached_marked = marked_out.num_cached_tokens
         actual_top = extract_step0_topk(marked_out.outputs[0], LOGPROBS_TOPK)
-        actual_span_kv = [_block_kv(llm, h) for h in marked_hashes[2:4]]
-        actual_cross_tail_kv = [_block_kv(llm, h) for h in marked_hashes[4:6]]
+        block_ids = max(captured.values(), key=len)
+        actual_span_kv = [
+            _physical_block_tensor(llm, block_ids[i]) for i in range(2, 4)
+        ]
+        actual_cross_tail_kv = [
+            _physical_block_tensor(llm, block_ids[i]) for i in range(4, 6)
+        ]
 
         assert cached_marked == BLOCK_SIZE * 4, (
             f"marked request should hit prefix + span (4 blocks); "
@@ -190,3 +193,41 @@ def test_large_gap_length_does_not_livelock_e2e(model, monkeypatch):
         )
     finally:
         cleanup(llm)
+
+
+def test_spans_prerotate_matches_per_tile_e2e(model, monkeypatch):
+    """Prerotate must be a pure optimization: the block-wise K-prerotate scratch
+    (VLLM_V1_SPANS_PREROTATE=1) must give byte-identical step-0 top-K to the
+    per-tile in-kernel rotation (=0) on the same marked LL run - which mixes a
+    pure-span gap recompute (prerotate fires) with a cross-tail prefill (per-tile
+    fallback). Guards against the scratch diverging from per-tile in future edits.
+    """
+    import vllm.envs as envs
+
+    _force_in_process_engine(monkeypatch)
+    prefix = list(range(0, BLOCK_SIZE * 2))
+    span = list(range(500, 500 + BLOCK_SIZE * 2))
+    cross_tail = list(range(900, 900 + BLOCK_SIZE * 2))
+    prompt = prefix + span + cross_tail
+    extra = {"span_starts": [BLOCK_SIZE * 2], "cross_span_starts": [BLOCK_SIZE * 4]}
+
+    tops = {}
+    for prerotate in (True, False):
+        monkeypatch.setenv("VLLM_V1_SPANS_PREROTATE", "1" if prerotate else "0")
+        monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", prerotate)
+        llm = build_llm(model, "LL-32", monkeypatch)
+        try:
+            _warmup_prompt(llm, span)
+            _warmup_prompt(llm, prefix)
+            out = generate_single_output(
+                llm, prompt, greedy_sp(extra_args=extra, logprobs=LOGPROBS_TOPK)
+            )
+            tops[prerotate] = extract_step0_topk(out.outputs[0], LOGPROBS_TOPK)
+        finally:
+            cleanup(llm)
+
+    assert tops[True], "no step-0 logprobs captured"
+    assert tops[True] == tops[False], (
+        "prerotate scratch diverged from per-tile rotation:\n"
+        f"  prerotate on : {tops[True]}\n  prerotate off: {tops[False]}"
+    )

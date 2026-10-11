@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -375,6 +377,20 @@ def triton_reshape_and_cache_flash(
         if is_quantized_kv_cache(kv_cache_dtype)
         else key_cache.dtype
     )
+
+    if os.environ.get("VLLM_SPANS_SLOTMAP_GUARD", "0") == "1":
+        # Debug aid: fail loudly in Python on an OOB slot instead of letting
+        # the kernel corrupt the CUDA context; .item() also syncs, surfacing
+        # async faults from earlier kernels at a deterministic point.
+        num_slots = key_cache.shape[0] * block_size
+        max_slot = int(slot_mapping.max().item())
+        if max_slot >= num_slots:
+            bad = (slot_mapping >= num_slots).nonzero(as_tuple=True)[0]
+            raise RuntimeError(
+                f"SLOTMAP_GUARD: max_slot={max_slot} >= num_slots={num_slots}; "
+                f"{bad.numel()} bad tokens, first={bad[:8].tolist()}, "
+                f"slots={slot_mapping[bad[:8]].tolist()}"
+            )
 
     if key_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
         kv_cache_dtype

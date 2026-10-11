@@ -261,11 +261,20 @@ if TYPE_CHECKING:
 
     # spans vars
     VLLM_V1_SPANS_ENABLED: bool = False
+    # CUDA graphs on spans decode; 0 forces eager
+    VLLM_V1_SPANS_CUDAGRAPH: bool = True
     VLLM_V1_SPANS_DEBUG: bool = False
     VLLM_V1_SPANS_PAD_TOKEN: int = -1
     VLLM_V1_SPANS_BLOCK_SIZE: int = 0
     VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
     VLLM_V1_SPANS_GAP_LENGTH: int = 32
+    VLLM_V1_SPANS_PREROTATE: bool = True
+    VLLM_V1_SPANS_QCFUSE_ENABLE: bool = False
+    VLLM_V1_SPANS_QCFUSE_RHO: float = 0.1
+    VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
+    VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
+    VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
+    VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1701,6 +1710,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
+    .lower()
+    in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
     "VLLM_V1_SPANS_DEBUG": lambda: os.environ.get("VLLM_V1_SPANS_DEBUG", "False")
@@ -1722,6 +1734,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gap length for span-aware gap policy
     "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
         os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
+    ),
+    # rotate K once per forward into a transient scratch (prefill batches)
+    # instead of per-tile inside the attention kernel
+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_PREROTATE", "True"
+    )
+    == "True",
+    # QCFuse: recompute a query-selected subset of cached tokens on all layers
+    "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"
+    )
+    == "True",
+    # fraction of cached tokens to recompute when K_PER_SPAN is 0
+    "VLLM_V1_SPANS_QCFUSE_RHO": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_QCFUSE_RHO", "0.1")
+    ),
+    # comma-separated layers the importance probe runs on; required
+    "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", ""
+    ),
+    # "block" (block-aligned gaps) or "token"
+    "VLLM_V1_SPANS_QCFUSE_GRANULARITY": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_GRANULARITY", "block"
+    ),
+    # recompute budget of K tokens per span, matching legolink-K; 0 uses rho
+    "VLLM_V1_SPANS_QCFUSE_K_PER_SPAN": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
+    ),
+    # PIC neighbor-aware gap policy (QCFuse probe, closure-aware ranking)
+    "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
+        os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces

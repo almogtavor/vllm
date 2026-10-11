@@ -280,6 +280,9 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # QCFUSE: req_id -> per-context-token importance from the worker probe
+    qcfuse_importance: dict[str, list[float]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

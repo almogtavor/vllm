@@ -38,6 +38,8 @@ from vllm.v1.attention.backend import (
     AttentionType,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.qcfuse import get_capturer as get_qcfuse_capturer
+from vllm.v1.attention.qcfuse import parse_critical_layers, probe_enabled
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -393,6 +395,13 @@ class Attention(nn.Module, AttentionLayerBase):
         # and let torch.compile handle them.
         self.use_direct_call = not current_platform.opaque_attention_op()
 
+        # QCFUSE: probe only critical layers; off keeps the graph unchanged
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        self.qcfuse_capture = probe_enabled() and (
+            extract_layer_index(prefix) in parse_critical_layers()
+        )
+
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -499,6 +508,10 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep = unified_kv_cache_update(
                     key, value, self.layer_name
                 )
+            if self.qcfuse_capture:
+                kv_cache_dummy_dep = qcfuse_capture_importance(
+                    query, kv_cache_dummy_dep, self.layer_name
+                )
             unified_attention_with_output(
                 query,
                 key,
@@ -518,6 +531,10 @@ class Attention(nn.Module, AttentionLayerBase):
             ):
                 kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                     key, value, encoded
+                )
+            if self.qcfuse_capture:
+                kv_cache_dummy_dep = torch.ops.vllm.qcfuse_capture_importance(
+                    query, kv_cache_dummy_dep, encoded
                 )
             torch.ops.vllm.unified_attention_with_output(
                 query,
@@ -727,6 +744,41 @@ direct_register_custom_op(
     op_name="unified_kv_cache_update",
     op_func=unified_kv_cache_update,
     fake_impl=unified_kv_cache_update_fake,
+    mutates_args=[],
+)
+
+
+def qcfuse_capture_importance(
+    query: torch.Tensor,
+    kv_cache_dummy_dep: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """QCFUSE: accumulate attention mass; the dummy dep orders it after the KV write."""
+    layer_name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    capturer = get_qcfuse_capturer()
+    if capturer is not None:
+        capturer.capture(
+            query,
+            kv_cache,
+            attn_layer.num_heads // attn_layer.num_kv_heads,
+            attn_layer.impl.scale,
+        )
+    return torch.empty(0, device=query.device, dtype=query.dtype)
+
+
+def qcfuse_capture_importance_fake(
+    query: torch.Tensor,
+    kv_cache_dummy_dep: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, device=query.device, dtype=query.dtype)
+
+
+direct_register_custom_op(
+    op_name="qcfuse_capture_importance",
+    op_func=qcfuse_capture_importance,
+    fake_impl=qcfuse_capture_importance_fake,
     mutates_args=[],
 )
 

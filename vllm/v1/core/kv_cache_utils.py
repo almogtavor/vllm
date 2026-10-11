@@ -106,6 +106,7 @@ class PrefixHitSource(IntEnum):
 
     PD = 0
     PIC = 1
+    MISS = 2  # null placeholder; recomputed as a forced gap
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):

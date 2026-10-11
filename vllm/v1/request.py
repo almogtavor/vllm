@@ -111,6 +111,11 @@ class Request:
         self.pd_block_hashes: list[BlockHash] = []
         self.pic_token_ranges: list[tuple[int, int | None]] = []
         self.prefix_hit_sources: list[PrefixHitSource] | None = None
+        self.pending_span_gaps: list[tuple[int, int]] = []
+        # gap selection memo (num_computed_tokens, gaps); avoids re-selecting while blocked
+        self.span_gaps_selection: tuple[int, list[tuple[int, int]]] | None = None
+        # QCFUSE: per-token importance from the worker probe, read by QCFusePolicy
+        self.qcfuse_importance: list[float] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -136,9 +141,16 @@ class Request:
 
         if self.span_starts:
             crosses = sorted(self.cross_span_starts or [])
-            for span_start in sorted(self.span_starts):
-                end = next((c for c in crosses if c > span_start), None)
-                self.pic_token_ranges.append((span_start, end))
+            spans_sorted = sorted(self.span_starts)
+            # end = next boundary after the span: the next span's start
+            # (adjacent spans carry no cross of their own) or the first cross
+            # past it. Cross-only pairing makes adjacent spans' ranges overlap
+            # all the way to the last cross.
+            for i, span_start in enumerate(spans_sorted):
+                nxt = spans_sorted[i + 1] if i + 1 < len(spans_sorted) else None
+                cross = next((c for c in crosses if c > span_start), None)
+                ends = [e for e in (nxt, cross) if e is not None]
+                self.pic_token_ranges.append((span_start, min(ends) if ends else None))
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -264,6 +276,9 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def in_pic_span(self, pos: int) -> bool:
+        return any(s <= pos and (e is None or pos < e) for s, e in self.pic_token_ranges)
 
     @property
     def use_structured_output(self) -> bool:
