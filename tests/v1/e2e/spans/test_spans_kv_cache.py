@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 from .conftest import (
@@ -289,11 +290,14 @@ def test_unwarmed_prefix_does_not_halt_pic_chunk_reuse_e2e(model, monkeypatch):
     assert cached_c == BLOCK_SIZE * 4, (
         f"warmed prefix should reuse prefix + chunk, got {cached_c}"
     )
-    # 4th check: A's in-prompt span K/V must match the standalone chunk within
-    # numerical tolerance (the tile rebase and the standalone prefill take
-    # different batch shapes and may differ by harmless bf16 drift).
+    # 4th check: span K/V is bit-exact under batch invariance, else bf16 drift.
     for i, (ip, st) in enumerate(zip(inprompt_chunk_kv, standalone_chunk_kv)):
-        assert torch.allclose(ip, st, atol=2e-2, rtol=2e-2), (
+        same = (
+            torch.equal(ip, st)
+            if envs.VLLM_BATCH_INVARIANT
+            else torch.allclose(ip, st, atol=2e-2, rtol=2e-2)
+        )
+        assert same, (
             f"span block {i} K/V from A's in-prompt prefill does not match "
             f"the standalone chunk - the PIC span is not position-invariant"
         )
