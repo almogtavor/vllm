@@ -109,6 +109,7 @@ def test_miss_gaps_cover_only_miss_blocks():
 def test_qcfuse_selects_inside_spans_only(monkeypatch):
     from vllm.v1.core.sched.gap_policy import QCFusePolicy
 
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     req = make_span_request(160, span_starts=[64])
