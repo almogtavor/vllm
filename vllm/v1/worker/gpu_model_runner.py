@@ -125,6 +125,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1.attention import qcfuse
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -435,6 +436,28 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+
+
+def compute_span_lb_regions(
+    span_starts: list[int],
+    cross_span_starts: list[int] | None,
+    req_len: int,
+) -> list[tuple[int, int, int]]:
+    """SPANS: (start, end, lb) attention-lower-bound regions for a request.
+
+    A span's lb region ends at the NEXT boundary after it: the next span's
+    start (adjacent spans carry no cross of their own - the client skips
+    crosses that coincide with a span start) or the first cross past it.
+    Index-pairing crosses to spans paints lb wrongly over later spans and the
+    generated tail whenever spans are adjacent."""
+    crosses = sorted(cross_span_starts or [])
+    spans_sorted = sorted(span_starts)
+    out = []
+    for j, start in enumerate(spans_sorted):
+        nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
+        cross = next((c for c in crosses if c > start), req_len)
+        out.append((start, min(nxt, cross), start))
+    return out
 
 
 class GPUModelRunner(
@@ -769,9 +792,43 @@ class GPUModelRunner(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
         if envs.VLLM_V1_SPANS_ENABLED:
-            # SPANS: flat per-KV lower bound + per-req offsets, rebuilt per forward.
-            self._attn_lower_bounds_gpu: torch.Tensor | None = None
-            self._req_kv_starts_gpu: torch.Tensor | None = None
+            # SPANS: fixed-address strided lower bounds, so CUDA graphs stay valid
+            self._spans_lb_stride = self.model_config.max_model_len
+            _lb_n = self.max_num_reqs * self._spans_lb_stride
+            _LB_MAX = 1 << 28  # 1 GiB of int32
+            if _lb_n > _LB_MAX:
+                # stride 0 = packed per-forward layout, eager only
+                logger.warning(
+                    "SPANS: lower-bound buffer would be %.1f GiB "
+                    "(max_num_seqs=%d x max_model_len=%d); keeping the eager path.",
+                    _lb_n * 4 / 2**30, self.max_num_reqs, self._spans_lb_stride,
+                )
+                self._spans_lb_stride = 0
+                self._attn_lower_bounds_gpu: torch.Tensor | None = None
+                self._req_kv_starts_gpu: torch.Tensor | None = None
+                self._spans_lb_staging = None
+                self._spans_lb_len = []
+            else:
+                self._attn_lower_bounds_gpu = torch.zeros(
+                    _lb_n, dtype=torch.int32, device=self.device
+                )
+                self._req_kv_starts_gpu = torch.arange(
+                    self.max_num_reqs + 1, dtype=torch.int32, device=self.device
+                ) * self._spans_lb_stride
+                # pinned, or non_blocking copies are synchronous
+                self._spans_lb_staging = torch.zeros(
+                    _lb_n, dtype=torch.int32, pin_memory=True
+                )
+                # per-slot live length, to clear stale tails on slot reuse
+                self._spans_lb_len = [0] * self.max_num_reqs
+        # QCFUSE: importance probe, allocated only under the knob
+        self.qcfuse_capturer = None
+        self._qcfuse_descs: list[tuple[int, int, int, int]] = []
+        if qcfuse.probe_enabled() and qcfuse.parse_critical_layers():
+            self.qcfuse_capturer = qcfuse.QCFuseImportanceCapturer(
+                self.max_num_reqs, self.max_model_len, self.device
+            )
+            qcfuse.bind_capturer(self.qcfuse_capturer)
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1981,6 +2038,7 @@ class GPUModelRunner(
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            spans_prerotate_safe = True
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 params = req.sampling_params
@@ -1990,16 +2048,62 @@ class GPUModelRunner(
                 spans = ea.get("span_starts") if ea else None
                 if not spans:
                     continue
-                crosses = ea.get("cross_span_starts") or []
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-                for j, span_start in enumerate(spans):
-                    cross = crosses[j] if j < len(crosses) else req_len
-                    attn_lb[req_start + span_start : req_start + cross] = span_start
+                for start, end, lb in compute_span_lb_regions(
+                    spans, ea.get("cross_span_starts"), req_len
+                ):
+                    attn_lb[req_start + start : req_start + end] = lb
+                q_start = req_start + int(num_computed[i])
+                q_end = req_start + req_len
+                if q_end > q_start:
+                    req_lbs = attn_lb[req_start:q_end]
+                    query_lbs = attn_lb[q_start:q_end]
+                    if np.max(req_lbs) > 0 and (
+                        np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
+                    ):
+                        spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
-            self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
-                self.device, non_blocking=True)
-            self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
-                self.device, non_blocking=True)
+            self._spans_prerotate_safe = spans_prerotate_safe
+            # copy the packed bounds into the strided buffer in place
+            stride = self._spans_lb_stride
+            staging = self._spans_lb_staging
+            _scatter_reqs = num_reqs if stride else 0
+            if not stride:
+                self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
+                    self.device, non_blocking=True
+                )
+                self._req_kv_starts_gpu = torch.from_numpy(req_kv_starts).to(
+                    self.device, non_blocking=True
+                )
+            for i in range(_scatter_reqs):
+                lo, hi = int(req_kv_starts[i]), int(req_kv_starts[i + 1])
+                n = min(hi - lo, stride)
+                base = i * stride
+                prev = self._spans_lb_len[i]
+                if prev > n:
+                    self._attn_lower_bounds_gpu[base + n:base + prev].zero_()
+                self._spans_lb_len[i] = n
+                if n <= 0:
+                    continue
+                staging[base:base + n] = torch.from_numpy(attn_lb[lo:lo + n])
+                self._attn_lower_bounds_gpu[base:base + n].copy_(
+                    staging[base:base + n], non_blocking=True
+                )
+
+        # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
+        if self.qcfuse_capturer is not None:
+            descs = []
+            bs = self.cache_config.block_size
+            for i in range(num_reqs):
+                nsched = int(num_scheduled_tokens[i])
+                ctx = int(self.input_batch.num_computed_tokens_cpu[i])
+                req = self.requests[self.input_batch.req_ids[i]]
+                if req.is_gap_recompute or nsched <= 1 or ctx < bs:
+                    continue
+                q_end = int(cu_num_tokens[i])
+                q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
+                descs.append((i, q_start, q_end, min(ctx, self.max_model_len)))
+            self._qcfuse_descs = descs
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2219,9 +2323,7 @@ class GPUModelRunner(
             and self._req_kv_starts_gpu is not None
         ):
             pos_slice = self.positions[:total_num_scheduled_tokens]
-            sched_kv_indices = (
-                self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
-            )
+            sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
             pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
                 pos_slice.dtype
             )
@@ -2373,6 +2475,9 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
+        if self.qcfuse_capturer is not None:
+            self.qcfuse_capturer.begin_step(block_table_gid_0, self._qcfuse_descs)
+
         # print("==================MODULES===============")
 
         # # Dump full structure
@@ -2491,6 +2596,7 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
+            spans_prerotate_safe=getattr(self, "_spans_prerotate_safe", True),
         )
 
         if self.dcp_world_size > 1:
@@ -4156,6 +4262,18 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        # SPANS: decode-only graphs; capture (force_uniform_decode) is left alone
+        if (
+            envs.VLLM_V1_SPANS_ENABLED
+            and not force_eager
+            and force_uniform_decode is None
+        ):
+            force_eager = (
+                not getattr(self, "_spans_lb_stride", 0)
+                or not envs.VLLM_V1_SPANS_CUDAGRAPH
+                or max_num_scheduled_tokens > 1
+            )
+
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -4941,6 +5059,17 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        # QCFUSE: copy the probed importance to host
+        qcfuse_importance = None
+        if self.qcfuse_capturer is not None and self._qcfuse_descs:
+            buf = self.qcfuse_capturer.buffer
+            qcfuse_importance = {
+                self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
+                for row, _, _, ctx in self._qcfuse_descs
+            }
+            self._qcfuse_descs = []
+            self.qcfuse_capturer.end_step()
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4955,6 +5084,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                qcfuse_importance=qcfuse_importance,
             )
 
         # Handle virtual gap requests: cleanup only (KV written directly to parent)
@@ -6926,6 +7056,12 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        if envs.VLLM_V1_SPANS_ENABLED and not envs.VLLM_V1_SPANS_CUDAGRAPH:
+            logger.warning(
+                "Skipping CUDA graph capture for spans (VLLM_V1_SPANS_CUDAGRAPH=0)."
+            )
+            return 0
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "

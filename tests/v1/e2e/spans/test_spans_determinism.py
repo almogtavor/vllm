@@ -132,3 +132,4 @@ def test_block_size_constant_matches_conftest():
     """Defensive: tests assume block_size == 16. If conftest changes, tests
     that rely on PIC alignment must be revisited."""
     assert BLOCK_SIZE == 16
+

@@ -238,6 +238,9 @@ class KVCacheManager:
                 )
             )
             request.prefix_hit_sources = hit_sources
+            miss_tokens = (
+                hit_sources.count(PrefixHitSource.MISS) * self.coordinator.block_size
+            )
         else:
             computed_blocks, num_new_computed_tokens = (
                 self.coordinator.find_longest_cache_hit(
@@ -245,12 +248,13 @@ class KVCacheManager:
                 )
             )
             request.prefix_hit_sources = None
+            miss_tokens = 0  # hybrid coordinators have no block_size
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
+                num_hits=num_new_computed_tokens - miss_tokens,
                 preempted=request.num_preemptions > 0,
             )
 
@@ -358,13 +362,13 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        if num_new_tokens == 0 and num_external_computed_tokens == 0 and not span_gaps:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
                 "external computed tokens"
             )
 
-        # SPANS: PIC-hit blocks a gap will recompute; reserve+swap them below.
+        # SPANS: PIC-hit and MISS blocks a gap will recompute; reserve+swap them below.
         swap_indices = self._span_swap_indices(request, span_gaps)
 
         if new_computed_blocks is not None:
@@ -486,9 +490,15 @@ class KVCacheManager:
             fresh = manager.swap_blocks_for_gap_recompute(
                 request.request_id, swap_indices
             )
-            self.block_pool.cache_blocks_under_hashes(
-                fresh, [request.pd_block_hashes[i] for i in swap_indices], 0
-            )
+            bs = self.coordinator.block_size
+            # the key the dual lookup tries first: pd inside a span, else the plain hash
+            hashes = [
+                request.pd_block_hashes[i]
+                if request.in_pic_span(i * bs)
+                else request.block_hashes[i]
+                for i in swap_indices
+            ]
+            self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -503,7 +513,7 @@ class KVCacheManager:
             b
             for s, e in span_gaps
             for b in range(s // bs, min(e // bs, len(sources)))
-            if sources[b] == PrefixHitSource.PIC
+            if sources[b] in (PrefixHitSource.PIC, PrefixHitSource.MISS)
         ]
 
     def free(self, request: Request) -> None:
