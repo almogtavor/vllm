@@ -118,3 +118,52 @@ def test_qcfuse_selects_inside_spans_only(monkeypatch):
     imp[85] = 1.0
     assert QCFusePolicy(k_per_span=16)._select(req, imp, 160) == [(80, 96)]
     assert QCFusePolicy(rho=0.2)._select(req, imp, 160) == [(80, 96)]
+
+
+def test_drop_pd_gaps_cuts_pd_blocks_out():
+    from vllm.v1.core.sched.gap_policy import _drop_pd_gaps
+
+    req = make_span_request(64, span_starts=[0])
+    D, M, S = PrefixHitSource.PD, PrefixHitSource.MISS, PrefixHitSource.PIC
+    req.prefix_hit_sources = [D, S, D, S]
+    assert _drop_pd_gaps(req, [(0, 64)], 16) == [(16, 32), (48, 64)]
+    assert _drop_pd_gaps(req, [(20, 40)], 16) == [(20, 32)]
+    req.prefix_hit_sources = [D, D, D, D]
+    assert _drop_pd_gaps(req, [(0, 64)], 16) == []
+    req.prefix_hit_sources = [S, M, S, M]
+    assert _drop_pd_gaps(req, [(0, 64)], 16) == [(0, 64)]
+
+
+def test_tail_after_span_hits_pd_copy_never_the_blind_plain_one(monkeypatch):
+    """A tail block caches blind KV under its plain key; a repaired copy under
+    its pd key must win, and the plain one alone is labeled PIC, not PD."""
+    from types import SimpleNamespace
+
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    init_none_hash(sha256)
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+    sp = SamplingParams(
+        max_tokens=1, extra_args={"span_starts": [16], "cross_span_starts": [48]}
+    )
+    sp.update_from_generation_config({}, eos_token_id=100)
+    req = Request("r", list(range(64)), sp, None,
+                  block_hasher=get_request_block_hasher(16, sha256))
+    coord = SimpleNamespace(block_size=16, block_pool=pool)
+    lookup = UnitaryKVCacheCoordinator.find_longest_cache_hit_dual
+    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
+
+    blind = pool.get_new_blocks(4)
+    pool.cache_full_blocks(req, blind, 0, 4, 16, 0)
+    (got,), _, src = lookup(coord, req, 64)
+    assert got == blind and src == [D, S, S, S]
+
+    fresh = pool.get_new_blocks(1)
+    pool.cache_blocks_under_hashes(fresh, [req.pd_block_hashes[3]], 0)
+    (got,), _, src = lookup(coord, req, 64)
+    assert got[3] is fresh[0] and blind[3].block_hash is not None
+    assert src == [D, S, S, D]

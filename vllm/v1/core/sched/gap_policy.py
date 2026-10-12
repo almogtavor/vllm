@@ -292,18 +292,7 @@ class SpanAwareGapPolicy(GapPolicy):
             if gap_end > gap_start:
                 gaps.append((gap_start, gap_end))
 
-        # SPANS: drop gaps whose blocks all hit a prefix-aware (pd) copy from an
-        # earlier recompute of this prefix - recompute-once-per-unique-prefix.
-        sources = request.prefix_hit_sources
-        if sources is not None:
-            bs = self.block_size
-            kept = []
-            for s, e in gaps:
-                blocks = range(s // bs, min(e // bs, len(sources)))
-                if blocks and all(sources[b] == PrefixHitSource.PD for b in blocks):
-                    continue
-                kept.append((s, e))
-            gaps = kept
+        gaps = _drop_pd_gaps(request, gaps, self.block_size)
 
         logger.info(
             "Created %d gaps for request %s: %s", len(gaps), request.request_id, gaps
@@ -357,18 +346,23 @@ class SpanAwareGapPolicy(GapPolicy):
 def _drop_pd_gaps(
     request: "Request", gaps: list[tuple[int, int]], bs: int
 ) -> list[tuple[int, int]]:
-    """Drop gaps whose blocks all hit a pd copy (recompute once per prefix)."""
+    """Cut pd-hit blocks out of gaps: a pd copy already holds this prefix's
+    KV and is shared, so it is never rewritten (recompute once per prefix)."""
     sources = request.prefix_hit_sources
     if sources is None:
         return gaps
-    return [
-        (s, e)
-        for s, e in gaps
-        if not (
-            (blocks := range(s // bs, min(e // bs, len(sources))))
-            and all(sources[b] == PrefixHitSource.PD for b in blocks)
-        )
-    ]
+    out = []
+    for s, e in gaps:
+        cur = s
+        for b in range(s // bs, min(-(-e // bs), len(sources))):
+            if sources[b] != PrefixHitSource.PD:
+                continue
+            if b * bs > cur:
+                out.append((cur, b * bs))
+            cur = max(cur, min(e, (b + 1) * bs))
+        if e > cur:
+            out.append((cur, e))
+    return out
 
 
 class QCFusePolicy(GapPolicy):

@@ -500,16 +500,17 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         request: Request,
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, list[PrefixHitSource]]:
-        """SPANS: `find_longest_cache_hit`, but a block inside a
-        [span_start, cross_span_start) range is looked up under its
-        position-dependent (pd) key first, falling back to the shared
-        position-independent (pic) key; also returns each block's hit source.
+        """SPANS: `find_longest_cache_hit`, but a block at or after the first
+        span start is looked up under its position-dependent (pd) key first,
+        falling back to its plain key (labeled PIC: its KV may not match this
+        prefix); also returns each block's hit source.
         Misses before the last hit become null MISS placeholders."""
         bs = self.block_size
+        first = min(request.span_starts)
         computed: list[KVCacheBlock] = []
         sources: list[PrefixHitSource] = []
         for i in range(min(max_cache_hit_length // bs, len(request.block_hashes))):
-            in_span = request.in_pic_span(i * bs)
+            in_span = i * bs >= first
             block = None
             source = PrefixHitSource.PD
             if in_span and i < len(request.pd_block_hashes):
