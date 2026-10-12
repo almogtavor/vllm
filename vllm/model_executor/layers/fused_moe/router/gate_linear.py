@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
@@ -113,7 +114,12 @@ class GateLinear(ReplicatedLinear):
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         # Tier 1: DSV3 specialized kernel
-        if self.allow_dsv3_router_gemm and x.shape[0] <= self._dsv3_max_batch:
+        # BI: a kernel picked by token count makes router logits chunk-size dependent
+        if (
+            self.allow_dsv3_router_gemm
+            and x.shape[0] <= self._dsv3_max_batch
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
             output = ops.dsv3_router_gemm(
                 hidden_states=x,
                 router_weight=self.weight,
@@ -157,6 +163,11 @@ def fp32_router_gemm_dispatch_impl(
     This must be wrapped in a custom op because our torch.compile integration
     does not support runtime dispatching on num_tokens.
     """
+    if envs.VLLM_BATCH_INVARIANT:
+        # Hopper cuBLAS fp32 switches kernel below 17 rows; pad so every M runs one
+        m = x.shape[0]
+        x = torch.nn.functional.pad(x.float(), (0, 0, 0, max(0, 32 - m)))
+        return torch.nn.functional.linear(x, weight)[:m]
     if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
         return ops.fp32_router_gemm(x, weight)
     else:

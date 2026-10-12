@@ -846,10 +846,9 @@ def rms_norm_batch_invariant(
         assert input.shape == residual.shape, (
             f"Input shape {input.shape} must match residual shape {residual.shape}"
         )
-        import vllm._custom_ops as ops
-
-        ops.fused_add_rms_norm(input, residual, weight, eps)
-        return input, residual
+        # not ops.fused_add_rms_norm: its block size flips at 256 tokens, changing the reduction order
+        residual = input + residual
+        return rms_norm_batch_invariant(residual, weight, eps), residual
 
     assert weight.dim() == 1, "Weight must be 1-dimensional"
     assert input.shape[-1] == weight.shape[0], (
