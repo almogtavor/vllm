@@ -6,6 +6,7 @@ from functools import partial
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -155,7 +156,8 @@ class MiniMaxText01RMSNormTP(CustomOp):
         self.variance_epsilon = eps
 
         self.workspace = None
-        if _MINIMAX_FUSED_AR_RMS_QK is not None and self.tp_world > 1:
+        # batch invariance: the fused kernel only serves <=2048-token chunks, so its reduction order depends on chunking
+        if _MINIMAX_FUSED_AR_RMS_QK is not None and self.tp_world > 1 and not envs.VLLM_BATCH_INVARIANT:
             from .lamport_workspace import (
                 get_allreduce_workspace,
             )

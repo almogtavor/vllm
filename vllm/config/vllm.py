@@ -106,7 +106,9 @@ IS_DENSE = False
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
     """Enable if either RMS norm or quant FP8 custom op is active;
     otherwise Inductor handles fusion."""
-
+    # batch invariance: the fused rms_norm+fp8-quant kernels flip block size at 256 tokens
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
     return (
         cfg.compilation_config.is_custom_op_enabled("rms_norm")
         or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
@@ -138,6 +140,9 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
+    # batch invariance: the fused allreduce+rms kernel choice depends on the token count
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
     if current_platform.is_rocm():
         from vllm._aiter_ops import rocm_aiter_ops
 
