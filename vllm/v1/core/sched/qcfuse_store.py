@@ -26,11 +26,10 @@ class QCFuseImportanceStore:
 
     def lookup(
         self, block_hashes: list[BlockHash], num_computed_tokens: int
-    ) -> list[float] | None:
-        """Importance for the cached prefix; unmeasured blocks score 0, None if all are."""
+    ) -> list[float]:
+        """Importance for the cached prefix; unmeasured blocks score 0."""
         bs = self.block_size
         out: list[float] = []
-        hit = False
         for b in range(num_computed_tokens // bs):
             h = block_hashes[b] if b < len(block_hashes) else None
             entry = self._by_hash.get(h)
@@ -39,5 +38,5 @@ class QCFuseImportanceStore:
             else:
                 self._by_hash.move_to_end(h)
                 out.extend(entry)
-                hit = True
-        return out if hit else None
+        # all-unmeasured selects like a partial hit (span head), not zero repair
+        return out
