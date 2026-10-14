@@ -118,3 +118,17 @@ def test_qcfuse_selects_inside_spans_only(monkeypatch):
     imp[85] = 1.0
     assert QCFusePolicy(k_per_span=16)._select(req, imp, 160) == [(80, 96)]
     assert QCFusePolicy(rho=0.2)._select(req, imp, 160) == [(80, 96)]
+
+
+def test_qcfuse_unmeasured_store_repairs_span_head(monkeypatch):
+    from vllm.v1.core.sched.gap_policy import QCFusePolicy
+    from vllm.v1.core.sched.qcfuse_store import QCFuseImportanceStore
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    req = make_span_request(160, span_starts=[64])
+    imp = QCFuseImportanceStore(16).lookup([object() for _ in range(10)], 160)
+    assert imp == [0.0] * 160
+    req.qcfuse_importance = imp
+    assert QCFusePolicy(k_per_span=16).get_gaps(req, 160, 0) == [(64, 80)]
