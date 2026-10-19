@@ -250,6 +250,7 @@ def kernel_rotate_k_prepass(
     cos_sin_cache_ptr,
     attn_lower_bounds_ptr,
     req_kv_starts_ptr,
+    query_start_loc_ptr,
     block_table_stride: tl.int64,
     scratch_table_stride: tl.int64,
     stride_k_cache_0: tl.int64,
@@ -267,6 +268,7 @@ def kernel_rotate_k_prepass(
     HEAD_SIZE_PADDED: tl.constexpr,
     ROTARY_DIM: tl.constexpr,  # 0 means rotary_dim == head_size
     USE_SPAN: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,  # 0 = rotate every block
 ):
     seq_idx = tl.program_id(0)
     blk_j = tl.program_id(1)
@@ -275,6 +277,14 @@ def kernel_rotate_k_prepass(
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     if blk_j * BLOCK_SIZE >= seq_len:
         return
+    if SLIDING_WINDOW > 0:
+        # skip blocks below the first SWA tile the attention kernel can read (tiles <= 256)
+        qlen = tl.load(query_start_loc_ptr + seq_idx + 1) - tl.load(
+            query_start_loc_ptr + seq_idx
+        )
+        first_key = seq_len - qlen - SLIDING_WINDOW + 1
+        if (blk_j + 1) * BLOCK_SIZE <= (first_key // 256) * 256:
+            return
 
     src_blk = tl.load(block_tables_ptr + seq_idx * block_table_stride + blk_j).to(
         tl.int64
@@ -342,6 +352,8 @@ def rotate_k_prepass(
     rotary_dim: int,
     attn_lower_bounds: torch.Tensor | None,
     req_kv_starts: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None = None,
+    sliding_window: int = 0,
 ) -> None:
     # per-forward K rotation into the transient scratch
     num_seqs = seq_lens.shape[0]
@@ -359,6 +371,7 @@ def rotate_k_prepass(
         cos_sin_cache,
         attn_lower_bounds,
         req_kv_starts,
+        query_start_loc,
         block_table.stride(0),
         k_scratch_block_table.stride(0),
         *key_cache.stride(),
@@ -369,6 +382,7 @@ def rotate_k_prepass(
         HEAD_SIZE_PADDED=triton.next_power_of_2(key_cache.shape[3]),
         ROTARY_DIM=rotary_dim,
         USE_SPAN=attn_lower_bounds is not None,
+        SLIDING_WINDOW=sliding_window if query_start_loc is not None else 0,
     )
 
 

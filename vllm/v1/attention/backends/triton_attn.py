@@ -746,6 +746,13 @@ class TritonAttentionImpl(AttentionImpl):
                 rotary_dim,
                 None,  # absolute positions; the kernel shifts Q by its lb instead
                 None,
+                cu_seqlens_q,
+                # SWA skip mirrors compute_tile_loop_bounds' plain causal case only
+                1 + self.sliding_window[0]
+                if attn_metadata.causal is True
+                and attn_metadata.mm_prefix_range_tensor is None
+                and self.chunk_lookback < 0
+                else 0,
             )
         else:
             k_scratch_block_table = None
