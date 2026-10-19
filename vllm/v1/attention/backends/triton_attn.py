@@ -261,7 +261,17 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 blk = self.block_size
                 nblk = (seq_lens[:num_reqs] + (blk - 1)) // blk
                 starts = torch.cumsum(nblk, 0) - nblk
-                total = int(nblk.sum().item())
+                # CPU lengths (upper bound under async sched): no device sync
+                cm = common_attn_metadata
+                lens_cpu = next(
+                    (t for t in (cm._seq_lens_cpu, cm.seq_lens_cpu_upper_bound)
+                     if t is not None),
+                    None,
+                )
+                if lens_cpu is None:
+                    lens_cpu = cm.seq_lens_cpu
+                lens_cpu = lens_cpu[:num_reqs]
+                total = int(((lens_cpu + (blk - 1)) // blk).sum())
                 # 2B/elt (bf16/fp16); fp8 rejected at use time
                 scratch_mb = (total * blk * self.num_heads_kv * self.headdim * 2) // (
                     1024 * 1024
