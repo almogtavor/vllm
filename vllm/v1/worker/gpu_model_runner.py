@@ -2053,15 +2053,6 @@ class GPUModelRunner(
                     spans, ea.get("cross_span_starts"), req_len
                 ):
                     attn_lb[req_start + start : req_start + end] = lb
-                q_start = req_start + int(num_computed[i])
-                q_end = req_start + req_len
-                if q_end > q_start:
-                    req_lbs = attn_lb[req_start:q_end]
-                    query_lbs = attn_lb[q_start:q_end]
-                    if np.max(req_lbs) > 0 and (
-                        np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
-                    ):
-                        spans_prerotate_safe = False
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._spans_prerotate_safe = spans_prerotate_safe
             # copy the packed bounds into the strided buffer in place

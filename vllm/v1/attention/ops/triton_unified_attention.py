@@ -489,6 +489,7 @@ def kernel_unified_attention(
     k_block_tables_ptr=None,
     k_block_table_stride: tl.int64 = 0,
     SEPARATE_K_TABLE: tl.constexpr = False,
+    ROTATE_Q: tl.constexpr = False,  # SPANS prerotate: absolute K, shift Q by its lb
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -637,6 +638,38 @@ def kernel_unified_attention(
         span_offset = tl.min(q_lb_vec)
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
         loop_lo = tl.maximum(loop_lo, span_offset // TILE_SIZE)
+        if ROTATE_Q:
+            # Q was roped at pos-lb; K scratch is absolute, so rope Q by +lb
+            q_lb = tl.where(query_mask_0, q_lb_vec, 0)
+            ROT: tl.constexpr = (
+                HEAD_SIZE if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE) else ROTARY_DIM
+            )
+            HALF_ROT: tl.constexpr = ROT // 2
+            x_part = offs_d < HALF_ROT
+            partner_d = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
+            cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
+            rope_mask = (offs_d < ROT)[None, :] & query_mask_0[:, None]
+            cs_row = cos_sin_cache_ptr + q_lb[:, None] * stride_cs_cache_0
+            cos = tl.load(
+                cs_row + cos_idx[None, :] * stride_cs_cache_1, mask=rope_mask, other=1.0
+            ).to(tl.float32)
+            sin = tl.load(
+                cs_row + (HALF_ROT + cos_idx[None, :]) * stride_cs_cache_1,
+                mask=rope_mask,
+                other=0.0,
+            ).to(tl.float32)
+            Q_partner = tl.load(
+                query_ptr
+                + query_offset_0[:, None] * query_stride_0
+                + query_offset_1[:, None] * query_stride_1
+                + partner_d[None, :],
+                mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            rope_sign = tl.where(x_part, -1.0, 1.0)
+            Q = (
+                Q.to(tl.float32) * cos + rope_sign[None, :] * Q_partner * sin
+            ).to(Q.dtype)
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
@@ -1125,10 +1158,10 @@ def unified_attention(
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
-    fuse_rope = cos_sin_cache is not None
     separate_k_table = k_scratch is not None
+    fuse_rope = cos_sin_cache is not None and not separate_k_table
+    rotate_q = separate_k_table and use_span and cos_sin_cache is not None
     if separate_k_table:
-        assert not fuse_rope, "prerotated K scratch excludes fused RoPE"
         assert k_scratch_block_table is not None
         assert kv_quant_mode == KVQuantMode.NONE, (
             "SPANS prerotate supports unquantized KV caches only"
@@ -1408,8 +1441,8 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         cos_sin_cache_ptr=cos_sin_cache,
-        stride_cs_cache_0=cos_sin_cache.stride(0) if fuse_rope else 0,
-        stride_cs_cache_1=cos_sin_cache.stride(1) if fuse_rope else 0,
+        stride_cs_cache_0=cos_sin_cache.stride(0) if cos_sin_cache is not None else 0,
+        stride_cs_cache_1=cos_sin_cache.stride(1) if cos_sin_cache is not None else 0,
         FUSE_ROPE=fuse_rope,
         ROTARY_DIM=rotary_dim,
         KV_COMPUTE_DTYPE=kv_compute_dtype,
@@ -1421,6 +1454,7 @@ def unified_attention(
             k_scratch_block_table.stride(0) if separate_k_table else 0
         ),
         SEPARATE_K_TABLE=separate_k_table,
+        ROTATE_Q=rotate_q,
         **launch_kwargs,
     )
 

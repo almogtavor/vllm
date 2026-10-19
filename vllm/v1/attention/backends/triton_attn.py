@@ -744,11 +744,9 @@ class TritonAttentionImpl(AttentionImpl):
                 max_seqlen_k,
                 cos_sin_cache,
                 rotary_dim,
-                attn_lower_bounds,
-                req_kv_starts,
+                None,  # absolute positions; the kernel shifts Q by its lb instead
+                None,
             )
-            cos_sin_cache = None
-            rotary_dim = 0
         else:
             k_scratch_block_table = None
 
