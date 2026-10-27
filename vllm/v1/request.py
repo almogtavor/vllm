@@ -116,6 +116,8 @@ class Request:
         self.span_gaps_selection: tuple[int, list[tuple[int, int]]] | None = None
         # QCFUSE: per-token importance from the worker probe, read by QCFusePolicy
         self.qcfuse_importance: list[float] | None = None
+        # SPANFUSE: None -> inflight (probe scheduled) -> measured -> done
+        self.spanfuse_state: str | None = None
 
         if pooling_params is not None:
             # Pooling models.

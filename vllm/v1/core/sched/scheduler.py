@@ -43,6 +43,7 @@ from vllm.v1.core.sched.gap_policy import (
     GapPolicy,
     GapPolicyFactory,
     QCFusePolicy,
+    SpanFusePolicy,
     miss_gaps,
     schedule_span_gaps,
 )
@@ -174,7 +175,10 @@ class Scheduler(SchedulerInterface):
 
         # QCFUSE: importance from the worker probe, keyed by block hash
         self.qcfuse_store: QCFuseImportanceStore | None = None
-        if isinstance(self.gap_policy, QCFusePolicy):
+        # SPANFUSE probes the current query instead of the store
+        if isinstance(self.gap_policy, QCFusePolicy) and not isinstance(
+            self.gap_policy, SpanFusePolicy
+        ):
             self.qcfuse_store = QCFuseImportanceStore(self.gap_policy.block_size)
 
         self.kv_event_publisher = EventPublisherFactory.create(
@@ -790,7 +794,10 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
                     # SPANS: no fresh lookup ran; prior hit sources are stale.
-                    if not request.pending_span_gaps:
+                    if not request.pending_span_gaps and request.spanfuse_state not in (
+                        "inflight",
+                        "measured",
+                    ):
                         request.prefix_hit_sources = None
 
                 encoder_inputs_to_schedule = None
@@ -1167,6 +1174,8 @@ class Scheduler(SchedulerInterface):
         # SPANS: gap blocks were freed; the request re-selects on its next prefix lookup
         request.pending_span_gaps = []
         request.span_gaps_selection = None
+        if request.spanfuse_state is not None:
+            request.spanfuse_state = request.qcfuse_importance = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1589,6 +1598,22 @@ class Scheduler(SchedulerInterface):
                     continue
                 req.qcfuse_importance = importance
                 self.qcfuse_store.store(req.block_hashes, importance)
+
+        # SPANFUSE: the probe's importance feeds its own parent's repair
+        if isinstance(self.gap_policy, SpanFusePolicy):
+            imps = model_runner_output.qcfuse_importance or {}
+            for req_id in scheduler_output.num_scheduled_tokens:
+                if not req_id.endswith(".probe"):
+                    continue
+                req = self.requests.get(req_id[: -len(".probe")])
+                if req is None or req.spanfuse_state != "inflight":
+                    continue
+                imp = imps.get(req_id)
+                if imp is None:
+                    logger.warning("SpanFuse: no probe importance for %s", req_id)
+                    imp = [0.0] * req.num_computed_tokens
+                req.qcfuse_importance = imp
+                req.spanfuse_state = "measured"
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).

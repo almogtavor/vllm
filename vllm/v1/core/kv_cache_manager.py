@@ -469,7 +469,7 @@ class KVCacheManager:
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if not self.enable_caching or delay_cache_blocks:
+        if not self.enable_caching:
             return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
@@ -481,7 +481,9 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        # SPANFUSE: a delayed probe still swaps its MISS blocks below
+        if not delay_cache_blocks:
+            self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         if swap_indices:
             # SPANS: fresh pd-keyed blocks for the gap recompute; the shared

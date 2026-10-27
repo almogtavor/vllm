@@ -823,7 +823,7 @@ class GPUModelRunner(
                 self._spans_lb_len = [0] * self.max_num_reqs
         # QCFUSE: importance probe, allocated only under the knob
         self.qcfuse_capturer = None
-        self._qcfuse_descs: list[tuple[int, int, int, int]] = []
+        self._qcfuse_descs: list[tuple] = []
         if qcfuse.probe_enabled() and qcfuse.parse_critical_layers():
             self.qcfuse_capturer = qcfuse.QCFuseImportanceCapturer(
                 self.max_num_reqs, self.max_model_len, self.device
@@ -1343,6 +1343,10 @@ class GPUModelRunner(
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
                 is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
+                is_spanfuse_probe=getattr(new_req_data, "is_spanfuse_probe", False),
+                spanfuse_span_blocks=getattr(
+                    new_req_data, "spanfuse_span_blocks", None
+                ),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2098,11 +2102,18 @@ class GPUModelRunner(
                 nsched = int(num_scheduled_tokens[i])
                 ctx = int(self.input_batch.num_computed_tokens_cpu[i])
                 req = self.requests[self.input_batch.req_ids[i]]
-                if req.is_gap_recompute or nsched <= 1 or ctx < bs:
+                if envs.VLLM_V1_SPANS_SPANFUSE_ENABLE:
+                    # SPANFUSE: only the probe row scores, against span blocks only
+                    if not req.is_spanfuse_probe or ctx < bs:
+                        continue
+                elif req.is_gap_recompute or nsched <= 1 or ctx < bs:
                     continue
                 q_end = int(cu_num_tokens[i])
                 q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
-                descs.append((i, q_start, q_end, min(ctx, self.max_model_len)))
+                descs.append(
+                    (i, q_start, q_end, min(ctx, self.max_model_len),
+                     req.spanfuse_span_blocks)
+                )
             self._qcfuse_descs = descs
 
         # Calculate M-RoPE positions.
@@ -5065,7 +5076,7 @@ class GPUModelRunner(
             buf = self.qcfuse_capturer.buffer
             qcfuse_importance = {
                 self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
-                for row, _, _, ctx in self._qcfuse_descs
+                for row, _, _, ctx, _ in self._qcfuse_descs
             }
             self._qcfuse_descs = []
             self.qcfuse_capturer.end_step()

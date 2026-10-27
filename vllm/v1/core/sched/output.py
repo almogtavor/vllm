@@ -49,6 +49,9 @@ class NewRequestData:
     gap_start: int | None = (
         None  # Start position of gap in parent request (for KV copy)
     )
+    # SPANFUSE: current-query probe row and the span blocks it scores
+    is_spanfuse_probe: bool = False
+    spanfuse_span_blocks: list[int] | None = None
 
     @classmethod
     def from_request(

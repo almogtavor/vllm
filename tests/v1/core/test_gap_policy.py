@@ -132,3 +132,106 @@ def test_qcfuse_unmeasured_store_repairs_span_head(monkeypatch):
     assert imp == [0.0] * 160
     req.qcfuse_importance = imp
     assert QCFusePolicy(k_per_span=16).get_gaps(req, 160, 0) == [(64, 80)]
+
+
+def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
+    """(1) the probe softmax covers span blocks only; (2) a current-query probe
+    runs before repair and its top block is what gets repaired."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import torch
+
+    from vllm.v1.attention.qcfuse import QCFuseImportanceCapturer
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    bs, n_blk, span = 16, 10, [4, 5, 6, 7, 8]
+
+    # (1) mass lands only on span blocks, sums to 1 per (head, query row),
+    # ignores non-span keys, and keeps the full-softmax ranking inside the spans
+    torch.manual_seed(0)
+    kv = torch.randn(2, n_blk, bs, 2, 8)
+    q = torch.randn(4, 4, 8)
+    table = torch.arange(n_blk)[None]
+    cap = QCFuseImportanceCapturer(1, n_blk * bs, "cpu")
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span)])
+    cap.capture(q, kv, 2, 0.3)
+    got = cap.buffer[0].clone()
+    in_span = torch.zeros(n_blk * bs, dtype=torch.bool)
+    for b in span:
+        in_span[b * bs : (b + 1) * bs] = True
+    assert got[~in_span].eq(0).all()
+    assert torch.isclose(got.sum(), torch.tensor(4.0 * 2))
+    kv2 = kv.clone()
+    kv2[0, :4] = torch.randn_like(kv2[0, :4])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span)])
+    cap.capture(q, kv2, 2, 0.3)
+    assert torch.allclose(cap.buffer[0], got)
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None)])
+    cap.capture(q, kv, 2, 0.3)
+    full = cap.buffer[0][in_span]
+    # same rows, one shared normalizer per row: per-row rankings are identical
+    top = lambda m: m.topk(8).indices.sort().values
+    assert torch.equal(top(full), top(got[in_span]))
+
+    # (2) first pass schedules only the probe over the tail; second pass repairs
+    # the block the probe ranked highest
+    req = make_span_request(176, span_starts=[64])
+    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
+    req.prefix_hit_sources = [D] * 4 + [S] * 6
+    req.status = None
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([0] * 11,)
+    sched = SimpleNamespace(
+        gap_policy=SpanFusePolicy(k_per_span=16),
+        block_size=bs,
+        max_num_scheduled_tokens=8192,
+        connector=None,
+        _merge_gaps=sorted,
+        kv_cache_manager=SimpleNamespace(
+            allocate_slots=MagicMock(return_value=blocks),
+            get_blocks=MagicMock(return_value=blocks),
+        ),
+    )
+    queue = create_request_queue(SchedulingPolicy.FCFS)
+    queue.add_request(req)
+    skipped = create_request_queue(SchedulingPolicy.FCFS)
+    out, ids, nsched = [], set(), {}
+    call = lambda: schedule_span_gaps(
+        sched,
+        req,
+        True,
+        160,
+        0,
+        160,
+        MagicMock(),
+        8192,
+        nsched,
+        out,
+        ids,
+        queue,
+        skipped,
+    )
+    call()
+    assert [r.req_id for r in out] == ["gap_test.probe"]
+    assert out[0].is_spanfuse_probe and out[0].spanfuse_span_blocks == [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+    ]
+    assert nsched == {"gap_test.probe": 16} and req.spanfuse_state == "inflight"
+    imp = [0.0] * 160
+    imp[120] = 1.0
+    req.qcfuse_importance, req.spanfuse_state = imp, "measured"
+    queue.add_request(req)
+    out.clear(), ids.clear(), nsched.clear()
+    call()
+    assert req.spanfuse_state == "done"
+    assert (112, 128) in [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]

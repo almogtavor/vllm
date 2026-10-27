@@ -111,6 +111,36 @@ def schedule_span_gaps(
     parent was deferred (the caller sets token_budget and continues).
     """
     request_id = request.request_id
+    if (
+        isinstance(sched.gap_policy, SpanFusePolicy)
+        and request.spanfuse_state != "done"
+    ):
+        state = request.spanfuse_state
+        if state == "inflight":
+            # wait for the probe's importance, holding no budget
+            request_queue.pop_request()
+            step_skipped_waiting.prepend_request(request)
+            return token_budget
+        if state is None and did_prefix_lookup:
+            probed = _schedule_spanfuse_probe(
+                sched,
+                request,
+                num_computed_tokens,
+                num_external_computed_tokens,
+                num_new_local_computed_tokens,
+                new_computed_blocks,
+                token_budget,
+                num_scheduled_tokens,
+                virtual_reqs_out,
+                virtual_gap_req_ids,
+                request_queue,
+                step_skipped_waiting,
+            )
+            if probed is not NO_SPAN_GAPS:
+                return probed
+        # measured: select exactly as QCFuse would at its prefix lookup
+        did_prefix_lookup = did_prefix_lookup or state == "measured"
+        request.spanfuse_state = "done"
     if request.pending_span_gaps:
         span_gaps = request.pending_span_gaps
     elif did_prefix_lookup and sched.gap_policy is not None:
@@ -182,6 +212,90 @@ def schedule_span_gaps(
     request_queue.pop_request()
     step_skipped_waiting.prepend_request(request)
     return token_budget - gap_overhead
+
+
+def _schedule_spanfuse_probe(
+    sched: "Scheduler",
+    request: "Request",
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """Run the uncached tail once so its trailing query rows score the span
+    blocks before any repair; MISS blocks are recomputed in the same step so
+    the probe never reads the null placeholder."""
+    bs = sched.block_size
+    sources = request.prefix_hit_sources or []
+    span_blocks = [
+        b
+        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+        for b in range(s // bs, e // bs)
+    ]
+    if not any(
+        b < len(sources) and sources[b] == PrefixHitSource.PIC for b in span_blocks
+    ):
+        return NO_SPAN_GAPS
+    tail = request.num_tokens - num_computed_tokens
+    miss = miss_gaps(request, bs)
+    work = tail + len(miss) * bs
+    if work > sched.max_num_scheduled_tokens:
+        # ponytail: oversized probe falls back to span-head repair; chunk if it fires
+        logger.warning(
+            "SpanFuse: probe of %d tokens too large for %s", work, request.request_id
+        )
+        request.qcfuse_importance = [0.0] * num_computed_tokens
+        return NO_SPAN_GAPS
+    if work > token_budget:
+        return None
+    # delayed: the probe's tail KV is recomputed (and cached) by the parent prefill
+    blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        tail,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        num_external_computed_tokens=num_external_computed_tokens,
+        delay_cache_blocks=True,
+        span_gaps=miss,
+    )
+    if blocks is None:
+        return None
+    # MISS blocks are now fresh copies of this prefix: never re-swapped
+    request.prefix_hit_sources = [
+        PrefixHitSource.PD if s == PrefixHitSource.MISS else s for s in sources
+    ]
+    request.num_computed_tokens = num_computed_tokens
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+    )
+    if miss:
+        append_virtual_gap_reqs(
+            parent_nrd,
+            miss,
+            virtual_reqs_out,
+            virtual_gap_req_ids,
+            num_scheduled_tokens,
+        )
+    probe = replace(
+        parent_nrd,
+        req_id=request.request_id + ".probe",
+        parent_req_id=request.request_id,
+        is_spanfuse_probe=True,
+        spanfuse_span_blocks=span_blocks,
+    )
+    num_scheduled_tokens[probe.req_id] = tail
+    virtual_reqs_out.append(probe)
+    virtual_gap_req_ids.add(probe.req_id)
+    request.spanfuse_state = "inflight"
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - work
 
 
 class GapPolicy(ABC):
@@ -533,6 +647,10 @@ class NeighborAwarePolicy(QCFusePolicy):
         return gaps
 
 
+class SpanFusePolicy(QCFusePolicy):
+    """QCFuse whose importance comes from the current request's probe."""
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
@@ -541,6 +659,7 @@ class GapPolicyFactory:
         "span_aware": SpanAwareGapPolicy,
         "qcfuse": QCFusePolicy,
         "neighbor_aware": NeighborAwarePolicy,
+        "spanfuse": SpanFusePolicy,
     }
 
     @classmethod

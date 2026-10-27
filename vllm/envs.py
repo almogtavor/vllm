@@ -275,6 +275,8 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
     VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
     VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
+    VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
+    VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1763,6 +1765,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
     ),
     # PIC neighbor-aware gap policy (QCFuse probe, closure-aware ranking)
+    # SPANFUSE: QCFuse with a current-query probe scored against span keys only
+    "VLLM_V1_SPANS_SPANFUSE_ENABLE": lambda: (
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_ENABLE", "False") == "True"
+    ),
+    # SPANFUSE: also score the full prefix and log the per-span top-K agreement
+    "VLLM_V1_SPANS_SPANFUSE_NORM_CHECK": lambda: (
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_NORM_CHECK", "False") == "True"
+    ),
     "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
         os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"
     ),

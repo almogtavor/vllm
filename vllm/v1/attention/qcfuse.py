@@ -11,6 +11,9 @@ from __future__ import annotations
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # trailing rows treated as the query, bounding the probe's cost
 QCFUSE_MAX_QUERY_TOKENS = 64
@@ -22,14 +25,19 @@ def parse_critical_layers() -> tuple[int, ...]:
 
 
 def probe_enabled() -> bool:
-    return envs.VLLM_V1_SPANS_QCFUSE_ENABLE or envs.VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE
+    return (
+        envs.VLLM_V1_SPANS_QCFUSE_ENABLE
+        or envs.VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE
+        or envs.VLLM_V1_SPANS_SPANFUSE_ENABLE
+    )
 
 
 class QCFuseImportanceCapturer:
     """Per-worker importance buffer, filled once per critical layer.
 
-    Descriptor ``(row, q_start, q_end, ctx_len)``: batch row, flat query rows,
-    and cached prefix length; results go to ``buffer[row, :ctx_len]``.
+    Descriptor ``(row, q_start, q_end, ctx_len, span_blocks)``: batch row,
+    flat query rows, cached prefix length, and (SpanFuse) the span block
+    indices the softmax runs over, or None for the whole prefix.
     """
 
     def __init__(self, max_num_reqs: int, max_model_len: int, device) -> None:
@@ -37,12 +45,12 @@ class QCFuseImportanceCapturer:
             (max_num_reqs, max_model_len), dtype=torch.float32, device=device
         )
         self.block_table: torch.Tensor | None = None
-        self.descs: list[tuple[int, int, int, int]] = []
+        self.descs: list[tuple] = []
 
     def begin_step(self, block_table: torch.Tensor | None, descs: list) -> None:
         self.block_table = block_table
         self.descs = descs
-        for row, _, _, ctx_len in descs:
+        for row, _, _, ctx_len, _ in descs:
             self.buffer[row, :ctx_len].zero_()
 
     def end_step(self) -> None:
@@ -66,21 +74,53 @@ class QCFuseImportanceCapturer:
             )
         key_cache = kv_cache[0] if kv_cache.shape[0] == 2 else kv_cache[:, 0]
         bs = key_cache.shape[1]
-        for row, q_start, q_end, ctx_len in self.descs:
+        for row, q_start, q_end, ctx_len, span_blocks in self.descs:
             n_blk = min(ctx_len // bs, block_table.shape[1])
             if n_blk <= 0 or q_end <= q_start:
                 continue
-            blk_ids = block_table[row, :n_blk].long()
-            # (n_blk, bs, n_kv_heads, head) -> (ctx, n_kv_heads, head)
-            k_ctx = key_cache[blk_ids].flatten(0, 1).float()
             q = query[q_start:q_end].float()
             nq, n_heads, head_dim = q.shape
             n_kv = n_heads // num_queries_per_kv
             # mean-pool each GQA group onto its KV head
             q = q.view(nq, n_kv, num_queries_per_kv, head_dim).mean(2)
-            scores = torch.einsum("qhd,chd->hqc", q, k_ctx) * scale
-            mass = scores.softmax(dim=-1).sum(dim=(0, 1))
-            self.buffer[row, : n_blk * bs] += mass
+            if span_blocks is not None:
+                # SPANFUSE: normalize over the span blocks only, not the prefix
+                idx = torch.tensor(
+                    [b for b in span_blocks if b < n_blk],
+                    dtype=torch.long,
+                    device=block_table.device,
+                )
+                if idx.numel() == 0:
+                    continue
+                k_ctx = key_cache[block_table[row, idx].long()].flatten(0, 1).float()
+                mass = self._mass(q, k_ctx, scale)
+                pos = (
+                    idx[:, None] * bs + torch.arange(bs, device=idx.device)
+                ).flatten()
+                self.buffer[row].index_add_(0, pos.to(self.buffer.device), mass)
+                if envs.VLLM_V1_SPANS_SPANFUSE_NORM_CHECK:
+                    self._log_norm_check(
+                        q, key_cache, block_table[row, :n_blk], pos, mass, scale
+                    )
+                continue
+            blk_ids = block_table[row, :n_blk].long()
+            # (n_blk, bs, n_kv_heads, head) -> (ctx, n_kv_heads, head)
+            k_ctx = key_cache[blk_ids].flatten(0, 1).float()
+            self.buffer[row, : n_blk * bs] += self._mass(q, k_ctx, scale)
+
+    @staticmethod
+    def _mass(q, k_ctx, scale: float) -> torch.Tensor:
+        scores = torch.einsum("qhd,chd->hqc", q, k_ctx) * scale
+        return scores.softmax(dim=-1).sum(dim=(0, 1))
+
+    def _log_norm_check(self, q, key_cache, blk_row, pos, mass, scale) -> None:
+        full = self._mass(q, key_cache[blk_row.long()].flatten(0, 1).float(), scale)[
+            pos
+        ]
+        n = max(1, pos.numel() // 10)
+        a = set(mass.topk(n).indices.tolist())
+        b = set(full.topk(n).indices.tolist())
+        logger.info("SpanFuse norm check: top-%d overlap %d/%d", n, len(a & b), n)
 
 
 _CAPTURER: QCFuseImportanceCapturer | None = None
