@@ -9,6 +9,7 @@ generated tokens (decode blind to everything before it - the mind2web
 multi-DOM-chunk degeneration). These pin the positional pairing rule:
 a span's region ends at min(next span start, first cross past it).
 """
+
 from vllm.v1.worker.gpu_model_runner import compute_span_lb_regions
 
 B = 16  # block size used for readable offsets
@@ -49,6 +50,7 @@ def test_request_pic_token_ranges_pairing():
     # request.py sibling rule: adjacent spans' pd/pic hash ranges must not
     # overlap through the last cross.
     from vllm.v1.request import Request  # noqa: F401  (import guards the path)
+
     # The range rule mirrors compute_span_lb_regions with None for "open":
     regions = compute_span_lb_regions([B, 3 * B], [5 * B], 10 * B)
     assert regions[0][1] == 3 * B and regions[1][1] == 5 * B

@@ -506,6 +506,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         prefix); also returns each block's hit source.
         Misses before the last hit become null MISS placeholders."""
         bs = self.block_size
+        assert request.span_starts
         first = min(request.span_starts)
         computed: list[KVCacheBlock] = []
         sources: list[PrefixHitSource] = []

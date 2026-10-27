@@ -233,13 +233,13 @@ class KVCacheManager:
             and getattr(self.coordinator, "supports_dual_cache_hit", lambda: False)()
         ):
             computed_blocks, num_new_computed_tokens, hit_sources = (
-                self.coordinator.find_longest_cache_hit_dual(
+                self.coordinator.find_longest_cache_hit_dual(  # type: ignore[attr-defined]
                     request, max_cache_hit_length
                 )
             )
             request.prefix_hit_sources = hit_sources
             miss_tokens = (
-                hit_sources.count(PrefixHitSource.MISS) * self.coordinator.block_size
+                hit_sources.count(PrefixHitSource.MISS) * self.coordinator.block_size  # type: ignore[attr-defined]
             )
         else:
             computed_blocks, num_new_computed_tokens = (
@@ -489,14 +489,17 @@ class KVCacheManager:
             # SPANS: fresh pd-keyed blocks for the gap recompute; the shared
             # warmed (pic) blocks are left untouched for other prefixes.
             manager = self.coordinator.single_type_managers[0]
-            fresh = manager.swap_blocks_for_gap_recompute(
+            fresh = manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
                 request.request_id, swap_indices
             )
-            bs = self.coordinator.block_size
+            bs = self.coordinator.block_size  # type: ignore[attr-defined]
+            assert request.span_starts and request.pd_block_hashes is not None
             first = min(request.span_starts)
             # the key the dual lookup tries first: pd from the first span start on
             hashes = [
-                request.pd_block_hashes[i] if i * bs >= first else request.block_hashes[i]
+                request.pd_block_hashes[i]
+                if i * bs >= first
+                else request.block_hashes[i]
                 for i in swap_indices
             ]
             self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
@@ -509,7 +512,7 @@ class KVCacheManager:
         sources = request.prefix_hit_sources
         if not span_gaps or sources is None:
             return []
-        bs = self.coordinator.block_size
+        bs = self.coordinator.block_size  # type: ignore[attr-defined]
         return [
             b
             for s, e in span_gaps

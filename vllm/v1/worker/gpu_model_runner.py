@@ -596,7 +596,8 @@ class GPUModelRunner(
 
         if self._kv_hash_debug_enabled:
             logger.info(
-                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, output_file=%s, log_interval=%d",
+                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, "
+                "output_file=%s, log_interval=%d",
                 self._kv_hash_debug_layer,
                 self._kv_hash_debug_req_ids if self._kv_hash_debug_req_ids else "ALL",
                 self._kv_hash_debug_output_file
@@ -2057,7 +2058,7 @@ class GPUModelRunner(
                     continue
                 ea = params.extra_args
                 spans = ea.get("span_starts") if ea else None
-                if not spans:
+                if not spans or ea is None:
                     continue
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
                 for start, end, lb in compute_span_lb_regions(
@@ -2081,6 +2082,7 @@ class GPUModelRunner(
             # copy the packed bounds into the strided buffer in place
             stride = self._spans_lb_stride
             staging = self._spans_lb_staging
+            lb_gpu = self._attn_lower_bounds_gpu
             _scatter_reqs = num_reqs if stride else 0
             if not stride:
                 self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
@@ -2090,17 +2092,18 @@ class GPUModelRunner(
                     self.device, non_blocking=True
                 )
             for i in range(_scatter_reqs):
+                assert staging is not None and lb_gpu is not None
                 lo, hi = int(req_kv_starts[i]), int(req_kv_starts[i + 1])
                 n = min(hi - lo, stride)
                 base = i * stride
                 prev = self._spans_lb_len[i]
                 if prev > n:
-                    self._attn_lower_bounds_gpu[base + n : base + prev].zero_()
+                    lb_gpu[base + n : base + prev].zero_()
                 self._spans_lb_len[i] = n
                 if n <= 0:
                     continue
                 staging[base : base + n] = torch.from_numpy(attn_lb[lo : lo + n])
-                self._attn_lower_bounds_gpu[base : base + n].copy_(
+                lb_gpu[base : base + n].copy_(
                     staging[base : base + n], non_blocking=True
                 )
 
@@ -2522,21 +2525,8 @@ class GPUModelRunner(
         if self.qcfuse_capturer is not None:
             self.qcfuse_capturer.begin_step(block_table_gid_0, self._qcfuse_descs)
 
-        # print("==================MODULES===============")
-
-        # # Dump full structure
-        # for name, module in self.model.named_modules():
-        #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
-        #     for attr_name, attr_value in module.__dict__.items():
-        #         logger.info("  .%s: %s = %s", attr_name, type(attr_value).__name__, repr(attr_value)[:100])
-
-        # # Find rotary
-        # for name, module in self.model.named_modules():
-        #     if "rotary" in type(module).__name__.lower() or "rotary" in name.lower():
-        #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
-
         if not hasattr(self, "rotate"):
-            # Get the layers list, handling both standard and Llama4-style model structures
+            # layers list, for both standard and Llama4-style model structures
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                 layers = self.model.model.layers
             elif hasattr(self.model, "language_model") and hasattr(
@@ -2545,7 +2535,8 @@ class GPUModelRunner(
                 layers = self.model.language_model.model.layers
             else:
                 raise AttributeError(
-                    f"Cannot find layers in model structure: {type(self.model).__name__}"
+                    "Cannot find layers in model structure: "
+                    f"{type(self.model).__name__}"
                 )
 
             for lay in layers:

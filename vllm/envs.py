@@ -1712,8 +1712,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
-    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
-    .lower()
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get(
+        "VLLM_V1_SPANS_CUDAGRAPH", "True"
+    ).lower()
     in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
@@ -1739,9 +1740,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # rotate K once per forward into a transient scratch (prefill batches)
     # instead of per-tile inside the attention kernel
-    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get(
-        "VLLM_V1_SPANS_PREROTATE", "True"
-    )
+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
     == "True",
     # QCFuse: recompute a query-selected subset of cached tokens on all layers
     "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(

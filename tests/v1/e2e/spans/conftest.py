@@ -3,7 +3,8 @@
 # ruff: noqa: E402  (VLLM_BATCH_INVARIANT must be set before vLLM is imported)
 import os
 
-os.environ.setdefault("VLLM_BATCH_INVARIANT", "1") # exact KV comparison across shapes
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")  # exact KV comparison across shapes
+import contextlib
 import gc
 import hashlib
 import os
@@ -211,14 +212,12 @@ def cleanup(llm: LLM | None) -> None:
         # The caller still holds `llm`, so `del` alone won't collect the engine;
         # shut it down explicitly so its (subprocess) GPU memory is freed now -
         # a 62GB model can't co-reside with the next build in the same process.
-        try:
+        with contextlib.suppress(Exception):
             llm.llm_engine.engine_core.shutdown()
-        except Exception:
-            pass
         del llm
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         import time
 
         for _ in range(60):
@@ -364,13 +363,12 @@ def _request_block_hashes(
     if not hasattr(kv_cache_utils, "NONE_HASH"):
         kv_cache_utils.init_none_hash(hash_fn)
 
-    extra_args = {}
+    extra_args: dict[str, list[int]] = {}
     if span_starts is not None:
         extra_args["span_starts"] = span_starts
     if cross_span_starts is not None:
         extra_args["cross_span_starts"] = cross_span_starts
-    extra_args = extra_args or None
-    sp = greedy_sp(extra_args)
+    sp = greedy_sp(extra_args or None)
     sp.update_from_generation_config({}, eos_token_id=100)
     req = Request(
         request_id="hash_probe",

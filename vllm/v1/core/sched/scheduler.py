@@ -784,7 +784,8 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             # MISS placeholders are recomputed, not cached
                             num_local_cached_tokens=num_new_local_computed_tokens
-                            - len(miss_gaps(request, self.block_size)) * self.block_size,
+                            - len(miss_gaps(request, self.block_size))
+                            * self.block_size,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                 else:

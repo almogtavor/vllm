@@ -234,7 +234,9 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     queue = create_request_queue(SchedulingPolicy.FCFS)
     queue.add_request(req)
     skipped = create_request_queue(SchedulingPolicy.FCFS)
-    out, ids, nsched = [], set(), {}
+    out: list = []
+    ids: set[str] = set()
+    nsched: dict[str, int] = {}
     call = lambda: schedule_span_gaps(
         sched,
         req,
@@ -267,7 +269,9 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     imp[120] = 1.0
     req.qcfuse_importance, req.spanfuse_state = imp, "measured"
     queue.add_request(req)
-    out.clear(), ids.clear(), nsched.clear()
+    out.clear()
+    ids.clear()
+    nsched.clear()
     call()
     assert req.spanfuse_state == "done"
     assert (112, 128) in [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
@@ -277,7 +281,9 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     req.spanfuse_state = req.span_gaps_selection = None
     req.pending_span_gaps = []
     queue.add_request(req)
-    out.clear(), ids.clear(), nsched.clear()
+    out.clear()
+    ids.clear()
+    nsched.clear()
     call()
     assert [r.req_id for r in out] == ["gap_test.64", "gap_test.probe"]
     assert nsched == {"gap_test.64": 48, "gap_test.probe": 64}

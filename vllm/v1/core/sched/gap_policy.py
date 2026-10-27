@@ -145,7 +145,7 @@ def schedule_span_gaps(
     if request.pending_span_gaps:
         span_gaps = request.pending_span_gaps
     elif did_prefix_lookup and sched.gap_policy is not None:
-        # memoize per (request, prefix length): the probe rewrites importance between retries
+        # memoize per (request, prefix length): the probe rewrites importance
         memo = request.span_gaps_selection
         if memo is not None and memo[0] == num_computed_tokens:
             span_gaps = list(memo[1])
