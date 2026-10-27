@@ -52,6 +52,7 @@ class NewRequestData:
     # SPANFUSE: current-query probe row and the span blocks it scores
     is_spanfuse_probe: bool = False
     spanfuse_span_blocks: list[int] | None = None
+    spanfuse_window: int = 0  # leading probe rows that are already cached
 
     @classmethod
     def from_request(

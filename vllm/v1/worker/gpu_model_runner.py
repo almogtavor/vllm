@@ -138,6 +138,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
+    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -801,7 +802,9 @@ class GPUModelRunner(
                 logger.warning(
                     "SPANS: lower-bound buffer would be %.1f GiB "
                     "(max_num_seqs=%d x max_model_len=%d); keeping the eager path.",
-                    _lb_n * 4 / 2**30, self.max_num_reqs, self._spans_lb_stride,
+                    _lb_n * 4 / 2**30,
+                    self.max_num_reqs,
+                    self._spans_lb_stride,
                 )
                 self._spans_lb_stride = 0
                 self._attn_lower_bounds_gpu: torch.Tensor | None = None
@@ -812,9 +815,12 @@ class GPUModelRunner(
                 self._attn_lower_bounds_gpu = torch.zeros(
                     _lb_n, dtype=torch.int32, device=self.device
                 )
-                self._req_kv_starts_gpu = torch.arange(
-                    self.max_num_reqs + 1, dtype=torch.int32, device=self.device
-                ) * self._spans_lb_stride
+                self._req_kv_starts_gpu = (
+                    torch.arange(
+                        self.max_num_reqs + 1, dtype=torch.int32, device=self.device
+                    )
+                    * self._spans_lb_stride
+                )
                 # pinned, or non_blocking copies are synchronous
                 self._spans_lb_staging = torch.zeros(
                     _lb_n, dtype=torch.int32, pin_memory=True
@@ -1347,6 +1353,7 @@ class GPUModelRunner(
                 spanfuse_span_blocks=getattr(
                     new_req_data, "spanfuse_span_blocks", None
                 ),
+                spanfuse_window=getattr(new_req_data, "spanfuse_window", 0),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2059,6 +2066,9 @@ class GPUModelRunner(
                     attn_lb[req_start + start : req_start + end] = lb
                 q_start = req_start + int(num_computed[i])
                 q_end = req_start + req_len
+                if req.is_spanfuse_probe:
+                    # SPANFUSE: the query rows read the whole prefix
+                    attn_lb[q_start:q_end] = 0
                 if q_end > q_start:
                     req_lbs = attn_lb[req_start:q_end]
                     query_lbs = attn_lb[q_start:q_end]
@@ -2085,13 +2095,13 @@ class GPUModelRunner(
                 base = i * stride
                 prev = self._spans_lb_len[i]
                 if prev > n:
-                    self._attn_lower_bounds_gpu[base + n:base + prev].zero_()
+                    self._attn_lower_bounds_gpu[base + n : base + prev].zero_()
                 self._spans_lb_len[i] = n
                 if n <= 0:
                     continue
-                staging[base:base + n] = torch.from_numpy(attn_lb[lo:lo + n])
-                self._attn_lower_bounds_gpu[base:base + n].copy_(
-                    staging[base:base + n], non_blocking=True
+                staging[base : base + n] = torch.from_numpy(attn_lb[lo : lo + n])
+                self._attn_lower_bounds_gpu[base : base + n].copy_(
+                    staging[base : base + n], non_blocking=True
                 )
 
         # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
@@ -2100,8 +2110,10 @@ class GPUModelRunner(
             bs = self.cache_config.block_size
             for i in range(num_reqs):
                 nsched = int(num_scheduled_tokens[i])
-                ctx = int(self.input_batch.num_computed_tokens_cpu[i])
+                computed = int(self.input_batch.num_computed_tokens_cpu[i])
                 req = self.requests[self.input_batch.req_ids[i]]
+                # the probe's cached window rows stay scored as context
+                ctx = computed + req.spanfuse_window
                 if envs.VLLM_V1_SPANS_SPANFUSE_ENABLE:
                     # SPANFUSE: only the probe row scores, against span blocks only
                     if not req.is_spanfuse_probe or ctx < bs:
@@ -2110,14 +2122,24 @@ class GPUModelRunner(
                     continue
                 q_end = int(cu_num_tokens[i])
                 q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
+                q_pos0 = computed + nsched - (q_end - q_start)
                 descs.append(
-                    (i, q_start, q_end, min(ctx, self.max_model_len),
-                     req.spanfuse_span_blocks)
+                    (
+                        i,
+                        q_start,
+                        q_end,
+                        min(ctx, self.max_model_len),
+                        req.spanfuse_span_blocks,
+                        q_pos0,
+                    )
                 )
                 if req.is_spanfuse_probe:
-                    logger.info("SpanFuse probe %s: %d query rows, %d span blocks",
-                                req.req_id, q_end - q_start,
-                                len(req.spanfuse_span_blocks or ()))
+                    logger.info(
+                        "SpanFuse probe %s: %d query rows, %d span blocks",
+                        req.req_id,
+                        q_end - q_start,
+                        len(req.spanfuse_span_blocks or ()),
+                    )
             self._qcfuse_descs = descs
 
         # Calculate M-RoPE positions.
@@ -2326,6 +2348,13 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        # SPANFUSE: the probe's window rows are cached already; never overwrite
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            window = self.requests[req_id].spanfuse_window
+            if window and envs.VLLM_V1_SPANS_SPANFUSE_ENABLE:
+                qs = int(self.query_start_loc.np[i])
+                for bt in self.input_batch.block_table.block_tables:
+                    bt.slot_mapping.gpu[qs : qs + window].fill_(PAD_SLOT_ID)
 
         # SPANS: shift Q positions to span-relative on the GPU, after the slot
         # mapping (which requires absolute positions). On-the-fly-warmup did
@@ -5080,7 +5109,7 @@ class GPUModelRunner(
             buf = self.qcfuse_capturer.buffer
             qcfuse_importance = {
                 self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
-                for row, _, _, ctx, _ in self._qcfuse_descs
+                for row, _, _, ctx, _, _ in self._qcfuse_descs
             }
             self._qcfuse_descs = []
             self.qcfuse_capturer.end_step()

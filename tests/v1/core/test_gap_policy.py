@@ -159,7 +159,7 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     q = torch.randn(4, 4, 8)
     table = torch.arange(n_blk)[None]
     cap = QCFuseImportanceCapturer(1, n_blk * bs, "cpu")
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
     cap.capture(q, kv, 2, 0.3)
     got = cap.buffer[0].clone()
     in_span = torch.zeros(n_blk * bs, dtype=torch.bool)
@@ -169,10 +169,10 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     assert torch.isclose(got.sum(), torch.tensor(4.0 * 2))
     kv2 = kv.clone()
     kv2[0, :4] = torch.randn_like(kv2[0, :4])
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
     cap.capture(q, kv2, 2, 0.3)
     assert torch.allclose(cap.buffer[0], got)
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs)])
     cap.capture(q, kv, 2, 0.3)
     full = cap.buffer[0][in_span]
     # same rows, one shared normalizer per row: per-row rankings are identical
@@ -193,14 +193,20 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     k_rot = torch.cat((z.real, z.imag, k[..., rot:hd]), -1)
     pos = torch.cat([torch.arange(b * bs, (b + 1) * bs) for b in span])
     want = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot[pos], 0.3)
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
     cap.capture(q, kv, 2, 0.3, cos_sin, rot)
     assert torch.allclose(cap.buffer[0][pos], want, atol=1e-5)
     assert not torch.allclose(got[pos], want, atol=1e-3)
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs)])
     cap.capture(q, kv, 2, 0.3, cos_sin, rot)
     want_full = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot, 0.3)
     assert torch.allclose(cap.buffer[0], want_full, atol=1e-5)
+    # query rows inside the last span block never score keys after themselves
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, 8 * bs + 2)])
+    cap.capture(q, kv, 2, 0.3)
+    assert cap.buffer[0][8 * bs + 6 :].eq(0).all()
+    assert cap.buffer[0][8 * bs + 2 : 8 * bs + 6].gt(0).all()
+    assert torch.isclose(cap.buffer[0].sum(), torch.tensor(4.0 * 2))
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     with pytest.raises(RuntimeError, match="RoPE"):
         cap.capture(q, kv, 2, 0.3)
@@ -253,7 +259,9 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
         8,
         9,
     ]
-    assert nsched == {"gap_test.probe": 16} and req.spanfuse_state == "inflight"
+    # always QCFUSE_MAX_QUERY_TOKENS query rows: 16 uncached + 48 cached rows
+    assert nsched == {"gap_test.probe": 64} and req.spanfuse_state == "inflight"
+    assert (out[0].num_computed_tokens, out[0].spanfuse_window) == (112, 48)
     imp = [0.0] * 160
     imp[120] = 1.0
     req.qcfuse_importance, req.spanfuse_state = imp, "measured"

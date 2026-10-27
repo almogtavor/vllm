@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
 from vllm.v1.core.sched.output import NewRequestData
 
@@ -243,8 +244,12 @@ def _schedule_spanfuse_probe(
     ):
         return NO_SPAN_GAPS
     tail = request.num_tokens - num_computed_tokens
+    # cached rows re-run as query rows; the runner drops their KV writes
+    w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
+    w = min(num_computed_tokens, w)
+    window = num_computed_tokens - w
     miss = miss_gaps(request, bs)
-    work = tail + len(miss) * bs
+    work = tail + window + len(miss) * bs
     if work > sched.max_num_scheduled_tokens:
         # ponytail: oversized probe falls back to span-head repair; chunk if it fires
         logger.warning(
@@ -286,10 +291,12 @@ def _schedule_spanfuse_probe(
         parent_nrd,
         req_id=request.request_id + ".probe",
         parent_req_id=request.request_id,
+        num_computed_tokens=w,
         is_spanfuse_probe=True,
         spanfuse_span_blocks=span_blocks,
+        spanfuse_window=window,
     )
-    num_scheduled_tokens[probe.req_id] = tail
+    num_scheduled_tokens[probe.req_id] = tail + window
     virtual_reqs_out.append(probe)
     virtual_gap_req_ids.add(probe.req_id)
     request.spanfuse_state = "inflight"

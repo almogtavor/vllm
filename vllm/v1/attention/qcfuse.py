@@ -35,9 +35,10 @@ def probe_enabled() -> bool:
 class QCFuseImportanceCapturer:
     """Per-worker importance buffer, filled once per critical layer.
 
-    Descriptor ``(row, q_start, q_end, ctx_len, span_blocks)``: batch row,
-    flat query rows, cached prefix length, and (SpanFuse) the span block
-    indices the softmax runs over, or None for the whole prefix.
+    Descriptor ``(row, q_start, q_end, ctx_len, span_blocks, q_pos0)``: batch
+    row, flat query rows, scored prefix length, (SpanFuse) the span block
+    indices the softmax runs over or None for the whole prefix, and the
+    absolute position of row ``q_start`` (keys after a row are masked).
     """
 
     def __init__(self, max_num_reqs: int, max_model_len: int, device) -> None:
@@ -50,7 +51,7 @@ class QCFuseImportanceCapturer:
     def begin_step(self, block_table: torch.Tensor | None, descs: list) -> None:
         self.block_table = block_table
         self.descs = descs
-        for row, _, _, ctx_len, _ in descs:
+        for row, _, _, ctx_len, _, _ in descs:
             self.buffer[row, :ctx_len].zero_()
 
     def end_step(self) -> None:
@@ -86,7 +87,7 @@ class QCFuseImportanceCapturer:
             )
         key_cache = kv_cache[0] if kv_cache.shape[0] == 2 else kv_cache[:, 0]
         bs = key_cache.shape[1]
-        for row, q_start, q_end, ctx_len, span_blocks in self.descs:
+        for row, q_start, q_end, ctx_len, span_blocks, q_pos0 in self.descs:
             n_blk = min(ctx_len // bs, block_table.shape[1])
             if n_blk <= 0 or q_end <= q_start:
                 continue
@@ -95,6 +96,7 @@ class QCFuseImportanceCapturer:
             n_kv = n_heads // num_queries_per_kv
             # mean-pool each GQA group onto its KV head
             q = q.view(nq, n_kv, num_queries_per_kv, head_dim).mean(2)
+            q_pos = q_pos0 + torch.arange(nq, device=q.device)
             if span_blocks is not None:
                 # SPANFUSE: normalize over the span blocks only, not the prefix
                 idx = torch.tensor(
@@ -108,11 +110,18 @@ class QCFuseImportanceCapturer:
                     idx[:, None] * bs + torch.arange(bs, device=idx.device)
                 ).flatten()
                 k_ctx = key_cache[block_table[row, idx].long()].flatten(0, 1).float()
-                mass = self._mass(q, self._rope(k_ctx, pos, rope), scale)
+                mass = self._mass(q, self._rope(k_ctx, pos, rope), scale, q_pos, pos)
                 self.buffer[row].index_add_(0, pos.to(self.buffer.device), mass)
                 if envs.VLLM_V1_SPANS_SPANFUSE_NORM_CHECK:
                     self._log_norm_check(
-                        q, key_cache, block_table[row, :n_blk], pos, mass, scale, rope
+                        q,
+                        q_pos,
+                        key_cache,
+                        block_table[row, :n_blk],
+                        pos,
+                        mass,
+                        scale,
+                        rope,
                     )
                 continue
             blk_ids = block_table[row, :n_blk].long()
@@ -120,7 +129,7 @@ class QCFuseImportanceCapturer:
             k_ctx = key_cache[blk_ids].flatten(0, 1).float()
             pos = torch.arange(n_blk * bs, device=k_ctx.device)
             self.buffer[row, : n_blk * bs] += self._mass(
-                q, self._rope(k_ctx, pos, rope), scale
+                q, self._rope(k_ctx, pos, rope), scale, q_pos, pos
             )
 
     @staticmethod
@@ -139,14 +148,19 @@ class QCFuseImportanceCapturer:
         return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin, k[..., rot:]), -1)
 
     @staticmethod
-    def _mass(q, k_ctx, scale: float) -> torch.Tensor:
+    def _mass(q, k_ctx, scale: float, q_pos=None, k_pos=None) -> torch.Tensor:
         scores = torch.einsum("qhd,chd->hqc", q, k_ctx) * scale
-        return scores.softmax(dim=-1).sum(dim=(0, 1))
+        if q_pos is not None:
+            causal = k_pos.to(q_pos.device)[None, :] > q_pos[:, None]
+            scores = scores.masked_fill(causal[None], float("-inf"))
+        return scores.softmax(dim=-1).nan_to_num(0.0).sum(dim=(0, 1))
 
-    def _log_norm_check(self, q, key_cache, blk_row, pos, mass, scale, rope) -> None:
+    def _log_norm_check(
+        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope
+    ) -> None:
         k_all = key_cache[blk_row.long()].flatten(0, 1).float()
         ar = torch.arange(k_all.shape[0], device=k_all.device)
-        full = self._mass(q, self._rope(k_all, ar, rope), scale)[pos]
+        full = self._mass(q, self._rope(k_all, ar, rope), scale, q_pos, ar)[pos]
         n = max(1, pos.numel() // 10)
         a = set(mass.topk(n).indices.tolist())
         b = set(full.topk(n).indices.tolist())
