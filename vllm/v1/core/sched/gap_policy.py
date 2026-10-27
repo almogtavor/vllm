@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS
+from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS, spanfuse_query_ids
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
 from vllm.v1.core.sched.output import NewRequestData
 
@@ -250,12 +250,16 @@ def _schedule_spanfuse_probe(
     ):
         return NO_SPAN_GAPS
     tail = request.num_tokens - num_computed_tokens
+    # the appended instruction rows are the query, so no cached window is re-run
+    suffix = spanfuse_query_ids(sched.vllm_config.model_config)
+    if request.num_tokens + len(suffix) > sched.max_model_len:
+        suffix = []
     # cached rows re-run as query rows; the runner drops their KV writes
     w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
-    w = min(num_computed_tokens, w)
+    w = num_computed_tokens if suffix else min(num_computed_tokens, w)
     window = num_computed_tokens - w
     miss = sched._merge_gaps(miss_gaps(request, bs))
-    work = tail + window + sum(e - s for s, e in miss)
+    work = tail + window + len(suffix) + sum(e - s for s, e in miss)
     if work > sched.max_num_scheduled_tokens:
         # ponytail: oversized probe falls back to span-head repair; chunk if it fires
         logger.warning(
@@ -272,6 +276,7 @@ def _schedule_spanfuse_probe(
         num_new_computed_tokens=num_new_local_computed_tokens,
         new_computed_blocks=new_computed_blocks,
         num_external_computed_tokens=num_external_computed_tokens,
+        num_lookahead_tokens=len(suffix),
         delay_cache_blocks=True,
         span_gaps=miss,
     )
@@ -303,8 +308,11 @@ def _schedule_spanfuse_probe(
         is_spanfuse_probe=True,
         spanfuse_span_blocks=span_blocks,
         spanfuse_window=window,
+        # the suffix KV sits in decode slots, overwritten before any read
+        prompt_token_ids=list(parent_nrd.prompt_token_ids or ()) + suffix,
+        spanfuse_query_rows=len(suffix),
     )
-    num_scheduled_tokens[probe.req_id] = tail + window
+    num_scheduled_tokens[probe.req_id] = tail + window + len(suffix)
     virtual_reqs_out.append(probe)
     virtual_gap_req_ids.add(probe.req_id)
     request.spanfuse_state = "inflight"

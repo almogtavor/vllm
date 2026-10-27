@@ -53,6 +53,7 @@ class NewRequestData:
     is_spanfuse_probe: bool = False
     spanfuse_span_blocks: list[int] | None = None
     spanfuse_window: int = 0  # leading probe rows that are already cached
+    spanfuse_query_rows: int = 0  # appended instruction rows, 0 = prompt tail
 
     @classmethod
     def from_request(

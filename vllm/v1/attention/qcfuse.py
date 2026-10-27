@@ -8,6 +8,8 @@ paged K (fused backends expose no per-key mass) and sums it per context token.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm import envs
@@ -17,6 +19,20 @@ logger = init_logger(__name__)
 
 # trailing rows treated as the query, bounding the probe's cost
 QCFUSE_MAX_QUERY_TOKENS = 64
+_SPANFUSE_QUERY_IDS: list[int] | None = None
+
+
+def spanfuse_query_ids(model_config) -> list[int]:
+    """SPANFUSE: fixed instruction the probe appends and scores from; [] keeps the prompt's own tail."""
+    global _SPANFUSE_QUERY_IDS
+    if _SPANFUSE_QUERY_IDS is None:
+        from vllm.tokenizers import cached_tokenizer_from_config
+
+        text = os.environ.get("VLLM_V1_SPANS_SPANFUSE_QUERY", "")
+        tok = cached_tokenizer_from_config(model_config) if text else None
+        _SPANFUSE_QUERY_IDS = tok.encode(text, add_special_tokens=False) if tok else []
+        logger.info("SpanFuse query: %d appended rows", len(_SPANFUSE_QUERY_IDS))
+    return _SPANFUSE_QUERY_IDS
 
 
 def parse_critical_layers() -> tuple[int, ...]:

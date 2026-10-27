@@ -1355,6 +1355,7 @@ class GPUModelRunner(
                     new_req_data, "spanfuse_span_blocks", None
                 ),
                 spanfuse_window=getattr(new_req_data, "spanfuse_window", 0),
+                spanfuse_query_rows=getattr(new_req_data, "spanfuse_query_rows", 0),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2124,7 +2125,8 @@ class GPUModelRunner(
                 elif req.is_gap_recompute or nsched <= 1 or ctx < bs:
                     continue
                 q_end = int(cu_num_tokens[i])
-                q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
+                rows = req.spanfuse_query_rows or qcfuse.QCFUSE_MAX_QUERY_TOKENS
+                q_start = max(q_end - nsched, q_end - rows)
                 q_pos0 = computed + nsched - (q_end - q_start)
                 descs.append(
                     (
