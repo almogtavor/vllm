@@ -153,6 +153,7 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
 
     # (1) mass lands only on span blocks, sums to 1 per (head, query row),
     # ignores non-span keys, and keeps the full-softmax ranking inside the spans
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", False)
     torch.manual_seed(0)
     kv = torch.randn(2, n_blk, bs, 2, 8)
     q = torch.randn(4, 4, 8)
@@ -177,6 +178,32 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     # same rows, one shared normalizer per row: per-row rankings are identical
     top = lambda m: m.topk(8).indices.sort().values
     assert torch.equal(top(full), top(got[in_span]))
+
+    # SPANS caches K unrotated: the probe must rotate it to its absolute
+    # position (as the kernel does for lb=0 rows) before scoring rotated Q
+    hd, rot = 8, 6
+    inv = 1.0 / (10000 ** (torch.arange(0, rot, 2).float() / rot))
+    ang = torch.arange(n_blk * bs).float()[:, None] * inv
+    cos_sin = torch.cat((ang.cos(), ang.sin()), -1)
+    k = kv[0].flatten(0, 1)
+    z = (
+        torch.complex(k[..., : rot // 2], k[..., rot // 2 : rot])
+        * torch.polar(torch.ones_like(ang), ang)[:, None]
+    )
+    k_rot = torch.cat((z.real, z.imag, k[..., rot:hd]), -1)
+    pos = torch.cat([torch.arange(b * bs, (b + 1) * bs) for b in span])
+    want = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot[pos], 0.3)
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span)])
+    cap.capture(q, kv, 2, 0.3, cos_sin, rot)
+    assert torch.allclose(cap.buffer[0][pos], want, atol=1e-5)
+    assert not torch.allclose(got[pos], want, atol=1e-3)
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None)])
+    cap.capture(q, kv, 2, 0.3, cos_sin, rot)
+    want_full = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot, 0.3)
+    assert torch.allclose(cap.buffer[0], want_full, atol=1e-5)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    with pytest.raises(RuntimeError, match="RoPE"):
+        cap.capture(q, kv, 2, 0.3)
 
     # (2) first pass schedules only the probe over the tail; second pass repairs
     # the block the probe ranked highest

@@ -2114,6 +2114,10 @@ class GPUModelRunner(
                     (i, q_start, q_end, min(ctx, self.max_model_len),
                      req.spanfuse_span_blocks)
                 )
+                if req.is_spanfuse_probe:
+                    logger.info("SpanFuse probe %s: %d query rows, %d span blocks",
+                                req.req_id, q_end - q_start,
+                                len(req.spanfuse_span_blocks or ()))
             self._qcfuse_descs = descs
 
         # Calculate M-RoPE positions.
