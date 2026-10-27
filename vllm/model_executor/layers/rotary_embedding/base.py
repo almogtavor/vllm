@@ -7,6 +7,7 @@ import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
+from vllm.v1.spans import split_span_positions
 
 from .common import ApplyRotaryEmb
 
@@ -171,6 +172,10 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         """A PyTorch-native implementation of forward()."""
         positions = positions.flatten()
         num_tokens = positions.shape[0]
+        k_cos = k_sin = None
+        if envs.VLLM_V1_SPANS_ENABLED:
+            positions, k_positions = split_span_positions(positions)
+            k_cos, k_sin = cos_sin_cache.index_select(0, k_positions).chunk(2, dim=-1)
         cos_sin = cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
@@ -187,15 +192,15 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         # key may be None in some cases, e.g. cross-layer KV sharing
-        if key is not None and not envs.VLLM_V1_SPANS_ENABLED:
+        if key is not None:
             key_shape = key.shape
             key = key.view(num_tokens, -1, head_size)
             key_rot = key[..., :rotary_dim]
             key_pass = key[..., rotary_dim:]
             key_rot = ApplyRotaryEmb.forward_static(
                 key_rot,
-                cos,
-                sin,
+                cos if k_cos is None else k_cos,
+                sin if k_sin is None else k_sin,
                 is_neox_style,
             )
             key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
@@ -225,15 +230,30 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        k_positions = None
+        if envs.VLLM_V1_SPANS_ENABLED:
+            # SPANS: K gets its own call; raw-K (span) tokens rotate at 0
+            positions, k_positions = split_span_positions(positions)
+            if key is None:
+                k_positions = None
         if self.use_flashinfer:
             torch.ops.vllm.flashinfer_rotary_embedding(
                 positions,
                 query,
-                None if envs.VLLM_V1_SPANS_ENABLED else key,
+                None if k_positions is not None else key,
                 self.head_size,
                 self.cos_sin_cache,
                 self.is_neox_style,
             )
+            if k_positions is not None:
+                torch.ops.vllm.flashinfer_rotary_embedding(
+                    k_positions,
+                    key,
+                    None,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
             return query, key
 
         from vllm import _custom_ops as ops
@@ -245,11 +265,20 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         ops.rotary_embedding(
             positions,
             query,
-            None if envs.VLLM_V1_SPANS_ENABLED else key,
+            None if k_positions is not None else key,
             self.head_size,
             cos_sin_cache,
             self.is_neox_style,
         )
+        if k_positions is not None:
+            ops.rotary_embedding(
+                k_positions,
+                key,
+                None,
+                self.head_size,
+                cos_sin_cache,
+                self.is_neox_style,
+            )
         return query, key
 
     def forward_hip(

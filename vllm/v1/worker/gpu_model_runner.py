@@ -180,6 +180,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spans import SPANS_LB_MASK, SPANS_RAW_BIT
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -2051,11 +2052,12 @@ class GPUModelRunner(
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            raw_k = np.zeros(int(req_kv_starts[-1]), dtype=bool)
             spans_prerotate_safe = True
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 params = req.sampling_params
-                if req.is_gap_recompute or params is None:
+                if params is None:
                     continue
                 ea = params.extra_args
                 spans = ea.get("span_starts") if ea else None
@@ -2065,7 +2067,10 @@ class GPUModelRunner(
                 for start, end, lb in compute_span_lb_regions(
                     spans, ea.get("cross_span_starts"), req_len
                 ):
-                    attn_lb[req_start + start : req_start + end] = lb
+                    # span K is stored raw; a gap recompute reads full context
+                    raw_k[req_start + start : req_start + end] = True
+                    if not req.is_gap_recompute:
+                        attn_lb[req_start + start : req_start + end] = lb
                 q_start = req_start + int(num_computed[i])
                 q_end = req_start + req_len
                 if req.is_spanfuse_probe:
@@ -2078,6 +2083,9 @@ class GPUModelRunner(
                         np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
                     ):
                         spans_prerotate_safe = False
+            if not raw_k.any():
+                spans_prerotate_safe = False  # all K stored rotated: nothing to do
+            attn_lb[raw_k] |= SPANS_RAW_BIT
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             self._spans_prerotate_safe = spans_prerotate_safe
             # copy the packed bounds into the strided buffer in place
@@ -2128,15 +2136,15 @@ class GPUModelRunner(
                 rows = req.spanfuse_query_rows or qcfuse.QCFUSE_MAX_QUERY_TOKENS
                 q_start = max(q_end - nsched, q_end - rows)
                 q_pos0 = computed + nsched - (q_end - q_start)
+                ctx = min(ctx, self.max_model_len)
+                raw = None
+                if getattr(self, "_attn_lb_np", None) is not None:
+                    rs = int(self._req_kv_starts_np[i])
+                    raw = torch.from_numpy(
+                        (self._attn_lb_np[rs : rs + ctx] & SPANS_RAW_BIT) != 0
+                    ).to(self.device, non_blocking=True)
                 descs.append(
-                    (
-                        i,
-                        q_start,
-                        q_end,
-                        min(ctx, self.max_model_len),
-                        req.spanfuse_span_blocks,
-                        q_pos0,
-                    )
+                    (i, q_start, q_end, ctx, req.spanfuse_span_blocks, q_pos0, raw)
                 )
                 if req.is_spanfuse_probe:
                     logger.info(
@@ -2373,9 +2381,10 @@ class GPUModelRunner(
         ):
             pos_slice = self.positions[:total_num_scheduled_tokens]
             sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
-            pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
-                pos_slice.dtype
-            )
+            lb_word = self._attn_lower_bounds_gpu[sched_kv_indices].to(pos_slice.dtype)
+            # the raw-K bit rides on the position into RoPE (vllm/v1/spans.py)
+            pos_slice -= lb_word & SPANS_LB_MASK
+            pos_slice |= lb_word & SPANS_RAW_BIT
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -5102,7 +5111,7 @@ class GPUModelRunner(
             buf = self.qcfuse_capturer.buffer
             qcfuse_importance = {
                 self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
-                for row, _, _, ctx, _, _ in self._qcfuse_descs
+                for row, _, _, ctx, *_ in self._qcfuse_descs
             }
             self._qcfuse_descs = []
             self.qcfuse_capturer.end_step()

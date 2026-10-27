@@ -2673,3 +2673,35 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+@pytest.mark.spans
+def test_span_blocks_never_share_hash_with_rotated_blocks(monkeypatch):
+    """Span K is cached un-rotated, head/cross/tail K rotated: same tokens at
+    the same chain position must not hash alike across the two."""
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    bs = 16
+
+    def hashes(extra_args):
+        sp = SamplingParams(max_tokens=17, extra_args=extra_args)
+        sp.update_from_generation_config({}, eos_token_id=100)
+        return Request(
+            request_id="r",
+            prompt_token_ids=list(range(4 * bs)),
+            sampling_params=sp,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(bs, sha256),
+        ).block_hashes
+
+    plain = hashes(None)
+    # span at 0 collides with the head chain (both start from NONE_HASH)
+    span0 = hashes({"span_starts": [0], "cross_span_starts": [2 * bs]})
+    assert span0[0] != plain[0] and span0[1] != plain[1]
+    # head before the span stays rotated and shareable; the span block is not
+    span1 = hashes({"span_starts": [bs], "cross_span_starts": [2 * bs]})
+    assert span1[0] == plain[0]
+    assert span1[1] == kv_cache_utils.hash_block_tokens(
+        sha256, None, range(bs, 2 * bs), (kv_cache_utils.SPANS_RAW_KEY,)
+    )

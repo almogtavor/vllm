@@ -65,7 +65,7 @@ class QCFuseImportanceCapturer:
     def begin_step(self, block_table: torch.Tensor | None, descs: list) -> None:
         self.block_table = block_table
         self.descs = descs
-        for row, _, _, ctx_len, _, _ in descs:
+        for row, _, _, ctx_len, *_ in descs:
             self.buffer[row, :ctx_len].zero_()
 
     def end_step(self) -> None:
@@ -101,7 +101,7 @@ class QCFuseImportanceCapturer:
             )
         key_cache = kv_cache[0] if kv_cache.shape[0] == 2 else kv_cache[:, 0]
         bs = key_cache.shape[1]
-        for row, q_start, q_end, ctx_len, span_blocks, q_pos0 in self.descs:
+        for row, q_start, q_end, ctx_len, span_blocks, q_pos0, raw in self.descs:
             n_blk = min(ctx_len // bs, block_table.shape[1])
             if n_blk <= 0 or q_end <= q_start:
                 continue
@@ -124,7 +124,9 @@ class QCFuseImportanceCapturer:
                     idx[:, None] * bs + torch.arange(bs, device=idx.device)
                 ).flatten()
                 k_ctx = key_cache[block_table[row, idx].long()].flatten(0, 1).float()
-                mass = self._mass(q, self._rope(k_ctx, pos, rope), scale, q_pos, pos)
+                mass = self._mass(
+                    q, self._rope(k_ctx, pos, rope, raw), scale, q_pos, pos
+                )
                 self.buffer[row].index_add_(0, pos.to(self.buffer.device), mass)
                 if envs.VLLM_V1_SPANS_SPANFUSE_NORM_CHECK:
                     self._log_norm_check(
@@ -136,6 +138,7 @@ class QCFuseImportanceCapturer:
                         mass,
                         scale,
                         rope,
+                        raw,
                     )
                 continue
             blk_ids = block_table[row, :n_blk].long()
@@ -143,15 +146,18 @@ class QCFuseImportanceCapturer:
             k_ctx = key_cache[blk_ids].flatten(0, 1).float()
             pos = torch.arange(n_blk * bs, device=k_ctx.device)
             self.buffer[row, : n_blk * bs] += self._mass(
-                q, self._rope(k_ctx, pos, rope), scale, q_pos, pos
+                q, self._rope(k_ctx, pos, rope, raw), scale, q_pos, pos
             )
 
     @staticmethod
-    def _rope(k, pos, rope):
-        """Neox-rotate K to its absolute position, as the span kernel does for
-        the tail (lb=0) rows the probe scores from (_load_rotate_k)."""
+    def _rope(k, pos, rope, raw=None):
+        """Neox-rotate raw (span) K to its absolute position, as the span kernel
+        does for the tail (lb=0) rows the probe scores from (_load_rotate_k).
+        Non-span K is cached rotated already: rotating it at 0 is the identity."""
         if rope is None:
             return k
+        if raw is not None:
+            pos = torch.where(raw[pos.to(raw.device)], pos.to(raw.device), 0)
         cos_sin_cache, rotary_dim = rope
         d = k.shape[-1]
         rot = d if rotary_dim <= 0 or rotary_dim > d else rotary_dim
@@ -170,11 +176,11 @@ class QCFuseImportanceCapturer:
         return scores.softmax(dim=-1).nan_to_num(0.0).sum(dim=(0, 1))
 
     def _log_norm_check(
-        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope
+        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope, raw=None
     ) -> None:
         k_all = key_cache[blk_row.long()].flatten(0, 1).float()
         ar = torch.arange(k_all.shape[0], device=k_all.device)
-        full = self._mass(q, self._rope(k_all, ar, rope), scale, q_pos, ar)[pos]
+        full = self._mass(q, self._rope(k_all, ar, rope, raw), scale, q_pos, ar)[pos]
         n = max(1, pos.numel() // 10)
         a = set(mass.topk(n).indices.tolist())
         b = set(full.topk(n).indices.tolist())

@@ -34,6 +34,9 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
+# SPANS lb word: low bits = lower bound, RAW = K stored un-rotated (vllm/v1/spans.py)
+SPANS_RAW = tl.constexpr(1 << 30)
+SPANS_LB_MASK = tl.constexpr((1 << 30) - 1)
 
 
 @triton.jit
@@ -291,11 +294,15 @@ def kernel_rotate_k_prepass(
 
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-        key_lb = tl.load(
+        key_word = tl.load(
             attn_lower_bounds_ptr + req_kv_start + pos, mask=slot_mask, other=0
         )
+        # rotated K (non-span) copies through at rel pos 0, an exact identity
+        rel_pos = tl.where(
+            (key_word & SPANS_RAW) != 0, pos - (key_word & SPANS_LB_MASK), 0
+        )
     else:
-        key_lb = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        rel_pos = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
 
     k_base = (
         src_blk * stride_k_cache_0
@@ -306,7 +313,7 @@ def kernel_rotate_k_prepass(
     K_rot = _load_rotate_k(
         key_cache_ptr,
         k_base,
-        pos - key_lb,
+        rel_pos,
         slot_mask,
         offs_d,
         key_cache_ptr,
@@ -628,10 +635,13 @@ def kernel_unified_attention(
     span_offset: tl.int32 = 0
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-        q_lb_vec = tl.load(
-            attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
-            mask=query_mask_0,
-            other=INT32_MAX,
+        q_lb_vec = (
+            tl.load(
+                attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
+                mask=query_mask_0,
+                other=INT32_MAX,
+            )
+            & SPANS_LB_MASK
         )
         # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
         span_offset = tl.min(q_lb_vec)
@@ -644,11 +654,13 @@ def kernel_unified_attention(
         tile_mask = seq_offset < max_seq_prefix_len
 
         if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
-            key_span_lb = tl.load(
+            key_word = tl.load(
                 attn_lower_bounds_ptr + req_kv_start + seq_offset,
                 mask=tile_mask,
                 other=0,
             )
+            key_raw = (key_word & SPANS_RAW) != 0
+            key_span_lb = key_word & SPANS_LB_MASK
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -710,30 +722,45 @@ def kernel_unified_attention(
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
             if FUSE_ROPE:
-                # SPANS: span-local queries see span-relative keys, but
-                # cross-tail queries (lb=0) must see absolute-position keys.
-                key_pos_shift = (
-                    tl.minimum(key_span_lb, span_offset) if USE_SPAN else span_offset
-                )
+                # SPANS: only span K is stored raw; everything else was rotated
+                # at its absolute position on write, which every query reads.
                 k_base = (
                     physical_block_idx * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
                     + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
                 )
-                K_rot = _load_rotate_k(
-                    key_cache_ptr,
-                    k_base,
-                    seq_offset - key_pos_shift,
-                    tile_mask,
-                    offs_d,
-                    k_scale,
-                    cos_sin_cache_ptr,
-                    stride_k_cache_3,
-                    stride_cs_cache_0,
-                    stride_cs_cache_1,
-                    HEAD_SIZE,
-                    ROTARY_DIM,
-                ).to(KV_COMPUTE_DTYPE)
+                tile_raw = 0
+                if USE_SPAN:
+                    tile_raw = tl.max(key_raw.to(tl.int32), 0)
+                if tile_raw > 0:
+                    # span-local queries see span-relative keys, cross-tail
+                    # queries (lb=0) absolute-position keys
+                    key_pos_shift = tl.minimum(key_span_lb, span_offset)
+                    K_rot = _load_rotate_k(
+                        key_cache_ptr,
+                        k_base,
+                        tl.where(key_raw, seq_offset - key_pos_shift, 0),
+                        tile_mask,
+                        offs_d,
+                        k_scale,
+                        cos_sin_cache_ptr,
+                        stride_k_cache_3,
+                        stride_cs_cache_0,
+                        stride_cs_cache_1,
+                        HEAD_SIZE,
+                        ROTARY_DIM,
+                    ).to(KV_COMPUTE_DTYPE)
+                else:
+                    K_rot = tl.load(
+                        key_cache_ptr
+                        + k_base[None, :]
+                        + offs_d[:, None] * stride_k_cache_3,
+                        mask=dim_mask[:, None] & tile_mask[None, :],
+                        other=0.0,
+                    )
+                    if K_rot.dtype.is_fp8():
+                        K_rot = K_rot.to(tl.float32) * tl.load(k_scale)
+                    K_rot = K_rot.to(KV_COMPUTE_DTYPE)
             else:
                 k_offset = (
                     k_physical_block_idx[None, :] * stride_k_cache_0
