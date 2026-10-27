@@ -12,6 +12,7 @@ from vllm.v1.core.sched.gap_policy import (
     SpanAwareGapPolicy,
     miss_gaps,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 pytestmark = pytest.mark.spans
@@ -224,7 +225,7 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
         block_size=bs,
         max_num_scheduled_tokens=8192,
         connector=None,
-        _merge_gaps=sorted,
+        _merge_gaps=Scheduler._merge_gaps,
         kv_cache_manager=SimpleNamespace(
             allocate_slots=MagicMock(return_value=blocks),
             get_blocks=MagicMock(return_value=blocks),
@@ -270,3 +271,13 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     call()
     assert req.spanfuse_state == "done"
     assert (112, 128) in [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
+
+    # (3) adjacent MISS blocks ride the probe as ONE virtual request, not one per block
+    req.prefix_hit_sources = [D] * 4 + [PrefixHitSource.MISS] * 3 + [S] * 3
+    req.spanfuse_state = req.span_gaps_selection = None
+    req.pending_span_gaps = []
+    queue.add_request(req)
+    out.clear(), ids.clear(), nsched.clear()
+    call()
+    assert [r.req_id for r in out] == ["gap_test.64", "gap_test.probe"]
+    assert nsched == {"gap_test.64": 48, "gap_test.probe": 64}

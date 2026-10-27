@@ -248,8 +248,8 @@ def _schedule_spanfuse_probe(
     w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
     w = min(num_computed_tokens, w)
     window = num_computed_tokens - w
-    miss = miss_gaps(request, bs)
-    work = tail + window + len(miss) * bs
+    miss = sched._merge_gaps(miss_gaps(request, bs))
+    work = tail + window + sum(e - s for s, e in miss)
     if work > sched.max_num_scheduled_tokens:
         # ponytail: oversized probe falls back to span-head repair; chunk if it fires
         logger.warning(
