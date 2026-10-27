@@ -137,12 +137,14 @@ def test_qcfuse_unmeasured_store_repairs_span_head(monkeypatch):
 
 def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     """(1) the probe softmax covers span blocks only; (2) a current-query probe
-    runs before repair and its top block is what gets repaired."""
+    runs before repair; the span head block and the probe's top block are what
+    get repaired; (5) the appended instruction's rows are the probe's query."""
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
     import torch
 
+    from vllm.v1.attention import qcfuse
     from vllm.v1.attention.qcfuse import QCFuseImportanceCapturer
     from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
     from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -150,6 +152,7 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])  # (2)-(4): prompt tail
     bs, n_blk, span = 16, 10, [4, 5, 6, 7, 8]
 
     # (1) mass lands only on span blocks, sums to 1 per (head, query row),
@@ -221,9 +224,11 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     blocks = MagicMock()
     blocks.get_block_ids.return_value = ([0] * 11,)
     sched = SimpleNamespace(
-        gap_policy=SpanFusePolicy(k_per_span=16),
+        gap_policy=SpanFusePolicy(k_per_span=32),
         block_size=bs,
         max_num_scheduled_tokens=8192,
+        max_model_len=4096,
+        vllm_config=SimpleNamespace(model_config=None),
         connector=None,
         _merge_gaps=Scheduler._merge_gaps,
         kv_cache_manager=SimpleNamespace(
@@ -274,7 +279,8 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     nsched.clear()
     call()
     assert req.spanfuse_state == "done"
-    assert (112, 128) in [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
+    got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
+    assert (64, 80) in got and (112, 128) in got
 
     # (3) adjacent MISS blocks ride the probe as ONE virtual request, not one per block
     req.prefix_hit_sources = [D] * 4 + [PrefixHitSource.MISS] * 3 + [S] * 3
@@ -296,3 +302,16 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     call()
     assert [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out] == [(64, 128)]
     assert req.spanfuse_miss_gaps == []
+
+    # (5) an appended instruction replaces the cached window as the query rows
+    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [7] * 12)
+    req.spanfuse_state = req.span_gaps_selection = None
+    req.prefix_hit_sources = [D] * 4 + [S] * 6
+    queue.add_request(req)
+    out.clear()
+    ids.clear()
+    nsched.clear()
+    call()
+    p = out[0]
+    assert nsched == {"gap_test.probe": 16 + 12} and p.spanfuse_window == 0
+    assert p.spanfuse_query_rows == 12 and p.prompt_token_ids[-12:] == [7] * 12
