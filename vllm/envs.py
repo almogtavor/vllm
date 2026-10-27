@@ -275,6 +275,11 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_QCFUSE_GRANULARITY: str = "block"
     VLLM_V1_SPANS_QCFUSE_K_PER_SPAN: int = 0
     VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
+    VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
+    VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
+    VLLM_V1_SPANS_SPANFUSE_QUERY: str = (
+        "Based on this tool output, continue with the task."
+    )
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1710,8 +1715,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether to enable block-attention (span detection, fan-in, repositioning)
     "VLLM_V1_SPANS_ENABLED": lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False")
     == "True",
-    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get("VLLM_V1_SPANS_CUDAGRAPH", "True")
-    .lower()
+    "VLLM_V1_SPANS_CUDAGRAPH": lambda: os.environ.get(
+        "VLLM_V1_SPANS_CUDAGRAPH", "True"
+    ).lower()
     in ("true", "1"),
     # whether to print details pertaining to the block-attention
     # implementation
@@ -1737,9 +1743,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # rotate K once per forward into a transient scratch (prefill batches)
     # instead of per-tile inside the attention kernel
-    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get(
-        "VLLM_V1_SPANS_PREROTATE", "True"
-    )
+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
     == "True",
     # QCFuse: recompute a query-selected subset of cached tokens on all layers
     "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
@@ -1763,6 +1767,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_V1_SPANS_QCFUSE_K_PER_SPAN", "0")
     ),
     # PIC neighbor-aware gap policy (QCFuse probe, closure-aware ranking)
+    # SPANFUSE: QCFuse with a current-query probe scored against span keys only
+    "VLLM_V1_SPANS_SPANFUSE_ENABLE": lambda: (
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_ENABLE", "False") == "True"
+    ),
+    # SPANFUSE: also score the full prefix and log the per-span top-K agreement
+    "VLLM_V1_SPANS_SPANFUSE_NORM_CHECK": lambda: (
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_NORM_CHECK", "False") == "True"
+    ),
+    # SPANFUSE: instruction appended in the scoring pass; its rows are the query,
+    # "" scores from the prompt's own last QCFUSE_MAX_QUERY_TOKENS tokens instead
+    "VLLM_V1_SPANS_SPANFUSE_QUERY": lambda: os.environ.get(
+        "VLLM_V1_SPANS_SPANFUSE_QUERY",
+        "Based on this tool output, continue with the task.",
+    ),
     "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
         os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"
     ),

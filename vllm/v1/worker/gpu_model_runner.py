@@ -138,6 +138,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
+    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -595,7 +596,8 @@ class GPUModelRunner(
 
         if self._kv_hash_debug_enabled:
             logger.info(
-                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, output_file=%s, log_interval=%d",
+                "KV Cache Hash Debugging ENABLED: layer=%d, req_ids=%s, "
+                "output_file=%s, log_interval=%d",
                 self._kv_hash_debug_layer,
                 self._kv_hash_debug_req_ids if self._kv_hash_debug_req_ids else "ALL",
                 self._kv_hash_debug_output_file
@@ -801,7 +803,9 @@ class GPUModelRunner(
                 logger.warning(
                     "SPANS: lower-bound buffer would be %.1f GiB "
                     "(max_num_seqs=%d x max_model_len=%d); keeping the eager path.",
-                    _lb_n * 4 / 2**30, self.max_num_reqs, self._spans_lb_stride,
+                    _lb_n * 4 / 2**30,
+                    self.max_num_reqs,
+                    self._spans_lb_stride,
                 )
                 self._spans_lb_stride = 0
                 self._attn_lower_bounds_gpu: torch.Tensor | None = None
@@ -812,9 +816,12 @@ class GPUModelRunner(
                 self._attn_lower_bounds_gpu = torch.zeros(
                     _lb_n, dtype=torch.int32, device=self.device
                 )
-                self._req_kv_starts_gpu = torch.arange(
-                    self.max_num_reqs + 1, dtype=torch.int32, device=self.device
-                ) * self._spans_lb_stride
+                self._req_kv_starts_gpu = (
+                    torch.arange(
+                        self.max_num_reqs + 1, dtype=torch.int32, device=self.device
+                    )
+                    * self._spans_lb_stride
+                )
                 # pinned, or non_blocking copies are synchronous
                 self._spans_lb_staging = torch.zeros(
                     _lb_n, dtype=torch.int32, pin_memory=True
@@ -823,7 +830,7 @@ class GPUModelRunner(
                 self._spans_lb_len = [0] * self.max_num_reqs
         # QCFUSE: importance probe, allocated only under the knob
         self.qcfuse_capturer = None
-        self._qcfuse_descs: list[tuple[int, int, int, int]] = []
+        self._qcfuse_descs: list[tuple] = []
         if qcfuse.probe_enabled() and qcfuse.parse_critical_layers():
             self.qcfuse_capturer = qcfuse.QCFuseImportanceCapturer(
                 self.max_num_reqs, self.max_model_len, self.device
@@ -1343,6 +1350,12 @@ class GPUModelRunner(
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
                 is_gap_recompute=getattr(new_req_data, "is_gap_recompute", False),
+                is_spanfuse_probe=getattr(new_req_data, "is_spanfuse_probe", False),
+                spanfuse_span_blocks=getattr(
+                    new_req_data, "spanfuse_span_blocks", None
+                ),
+                spanfuse_window=getattr(new_req_data, "spanfuse_window", 0),
+                spanfuse_query_rows=getattr(new_req_data, "spanfuse_query_rows", 0),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2046,7 +2059,7 @@ class GPUModelRunner(
                     continue
                 ea = params.extra_args
                 spans = ea.get("span_starts") if ea else None
-                if not spans:
+                if not spans or ea is None:
                     continue
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
                 for start, end, lb in compute_span_lb_regions(
@@ -2055,6 +2068,9 @@ class GPUModelRunner(
                     attn_lb[req_start + start : req_start + end] = lb
                 q_start = req_start + int(num_computed[i])
                 q_end = req_start + req_len
+                if req.is_spanfuse_probe:
+                    # SPANFUSE: the query rows read the whole prefix
+                    attn_lb[q_start:q_end] = 0
                 if q_end > q_start:
                     req_lbs = attn_lb[req_start:q_end]
                     query_lbs = attn_lb[q_start:q_end]
@@ -2067,6 +2083,7 @@ class GPUModelRunner(
             # copy the packed bounds into the strided buffer in place
             stride = self._spans_lb_stride
             staging = self._spans_lb_staging
+            lb_gpu = self._attn_lower_bounds_gpu
             _scatter_reqs = num_reqs if stride else 0
             if not stride:
                 self._attn_lower_bounds_gpu = torch.from_numpy(attn_lb).to(
@@ -2076,18 +2093,19 @@ class GPUModelRunner(
                     self.device, non_blocking=True
                 )
             for i in range(_scatter_reqs):
+                assert staging is not None and lb_gpu is not None
                 lo, hi = int(req_kv_starts[i]), int(req_kv_starts[i + 1])
                 n = min(hi - lo, stride)
                 base = i * stride
                 prev = self._spans_lb_len[i]
                 if prev > n:
-                    self._attn_lower_bounds_gpu[base + n:base + prev].zero_()
+                    lb_gpu[base + n : base + prev].zero_()
                 self._spans_lb_len[i] = n
                 if n <= 0:
                     continue
-                staging[base:base + n] = torch.from_numpy(attn_lb[lo:lo + n])
-                self._attn_lower_bounds_gpu[base:base + n].copy_(
-                    staging[base:base + n], non_blocking=True
+                staging[base : base + n] = torch.from_numpy(attn_lb[lo : lo + n])
+                lb_gpu[base : base + n].copy_(
+                    staging[base : base + n], non_blocking=True
                 )
 
         # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
@@ -2096,13 +2114,37 @@ class GPUModelRunner(
             bs = self.cache_config.block_size
             for i in range(num_reqs):
                 nsched = int(num_scheduled_tokens[i])
-                ctx = int(self.input_batch.num_computed_tokens_cpu[i])
+                computed = int(self.input_batch.num_computed_tokens_cpu[i])
                 req = self.requests[self.input_batch.req_ids[i]]
-                if req.is_gap_recompute or nsched <= 1 or ctx < bs:
+                # the probe's cached window rows stay scored as context
+                ctx = computed + req.spanfuse_window
+                if envs.VLLM_V1_SPANS_SPANFUSE_ENABLE:
+                    # SPANFUSE: only the probe row scores, against span blocks only
+                    if not req.is_spanfuse_probe or ctx < bs:
+                        continue
+                elif req.is_gap_recompute or nsched <= 1 or ctx < bs:
                     continue
                 q_end = int(cu_num_tokens[i])
-                q_start = max(q_end - nsched, q_end - qcfuse.QCFUSE_MAX_QUERY_TOKENS)
-                descs.append((i, q_start, q_end, min(ctx, self.max_model_len)))
+                rows = req.spanfuse_query_rows or qcfuse.QCFUSE_MAX_QUERY_TOKENS
+                q_start = max(q_end - nsched, q_end - rows)
+                q_pos0 = computed + nsched - (q_end - q_start)
+                descs.append(
+                    (
+                        i,
+                        q_start,
+                        q_end,
+                        min(ctx, self.max_model_len),
+                        req.spanfuse_span_blocks,
+                        q_pos0,
+                    )
+                )
+                if req.is_spanfuse_probe:
+                    logger.info(
+                        "SpanFuse probe %s: %d query rows, %d span blocks",
+                        req.req_id,
+                        q_end - q_start,
+                        len(req.spanfuse_span_blocks or ()),
+                    )
             self._qcfuse_descs = descs
 
         # Calculate M-RoPE positions.
@@ -2311,6 +2353,13 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        # SPANFUSE: the probe's window rows are cached already; never overwrite
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            window = self.requests[req_id].spanfuse_window
+            if window and envs.VLLM_V1_SPANS_SPANFUSE_ENABLE:
+                qs = int(self.query_start_loc.np[i])
+                for bt in self.input_batch.block_table.block_tables:
+                    bt.slot_mapping.gpu[qs : qs + window].fill_(PAD_SLOT_ID)
 
         # SPANS: shift Q positions to span-relative on the GPU, after the slot
         # mapping (which requires absolute positions). On-the-fly-warmup did
@@ -2478,21 +2527,8 @@ class GPUModelRunner(
         if self.qcfuse_capturer is not None:
             self.qcfuse_capturer.begin_step(block_table_gid_0, self._qcfuse_descs)
 
-        # print("==================MODULES===============")
-
-        # # Dump full structure
-        # for name, module in self.model.named_modules():
-        #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
-        #     for attr_name, attr_value in module.__dict__.items():
-        #         logger.info("  .%s: %s = %s", attr_name, type(attr_value).__name__, repr(attr_value)[:100])
-
-        # # Find rotary
-        # for name, module in self.model.named_modules():
-        #     if "rotary" in type(module).__name__.lower() or "rotary" in name.lower():
-        #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
-
         if not hasattr(self, "rotate"):
-            # Get the layers list, handling both standard and Llama4-style model structures
+            # layers list, for both standard and Llama4-style model structures
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                 layers = self.model.model.layers
             elif hasattr(self.model, "language_model") and hasattr(
@@ -2501,7 +2537,8 @@ class GPUModelRunner(
                 layers = self.model.language_model.model.layers
             else:
                 raise AttributeError(
-                    f"Cannot find layers in model structure: {type(self.model).__name__}"
+                    "Cannot find layers in model structure: "
+                    f"{type(self.model).__name__}"
                 )
 
             for lay in layers:
@@ -5065,7 +5102,7 @@ class GPUModelRunner(
             buf = self.qcfuse_capturer.buffer
             qcfuse_importance = {
                 self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
-                for row, _, _, ctx in self._qcfuse_descs
+                for row, _, _, ctx, _, _ in self._qcfuse_descs
             }
             self._qcfuse_descs = []
             self.qcfuse_capturer.end_step()

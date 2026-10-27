@@ -48,8 +48,7 @@ def test_all_configs_match_full_recompute(model, monkeypatch):
         try:
             for span_starts in SPAN_STARTS_VARIANTS:
                 extra = (
-                    {"span_starts": span_starts}
-                    if span_starts is not None else None
+                    {"span_starts": span_starts} if span_starts is not None else None
                 )
                 # cold run, then a replay that hits the prefix cache (for LL
                 # modes); each yields (text, top-K, num_cached_tokens).
@@ -69,9 +68,7 @@ def test_all_configs_match_full_recompute(model, monkeypatch):
                 if ref_text is None:
                     ref_text, ref_top, _ = cold
 
-                label = (
-                    f"{mode}+{'sp[0]' if span_starts is not None else 'no_sp'}"
-                )
+                label = f"{mode}+{'sp[0]' if span_starts is not None else 'no_sp'}"
 
                 # LL modes have prefix caching on: the replay must hit 3 of
                 # the 4 blocks (the last is held back), which is what makes
@@ -85,7 +82,8 @@ def test_all_configs_match_full_recompute(model, monkeypatch):
                     )
 
                 for run_label, (text, top, _) in (
-                    ("cold", cold), ("replay", replay),
+                    ("cold", cold),
+                    ("replay", replay),
                 ):
                     if text != ref_text:
                         drifts.append(
@@ -107,7 +105,7 @@ def test_per_layer_rope_spans_match_full_recompute(model, monkeypatch):
     """Regression: models with per-layer-type RoPE (e.g. gemma-4, whose sliding
     layers use a local theta and full layers a global theta) must still get
     SPANS == FR. The in-kernel span K-rotation has to use each layer's own
-    cos_sin_cache; using the shared first-layer cache mis-rotates the other
+    cos_sin_cache; using the shared first-layer cache wrongly rotates the other
     layers and silently corrupts generation. Trivially holds for uniform-RoPE
     models (Qwen/Llama); the real coverage is SPANS_TEST_MODEL=google/gemma-4-*.
     """
@@ -132,4 +130,3 @@ def test_block_size_constant_matches_conftest():
     """Defensive: tests assume block_size == 16. If conftest changes, tests
     that rely on PIC alignment must be revisited."""
     assert BLOCK_SIZE == 16
-

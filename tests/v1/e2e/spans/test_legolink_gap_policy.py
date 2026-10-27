@@ -183,10 +183,12 @@ def test_large_gap_length_does_not_livelock_e2e(model, monkeypatch):
     try:
         _warmup_prompt(llm, prompt)  # cold prefill caches all blocks
         done = threading.Event()
-        threading.Thread(
-            target=lambda: (_generate_num_cached_tokens(llm, prompt, sp), done.set()),
-            daemon=True,
-        ).start()
+
+        def run() -> None:
+            _generate_num_cached_tokens(llm, prompt, sp)
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
         assert done.wait(timeout=60), (
             "engine livelocked: large gap_length tiled the cached prefix so "
             "gap_overhead >= max_num_batched_tokens and the request never ran"

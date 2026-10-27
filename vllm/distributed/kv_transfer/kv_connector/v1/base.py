@@ -485,7 +485,7 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
-    def get_computed_token_gaps(
+    def get_computed_token_gaps(  # noqa: B027
         self,
         request: "Request",
     ) -> list[tuple[int, int]] | None:

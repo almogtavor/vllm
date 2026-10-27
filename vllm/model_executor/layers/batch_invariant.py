@@ -846,7 +846,7 @@ def rms_norm_batch_invariant(
         assert input.shape == residual.shape, (
             f"Input shape {input.shape} must match residual shape {residual.shape}"
         )
-        # not ops.fused_add_rms_norm: its block size flips at 256 tokens, changing the reduction order
+        # not ops.fused_add_rms_norm: its block size (reduction order) flips at 256
         residual = input + residual
         return rms_norm_batch_invariant(residual, weight, eps), residual
 

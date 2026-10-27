@@ -112,10 +112,14 @@ class Request:
         self.pic_token_ranges: list[tuple[int, int | None]] = []
         self.prefix_hit_sources: list[PrefixHitSource] | None = None
         self.pending_span_gaps: list[tuple[int, int]] = []
-        # gap selection memo (num_computed_tokens, gaps); avoids re-selecting while blocked
+        # gap selection memo (num_computed_tokens, gaps), kept while blocked
         self.span_gaps_selection: tuple[int, list[tuple[int, int]]] | None = None
         # QCFUSE: per-token importance from the worker probe, read by QCFusePolicy
         self.qcfuse_importance: list[float] | None = None
+        # SPANFUSE: None -> inflight (probe scheduled) -> measured -> done
+        self.spanfuse_state: str | None = None
+        # SPANFUSE: MISS ranges the probe filled blind; recomputed again with the repair
+        self.spanfuse_miss_gaps: list[tuple[int, int]] = []
 
         if pooling_params is not None:
             # Pooling models.
@@ -278,7 +282,9 @@ class Request:
             self.block_hashes.extend(self._block_hasher(self))
 
     def in_pic_span(self, pos: int) -> bool:
-        return any(s <= pos and (e is None or pos < e) for s, e in self.pic_token_ranges)
+        return any(
+            s <= pos and (e is None or pos < e) for s, e in self.pic_token_ranges
+        )
 
     @property
     def use_structured_output(self) -> bool:

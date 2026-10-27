@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS, spanfuse_query_ids
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
 from vllm.v1.core.sched.output import NewRequestData
 
@@ -111,10 +112,40 @@ def schedule_span_gaps(
     parent was deferred (the caller sets token_budget and continues).
     """
     request_id = request.request_id
+    if (
+        isinstance(sched.gap_policy, SpanFusePolicy)
+        and request.spanfuse_state != "done"
+    ):
+        state = request.spanfuse_state
+        if state == "inflight":
+            # wait for the probe's importance, holding no budget
+            request_queue.pop_request()
+            step_skipped_waiting.prepend_request(request)
+            return token_budget
+        if state is None and did_prefix_lookup:
+            probed = _schedule_spanfuse_probe(
+                sched,
+                request,
+                num_computed_tokens,
+                num_external_computed_tokens,
+                num_new_local_computed_tokens,
+                new_computed_blocks,
+                token_budget,
+                num_scheduled_tokens,
+                virtual_reqs_out,
+                virtual_gap_req_ids,
+                request_queue,
+                step_skipped_waiting,
+            )
+            if probed is not NO_SPAN_GAPS:
+                return probed
+        # measured: select exactly as QCFuse would at its prefix lookup
+        did_prefix_lookup = did_prefix_lookup or state == "measured"
+        request.spanfuse_state = "done"
     if request.pending_span_gaps:
         span_gaps = request.pending_span_gaps
     elif did_prefix_lookup and sched.gap_policy is not None:
-        # memoize per (request, prefix length): the probe rewrites importance between retries
+        # memoize per (request, prefix length): the probe rewrites importance
         memo = request.span_gaps_selection
         if memo is not None and memo[0] == num_computed_tokens:
             span_gaps = list(memo[1])
@@ -126,7 +157,12 @@ def schedule_span_gaps(
     else:
         span_gaps = []
     if did_prefix_lookup and not request.pending_span_gaps:
-        span_gaps = span_gaps + miss_gaps(request, sched.block_size)
+        # SPANFUSE: misses that read the blind spans are rewritten in place after repair
+        span_gaps = (
+            span_gaps
+            + miss_gaps(request, sched.block_size)
+            + request.spanfuse_miss_gaps
+        )
     if did_prefix_lookup and sched.connector is not None:
         connector_gaps = sched.connector.get_computed_token_gaps(request)
         if connector_gaps:
@@ -169,6 +205,7 @@ def schedule_span_gaps(
 
     request.num_computed_tokens = num_computed_tokens
     request.pending_span_gaps = remaining_gaps
+    request.spanfuse_miss_gaps = []
     parent_nrd = NewRequestData.from_request(
         request, sched.kv_cache_manager.get_blocks(request_id).get_block_ids()
     )
@@ -182,6 +219,106 @@ def schedule_span_gaps(
     request_queue.pop_request()
     step_skipped_waiting.prepend_request(request)
     return token_budget - gap_overhead
+
+
+def _schedule_spanfuse_probe(
+    sched: "Scheduler",
+    request: "Request",
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """Run the uncached tail once so its trailing query rows score the span
+    blocks before any repair; MISS blocks are recomputed in the same step so
+    the probe never reads the null placeholder, and again with the repair."""
+    bs = sched.block_size
+    sources = request.prefix_hit_sources or []
+    span_blocks = [
+        b
+        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+        for b in range(s // bs, e // bs)
+    ]
+    if not any(
+        b < len(sources) and sources[b] == PrefixHitSource.PIC for b in span_blocks
+    ):
+        return NO_SPAN_GAPS
+    tail = request.num_tokens - num_computed_tokens
+    # the appended instruction rows are the query, so no cached window is re-run
+    suffix = spanfuse_query_ids(sched.vllm_config.model_config)
+    if request.num_tokens + len(suffix) > sched.max_model_len:
+        suffix = []
+    # cached rows re-run as query rows; the runner drops their KV writes
+    w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
+    w = num_computed_tokens if suffix else min(num_computed_tokens, w)
+    window = num_computed_tokens - w
+    miss = sched._merge_gaps(miss_gaps(request, bs))
+    work = tail + window + len(suffix) + sum(e - s for s, e in miss)
+    if work > sched.max_num_scheduled_tokens:
+        # ponytail: oversized probe falls back to span-head repair; chunk if it fires
+        logger.warning(
+            "SpanFuse: probe of %d tokens too large for %s", work, request.request_id
+        )
+        request.qcfuse_importance = [0.0] * num_computed_tokens
+        return NO_SPAN_GAPS
+    if work > token_budget:
+        return None
+    # delayed: the probe's tail KV is recomputed (and cached) by the parent prefill
+    blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        tail,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        num_external_computed_tokens=num_external_computed_tokens,
+        num_lookahead_tokens=len(suffix),
+        delay_cache_blocks=True,
+        span_gaps=miss,
+    )
+    if blocks is None:
+        return None
+    # MISS blocks are now fresh copies of this prefix: never re-swapped, but
+    # they read the blind spans, so the repair step rewrites them in place
+    request.prefix_hit_sources = [
+        PrefixHitSource.PD if s == PrefixHitSource.MISS else s for s in sources
+    ]
+    request.spanfuse_miss_gaps = miss
+    request.num_computed_tokens = num_computed_tokens
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+    )
+    if miss:
+        append_virtual_gap_reqs(
+            parent_nrd,
+            miss,
+            virtual_reqs_out,
+            virtual_gap_req_ids,
+            num_scheduled_tokens,
+        )
+    probe = replace(
+        parent_nrd,
+        req_id=request.request_id + ".probe",
+        parent_req_id=request.request_id,
+        num_computed_tokens=w,
+        is_spanfuse_probe=True,
+        spanfuse_span_blocks=span_blocks,
+        spanfuse_window=window,
+        # the suffix KV sits in decode slots, overwritten before any read
+        prompt_token_ids=list(parent_nrd.prompt_token_ids or ()) + suffix,
+        spanfuse_query_rows=len(suffix),
+    )
+    num_scheduled_tokens[probe.req_id] = tail + window + len(suffix)
+    virtual_reqs_out.append(probe)
+    virtual_gap_req_ids.add(probe.req_id)
+    request.spanfuse_state = "inflight"
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - work
 
 
 class GapPolicy(ABC):
@@ -533,6 +670,34 @@ class NeighborAwarePolicy(QCFusePolicy):
         return gaps
 
 
+class SpanFusePolicy(QCFusePolicy):
+    """QCFuse whose importance comes from the current request's probe."""
+
+    # every span keeps its head block repaired; the scoring pass ranks the rest
+    anchor_blocks = 1
+
+    def _select(
+        self, request: "Request", importance: list[float], n: int
+    ) -> list[tuple[int, int]]:
+        if self.granularity == "token":
+            return super()._select(request, importance, n)
+        bs, gaps = self.block_size, []
+        for start, end in self._span_ranges(request, n):
+            budget = self.k_per_span or int(self.rho * (end - start))
+            if budget <= 0:
+                continue
+            k = max(1, budget // bs)
+            blocks = list(range(start // bs, min(end // bs, len(importance) // bs)))
+            head = blocks[: min(self.anchor_blocks, k)]
+            rest = sorted(
+                blocks[len(head) :],
+                key=lambda b: -sum(importance[b * bs : (b + 1) * bs]),
+            )
+            top = head + rest[: k - len(head)]
+            gaps += [(b * bs, (b + 1) * bs) for b in sorted(top)]
+        return gaps
+
+
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
 
@@ -541,6 +706,7 @@ class GapPolicyFactory:
         "span_aware": SpanAwareGapPolicy,
         "qcfuse": QCFusePolicy,
         "neighbor_aware": NeighborAwarePolicy,
+        "spanfuse": SpanFusePolicy,
     }
 
     @classmethod

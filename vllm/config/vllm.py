@@ -106,7 +106,7 @@ IS_DENSE = False
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
     """Enable if either RMS norm or quant FP8 custom op is active;
     otherwise Inductor handles fusion."""
-    # batch invariance: the fused rms_norm+fp8-quant kernels flip block size at 256 tokens
+    # batch invariance: fused rms_norm+fp8-quant kernels flip block size at 256 tok
     if envs.VLLM_BATCH_INVARIANT:
         return False
     return (

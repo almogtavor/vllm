@@ -755,14 +755,22 @@ def qcfuse_capture_importance(
 ) -> torch.Tensor:
     """QCFUSE: accumulate attention mass; the dummy dep orders it after the KV write."""
     layer_name = _resolve_layer_name(layer_name)
-    _, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
     capturer = get_qcfuse_capturer()
     if capturer is not None:
+        # same per-layer RoPE the span kernel rotates K with (triton_attn.py)
+        cos_sin_cache = getattr(attn_metadata, "cos_sin_cache", None)
+        rotary_dim = getattr(attn_metadata, "rotary_dim", 0)
+        if cos_sin_cache is not None:
+            cos_sin_cache = getattr(attn_layer, "spans_cos_sin_cache", cos_sin_cache)
+            rotary_dim = getattr(attn_layer, "spans_rotary_dim", rotary_dim)
         capturer.capture(
             query,
             kv_cache,
             attn_layer.num_heads // attn_layer.num_kv_heads,
             attn_layer.impl.scale,
+            cos_sin_cache,
+            rotary_dim,
         )
     return torch.empty(0, device=query.device, dtype=query.dtype)
 

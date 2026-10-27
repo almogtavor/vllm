@@ -1469,8 +1469,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to parent's KV cache during model execution. Only need cleanup.
             for req_id in virtual_gap_req_ids:
                 self.req_states.remove_request(req_id)
-                if self.supports_mm_inputs:
-                    self.encoder_runner.remove_request(req_id)
+                if self.encoder_cache is not None:
+                    self.encoder_cache.remove_request(req_id)
 
         return async_output
 

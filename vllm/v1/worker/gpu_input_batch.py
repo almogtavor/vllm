@@ -57,6 +57,10 @@ class CachedRequestState:
     prompt_is_token_ids: list[bool] | None = None
 
     is_gap_recompute: bool = False  # SPANS: skip span-local attention for Legolink
+    is_spanfuse_probe: bool = False
+    spanfuse_span_blocks: list[int] | None = None
+    spanfuse_window: int = 0  # leading probe rows that are already cached
+    spanfuse_query_rows: int = 0
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

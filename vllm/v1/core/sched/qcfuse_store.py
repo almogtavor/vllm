@@ -32,8 +32,8 @@ class QCFuseImportanceStore:
         out: list[float] = []
         for b in range(num_computed_tokens // bs):
             h = block_hashes[b] if b < len(block_hashes) else None
-            entry = self._by_hash.get(h)
-            if entry is None:
+            entry = self._by_hash.get(h) if h is not None else None
+            if h is None or entry is None:
                 out.extend([0.0] * bs)
             else:
                 self._by_hash.move_to_end(h)
