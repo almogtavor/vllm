@@ -665,6 +665,30 @@ class NeighborAwarePolicy(QCFusePolicy):
 class SpanFusePolicy(QCFusePolicy):
     """QCFuse whose importance comes from the current request's probe."""
 
+    # every span keeps its head block repaired; the scoring pass ranks the rest
+    anchor_blocks = 1
+
+    def _select(
+        self, request: "Request", importance: list[float], n: int
+    ) -> list[tuple[int, int]]:
+        if self.granularity == "token":
+            return super()._select(request, importance, n)
+        bs, gaps = self.block_size, []
+        for start, end in self._span_ranges(request, n):
+            budget = self.k_per_span or int(self.rho * (end - start))
+            if budget <= 0:
+                continue
+            k = max(1, budget // bs)
+            blocks = list(range(start // bs, min(end // bs, len(importance) // bs)))
+            head = blocks[: min(self.anchor_blocks, k)]
+            rest = sorted(
+                blocks[len(head) :],
+                key=lambda b: -sum(importance[b * bs : (b + 1) * bs]),
+            )
+            top = head + rest[: k - len(head)]
+            gaps += [(b * bs, (b + 1) * bs) for b in sorted(top)]
+        return gaps
+
 
 class GapPolicyFactory:
     """Factory for creating GapPolicy instances from configuration."""
