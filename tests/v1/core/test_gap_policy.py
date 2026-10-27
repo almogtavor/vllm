@@ -287,3 +287,12 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     call()
     assert [r.req_id for r in out] == ["gap_test.64", "gap_test.probe"]
     assert nsched == {"gap_test.64": 48, "gap_test.probe": 64}
+    # (4) the MISS blocks read the blind spans: the repair step recomputes them
+    req.qcfuse_importance, req.spanfuse_state = imp, "measured"
+    queue.add_request(req)
+    out.clear()
+    ids.clear()
+    nsched.clear()
+    call()
+    assert [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out] == [(64, 128)]
+    assert req.spanfuse_miss_gaps == []

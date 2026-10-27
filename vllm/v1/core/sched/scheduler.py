@@ -1177,6 +1177,7 @@ class Scheduler(SchedulerInterface):
         request.span_gaps_selection = None
         if request.spanfuse_state is not None:
             request.spanfuse_state = request.qcfuse_importance = None
+            request.spanfuse_miss_gaps = []
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1

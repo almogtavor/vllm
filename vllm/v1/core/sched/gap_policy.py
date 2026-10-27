@@ -157,7 +157,12 @@ def schedule_span_gaps(
     else:
         span_gaps = []
     if did_prefix_lookup and not request.pending_span_gaps:
-        span_gaps = span_gaps + miss_gaps(request, sched.block_size)
+        # SPANFUSE: misses that read the blind spans are rewritten in place after repair
+        span_gaps = (
+            span_gaps
+            + miss_gaps(request, sched.block_size)
+            + request.spanfuse_miss_gaps
+        )
     if did_prefix_lookup and sched.connector is not None:
         connector_gaps = sched.connector.get_computed_token_gaps(request)
         if connector_gaps:
@@ -200,6 +205,7 @@ def schedule_span_gaps(
 
     request.num_computed_tokens = num_computed_tokens
     request.pending_span_gaps = remaining_gaps
+    request.spanfuse_miss_gaps = []
     parent_nrd = NewRequestData.from_request(
         request, sched.kv_cache_manager.get_blocks(request_id).get_block_ids()
     )
@@ -231,7 +237,7 @@ def _schedule_spanfuse_probe(
 ):
     """Run the uncached tail once so its trailing query rows score the span
     blocks before any repair; MISS blocks are recomputed in the same step so
-    the probe never reads the null placeholder."""
+    the probe never reads the null placeholder, and again with the repair."""
     bs = sched.block_size
     sources = request.prefix_hit_sources or []
     span_blocks = [
@@ -271,10 +277,12 @@ def _schedule_spanfuse_probe(
     )
     if blocks is None:
         return None
-    # MISS blocks are now fresh copies of this prefix: never re-swapped
+    # MISS blocks are now fresh copies of this prefix: never re-swapped, but
+    # they read the blind spans, so the repair step rewrites them in place
     request.prefix_hit_sources = [
         PrefixHitSource.PD if s == PrefixHitSource.MISS else s for s in sources
     ]
+    request.spanfuse_miss_gaps = miss
     request.num_computed_tokens = num_computed_tokens
     parent_nrd = NewRequestData.from_request(
         request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()

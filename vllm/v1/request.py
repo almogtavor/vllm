@@ -118,6 +118,8 @@ class Request:
         self.qcfuse_importance: list[float] | None = None
         # SPANFUSE: None -> inflight (probe scheduled) -> measured -> done
         self.spanfuse_state: str | None = None
+        # SPANFUSE: MISS ranges the probe filled blind; recomputed again with the repair
+        self.spanfuse_miss_gaps: list[tuple[int, int]] = []
 
         if pooling_params is not None:
             # Pooling models.
