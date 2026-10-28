@@ -143,6 +143,10 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.triton_unified_attention import (
+    SPANS_FULLQ,
+    SPANS_LB_MASK,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -180,7 +184,6 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spans import SPANS_FULLQ, SPANS_LB_MASK
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -2370,7 +2373,7 @@ class GPUModelRunner(
             pos_slice = self.positions[:total_num_scheduled_tokens]
             sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
             lb_word = self._attn_lower_bounds_gpu[sched_kv_indices].to(pos_slice.dtype)
-            pos_slice -= lb_word & SPANS_LB_MASK  # Q and K at p - L (vllm/v1/spans.py)
+            pos_slice -= lb_word & SPANS_LB_MASK  # Q and K at p - L
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(

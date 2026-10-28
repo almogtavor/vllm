@@ -34,10 +34,11 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
-# SPANS lb word: low bits = L (K and Q stored at RoPE p - L), FULLQ = query reads
-# the whole prefix (vllm/v1/spans.py)
-SPANS_FULLQ = tl.constexpr(1 << 29)
-SPANS_LB_MASK = tl.constexpr((1 << 29) - 1)
+# SPANS lb word (packed by gpu_model_runner): low bits = L, K and Q at RoPE p - L
+SPANS_FULLQ = 1 << 29  # query row reads the whole prefix (gap recompute, probe)
+SPANS_LB_MASK = SPANS_FULLQ - 1
+_SPANS_FULLQ = tl.constexpr(SPANS_FULLQ)
+_SPANS_LB_MASK = tl.constexpr(SPANS_LB_MASK)
 SPANS_SCAN = tl.constexpr(1024)  # lb words read per run-end scan step
 
 
@@ -335,7 +336,7 @@ def kernel_rotate_k_prepass(
         key_word = tl.load(
             attn_lower_bounds_ptr + req_kv_start + pos, mask=slot_mask, other=0
         )
-        rel_pos = key_word & SPANS_LB_MASK  # K at p - L back to absolute p
+        rel_pos = key_word & _SPANS_LB_MASK  # K at p - L back to absolute p
     else:
         rel_pos = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
 
@@ -677,8 +678,8 @@ def kernel_unified_attention(
             mask=query_mask_0,
             other=0,
         )
-        q_off = q_word & SPANS_LB_MASK  # Q stored at RoPE p - q_off
-        q_lb = tl.where((q_word & SPANS_FULLQ) != 0, 0, q_off)
+        q_off = q_word & _SPANS_LB_MASK  # Q stored at RoPE p - q_off
+        q_lb = tl.where((q_word & _SPANS_FULLQ) != 0, 0, q_off)
         # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
         span_offset = tl.min(tl.where(query_mask_0, q_lb, INT32_MAX))
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
@@ -699,12 +700,12 @@ def kernel_unified_attention(
         run_hi = key_hi
         if FUSE_ROPE:
             lb_base = attn_lower_bounds_ptr + req_kv_start
-            L_run = tl.load(lb_base + run_lo) & SPANS_LB_MASK
+            L_run = tl.load(lb_base + run_lo) & _SPANS_LB_MASK
             scan = run_lo
             while scan < run_hi:
                 offs_w = scan + tl.arange(0, SPANS_SCAN)
                 w = tl.load(lb_base + offs_w, mask=offs_w < run_hi, other=0)
-                brk = (offs_w < run_hi) & ((w & SPANS_LB_MASK) != L_run)
+                brk = (offs_w < run_hi) & ((w & _SPANS_LB_MASK) != L_run)
                 run_hi = tl.minimum(run_hi, tl.min(tl.where(brk, offs_w, INT32_MAX)))
                 scan += SPANS_SCAN
             Qs = _load_rotate_q(
@@ -1151,7 +1152,7 @@ def unified_attention(
     use_td: bool = False,
     # Fused span-relative RoPE (spans / Legolink). When ``cos_sin_cache`` is
     # provided, Q and K are cached at RoPE p - L and Q is re-rotated per run of
-    # keys with one L (vllm/v1/spans.py). ``rotary_dim``
+    # keys with one L. ``rotary_dim``
     # of 0 means rotary_dim == head_size (full rotary).
     cos_sin_cache=None,
     rotary_dim=0,
