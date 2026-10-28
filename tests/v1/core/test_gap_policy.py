@@ -316,3 +316,70 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     p = out[0]
     assert nsched == {"gap_test.probe": 16 + 12} and p.spanfuse_window == 0
     assert p.spanfuse_query_rows == 12 and p.prompt_token_ids[-12:] == [7] * 12
+
+
+def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
+    """With mw query starts, each re-read span gets its own probe row: the
+    sentence spliced at that span's tail scores only that span's blocks."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.v1.attention import qcfuse
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", "7,8,9,10")
+    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([0] * 11,)
+
+    def run(starts, rows=8, bad=False):
+        req = make_span_request(176, span_starts=[32, 96])
+        req.prompt_token_ids[64:68] = [7, 8, 9, 10]
+        req.prompt_token_ids[128:132] = [7, 8, 9, 99] if bad else [7, 8, 9, 10]
+        req.spanfuse_query_starts = starts
+        req.prefix_hit_sources = [D] * 2 + [S] * 8
+        req.status = None
+        sched = SimpleNamespace(
+            gap_policy=SpanFusePolicy(k_per_span=32),
+            block_size=16,
+            max_num_scheduled_tokens=8192,
+            max_model_len=4096,
+            max_num_running_reqs=rows,
+            running=[],
+            vllm_config=SimpleNamespace(model_config=None),
+            connector=None,
+            _merge_gaps=Scheduler._merge_gaps,
+            kv_cache_manager=SimpleNamespace(
+                allocate_slots=MagicMock(return_value=blocks),
+                get_blocks=MagicMock(return_value=blocks),
+            ),
+        )
+        queue = create_request_queue(SchedulingPolicy.FCFS)
+        queue.add_request(req)
+        out, nsched = [], {}
+        schedule_span_gaps(
+            sched, req, True, 160, 0, 160, MagicMock(), 8192, nsched, out, set(),
+            queue, create_request_queue(SchedulingPolicy.FCFS),
+        )
+        return req, out, nsched
+
+    req, out, nsched = run([64, 128])
+    got = [(p.req_id, p.num_computed_tokens, p.spanfuse_span_blocks) for p in out]
+    assert got == [("gap_test.probe0", 64, [2, 3]), ("gap_test.probe1", 128, [6, 7])]
+    assert all(p.spanfuse_window == p.spanfuse_query_rows == 4 for p in out)
+    assert nsched == {"gap_test.probe0": 4, "gap_test.probe1": 4}
+    assert req.spanfuse_state == "inflight"
+    # a sentence whose ids differ is not a probe
+    _, out, _ = run([64, 128], bad=True)
+    assert [p.num_computed_tokens for p in out] == [64]
+    # one free batch row: the newest span keeps it
+    _, out, _ = run([64, 128], rows=1)
+    assert [(p.req_id, p.num_computed_tokens) for p in out] == [("gap_test.probe0", 128)]
+    # no mw starts: the single tail probe
+    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
+    _, out, _ = run(None)
+    assert [p.req_id for p in out] == ["gap_test.probe"]

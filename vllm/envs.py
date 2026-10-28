@@ -280,6 +280,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_SPANFUSE_QUERY: str = (
         "Based on this tool output, continue with the task."
     )
+    VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS: str = ""
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1780,6 +1781,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_SPANFUSE_QUERY": lambda: os.environ.get(
         "VLLM_V1_SPANS_SPANFUSE_QUERY",
         "Based on this tool output, continue with the task.",
+    ),
+    # SPANFUSE: ids of the sentence the mw splices after every span (qcfuse_query_starts)
+    "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", ""
     ),
     "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
         os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"
