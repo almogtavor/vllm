@@ -764,19 +764,19 @@ def get_request_block_hasher(
             extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
                 request, start_token_idx, end_token_idx, curr_mm_idx
             )
-            if track_pd and block_in_span(start_token_idx):
-                # span K is cached at p - span_start: never share it with K at p
-                extra_keys = (*(extra_keys or ()), SPANS_RAW_KEY)
-
             # Compute the hash of the current block
             block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
 
             if track_pd:
+                pd_keys = extra_keys
+                if block_in_span(start_token_idx):
+                    # pd chain runs from 0, but span K is cached at p - span_start
+                    pd_keys = (*(extra_keys or ()), SPANS_RAW_KEY)
                 pd_block_hash = hash_block_tokens(
                     caching_hash_fn,
                     prev_pd_hash_value,
                     block_tokens,
-                    extra_keys,
+                    pd_keys,
                 )
                 new_pd_block_hashes.append(pd_block_hash)
                 prev_pd_hash_value = pd_block_hash

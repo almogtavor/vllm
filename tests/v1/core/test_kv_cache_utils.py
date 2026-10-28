@@ -2574,7 +2574,7 @@ def test_request_block_hasher_span_start_resets_hash():
             sha256_cbor,
             None,
             (3, 4, 5),
-            (kv_cache_utils.SPANS_RAW_KEY,),
+            None,
             is_span_start=True,
         )
         assert hashes[1] == standalone_hash
@@ -2677,31 +2677,32 @@ def test_hma_not_disabled_when_kv_events_enabled():
 
 @pytest.mark.spans
 def test_span_blocks_never_share_hash_with_rotated_blocks(monkeypatch):
-    """Span K is cached at p - span_start, head/cross/tail K at p: same tokens at
-    the same chain position must not hash alike across the two."""
+    """Span K is cached at p - span_start: a span block matches the same tokens
+    prefilled bare (the warm-up copy), but its pd copy, chained from position 0,
+    never matches a pd copy whose K is at p."""
     import vllm.envs as envs
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     bs = 16
 
-    def hashes(extra_args):
+    def req(extra_args, toks=range(4 * bs)):
         sp = SamplingParams(max_tokens=17, extra_args=extra_args)
         sp.update_from_generation_config({}, eos_token_id=100)
         return Request(
             request_id="r",
-            prompt_token_ids=list(range(4 * bs)),
+            prompt_token_ids=list(toks),
             sampling_params=sp,
             pooling_params=None,
             block_hasher=get_request_block_hasher(bs, sha256),
-        ).block_hashes
+        )
 
-    plain = hashes(None)
-    # span at 0 collides with the head chain (both start from NONE_HASH)
-    span0 = hashes({"span_starts": [0], "cross_span_starts": [2 * bs]})
-    assert span0[0] != plain[0] and span0[1] != plain[1]
-    # head before the span stays rotated and shareable; the span block is not
-    span1 = hashes({"span_starts": [bs], "cross_span_starts": [2 * bs]})
-    assert span1[0] == plain[0]
-    assert span1[1] == kv_cache_utils.hash_block_tokens(
-        sha256, None, range(bs, 2 * bs), (kv_cache_utils.SPANS_RAW_KEY,)
-    )
+    plain = req(None).block_hashes
+    # a span at 0 is K at p, the same KV as a spans-off prompt
+    assert req({"span_starts": [0], "cross_span_starts": [2 * bs]}).block_hashes[:2] == plain[:2]
+    span1 = req({"span_starts": [bs], "cross_span_starts": [2 * bs]})
+    assert span1.block_hashes[0] == plain[0]
+    assert span1.block_hashes[1] == req(None, range(bs, 2 * bs)).block_hashes[0]
+    # same tokens and pd chain, K at p - bs (span) vs K at p (head)
+    head = req({"span_starts": [2 * bs], "cross_span_starts": [3 * bs]})
+    assert span1.pd_block_hashes[0] == head.pd_block_hashes[0]
+    assert span1.pd_block_hashes[1] != head.pd_block_hashes[1]
