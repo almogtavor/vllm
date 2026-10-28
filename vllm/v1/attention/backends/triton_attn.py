@@ -252,6 +252,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             # the data-dependent scratch never enters a captured decode graph
             k_scratch_block_table = None
             k_scratch_total_blocks = 0
+            if max_query_len > 1 and common_attn_metadata.spans_no_raw_k:
+                # eager batch with no span token: all K rotated, run stock attention
+                cos_sin_cache = attn_lower_bounds = req_kv_starts = None
             if (
                 envs.VLLM_V1_SPANS_PREROTATE
                 and cos_sin_cache is not None

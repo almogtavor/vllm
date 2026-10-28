@@ -2083,7 +2083,8 @@ class GPUModelRunner(
                         np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
                     ):
                         spans_prerotate_safe = False
-            if not raw_k.any():
+            self._spans_no_raw_k = not raw_k.any()
+            if self._spans_no_raw_k:
                 spans_prerotate_safe = False  # all K stored rotated: nothing to do
             attn_lb[raw_k] |= SPANS_RAW_BIT
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
@@ -2643,6 +2644,7 @@ class GPUModelRunner(
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
             spans_prerotate_safe=getattr(self, "_spans_prerotate_safe", True),
+            spans_no_raw_k=getattr(self, "_spans_no_raw_k", False),
         )
 
         if self.dcp_world_size > 1:

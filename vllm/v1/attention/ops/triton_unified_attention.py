@@ -180,6 +180,22 @@ def _store_output_td(
 
 
 @triton.jit
+def _load_k_plain(
+    key_cache_ptr, k_base, offs_d, dim_mask, tile_mask, k_scale, stride_k_cache_3,
+    KV_COMPUTE_DTYPE: tl.constexpr,
+):
+    """SPANS: load a K tile already rotated on write (no raw keys)."""
+    K = tl.load(
+        key_cache_ptr + k_base[None, :] + offs_d[:, None] * stride_k_cache_3,
+        mask=dim_mask[:, None] & tile_mask[None, :],
+        other=0.0,
+    )
+    if K.dtype.is_fp8():
+        K = K.to(tl.float32) * tl.load(k_scale)
+    return K.to(KV_COMPUTE_DTYPE)
+
+
+@triton.jit
 def _load_rotate_k(
     key_cache_ptr,
     k_base,  # [KEYS] per-key base offset (block + head + slot strides applied)
@@ -729,38 +745,29 @@ def kernel_unified_attention(
                     + kv_head_idx * stride_k_cache_2
                     + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
                 )
-                tile_raw = 0
+                K_rot = _load_k_plain(
+                    key_cache_ptr, k_base, offs_d, dim_mask, tile_mask, k_scale,
+                    stride_k_cache_3, KV_COMPUTE_DTYPE,
+                )
                 if USE_SPAN:
-                    tile_raw = tl.max(key_raw.to(tl.int32), 0)
-                if tile_raw > 0:
-                    # span-local queries see span-relative keys, cross-tail
-                    # queries (lb=0) absolute-position keys
-                    key_pos_shift = tl.minimum(key_span_lb, span_offset)
-                    K_rot = _load_rotate_k(
-                        key_cache_ptr,
-                        k_base,
-                        tl.where(key_raw, seq_offset - key_pos_shift, 0),
-                        tile_mask,
-                        offs_d,
-                        k_scale,
-                        cos_sin_cache_ptr,
-                        stride_k_cache_3,
-                        stride_cs_cache_0,
-                        stride_cs_cache_1,
-                        HEAD_SIZE,
-                        ROTARY_DIM,
-                    ).to(KV_COMPUTE_DTYPE)
-                else:
-                    K_rot = tl.load(
-                        key_cache_ptr
-                        + k_base[None, :]
-                        + offs_d[:, None] * stride_k_cache_3,
-                        mask=dim_mask[:, None] & tile_mask[None, :],
-                        other=0.0,
-                    )
-                    if K_rot.dtype.is_fp8():
-                        K_rot = K_rot.to(tl.float32) * tl.load(k_scale)
-                    K_rot = K_rot.to(KV_COMPUTE_DTYPE)
+                    if tl.max(key_raw.to(tl.int32), 0) > 0:
+                        # span-local queries see span-relative keys, cross-tail
+                        # queries (lb=0) absolute-position keys
+                        key_pos_shift = tl.minimum(key_span_lb, span_offset)
+                        K_rot = _load_rotate_k(
+                            key_cache_ptr,
+                            k_base,
+                            tl.where(key_raw, seq_offset - key_pos_shift, 0),
+                            tile_mask,
+                            offs_d,
+                            k_scale,
+                            cos_sin_cache_ptr,
+                            stride_k_cache_3,
+                            stride_cs_cache_0,
+                            stride_cs_cache_1,
+                            HEAD_SIZE,
+                            ROTARY_DIM,
+                        ).to(KV_COMPUTE_DTYPE)
             else:
                 k_offset = (
                     k_physical_block_idx[None, :] * stride_k_cache_0
@@ -1355,6 +1362,10 @@ def unified_attention(
     else:
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
+
+    # SPANS: the raw-K tile branch defeats load pipelining; 1 stage is 1.5-2x faster
+    if fuse_rope and use_span and max_seqlen_q == 1 and launch_num_stages is None:
+        launch_num_stages = 1
 
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:
