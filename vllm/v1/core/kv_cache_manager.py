@@ -486,25 +486,48 @@ class KVCacheManager:
             self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         if swap_indices:
-            # SPANS: fresh pd-keyed blocks for the gap recompute; the shared
-            # warmed (pic) blocks are left untouched for other prefixes.
+            # SPANS: fresh blocks for the gap recompute; the shared warmed (pic)
+            # blocks are left untouched for other prefixes.
             manager = self.coordinator.single_type_managers[0]
-            fresh = manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
+            manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
                 request.request_id, swap_indices
             )
-            bs = self.coordinator.block_size  # type: ignore[attr-defined]
-            assert request.span_starts and request.pd_block_hashes is not None
-            first = min(request.span_starts)
-            # the key the dual lookup tries first: pd from the first span start on
-            hashes = [
-                request.pd_block_hashes[i]
-                if i * bs >= first
-                else request.block_hashes[i]
-                for i in swap_indices
-            ]
-            self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
+        # SPANFUSE: a probe's MISS copies are rewritten in place at repair, so no
+        # other prefix may share them before then
+        if span_gaps and not delay_cache_blocks:
+            self._cache_gap_blocks(request, span_gaps)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _cache_gap_blocks(
+        self, request: Request, span_gaps: Sequence[tuple[int, int]]
+    ) -> None:
+        """SPANS: cache the hash-less full blocks a gap recompute writes."""
+        bs = self.coordinator.block_size  # type: ignore[attr-defined]
+        req_blocks = self.coordinator.single_type_managers[0].req_to_blocks[
+            request.request_id
+        ]
+        pd = request.pd_block_hashes or ()
+        n = min(len(req_blocks), len(request.block_hashes), len(pd))
+        idx = sorted(
+            {
+                b
+                for s, e in span_gaps
+                for b in range(s // bs, min(e // bs, n))
+                if req_blocks[b].block_hash is None and not req_blocks[b].is_null
+            }
+        )
+        if not idx:
+            return
+        assert request.span_starts and request.pd_block_hashes is not None
+        first = min(request.span_starts)
+        # the key the dual lookup tries first: pd from the first span start on
+        hashes = [
+            request.pd_block_hashes[i] if i * bs >= first else request.block_hashes[i]
+            for i in idx
+        ]
+        blocks = [req_blocks[i] for i in idx]
+        self.block_pool.cache_blocks_under_hashes(blocks, hashes, 0)
 
     def _span_swap_indices(
         self, request: Request, span_gaps: Sequence[tuple[int, int]]

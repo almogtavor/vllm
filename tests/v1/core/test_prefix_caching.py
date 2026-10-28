@@ -3903,3 +3903,51 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
         is not None
     }
     assert cached == set(range(16))
+
+
+@pytest.mark.spans
+def test_spanfuse_probe_miss_copies_stay_private_until_repair(monkeypatch):
+    """A delayed probe swaps its MISS blocks to fresh hash-less copies; nothing
+    may hit them before the repair step rewrites them, which then caches them."""
+    import vllm.envs as envs
+    from vllm.v1.core.kv_cache_utils import PrefixHitSource
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    bs = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(bs, 32), max_model_len=8192, hash_block_size=bs
+    )
+
+    def req(rid):
+        sp = SamplingParams(max_tokens=17, extra_args={"span_starts": [bs]})
+        sp.update_from_generation_config({}, eos_token_id=100)
+        return Request(
+            request_id=rid,
+            prompt_token_ids=list(range(4 * bs + 1)),
+            sampling_params=sp,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(bs, sha256),
+        )
+
+    warm = req("warm")
+    blocks, n = manager.get_computed_blocks(warm)
+    manager.allocate_slots(warm, warm.num_tokens - n, n, blocks)
+    manager.free(warm)
+
+    probe = req("probe")
+    blocks, n = manager.get_computed_blocks(probe)
+    assert n == 4 * bs
+    probe.prefix_hit_sources[1] = PrefixHitSource.MISS
+    gap = [(bs, 2 * bs)]
+    manager.allocate_slots(
+        probe, 1, n, blocks, delay_cache_blocks=True, span_gaps=gap
+    )
+    copy_ = manager.coordinator.single_type_managers[0].req_to_blocks["probe"][1]
+    assert copy_.block_hash is None and copy_.ref_cnt == 1
+
+    probe.prefix_hit_sources[1] = PrefixHitSource.PD  # what the probe launch sets
+    probe.num_computed_tokens = n
+    manager.allocate_slots(probe, 1, span_gaps=gap)
+    req_blocks = manager.coordinator.single_type_managers[0].req_to_blocks["probe"]
+    assert req_blocks[1] is copy_ and copy_.block_hash is not None
+    assert manager.block_pool.get_cached_block(probe.pd_block_hashes[1], [0]) == [copy_]
