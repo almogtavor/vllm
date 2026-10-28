@@ -334,10 +334,11 @@ def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", "7,8,9,10")
     D, S = PrefixHitSource.PD, PrefixHitSource.PIC
     blocks = MagicMock()
-    blocks.get_block_ids.return_value = ([0] * 11,)
+    blocks.get_block_ids.return_value = (list(range(13)),)
 
-    def run(starts, rows=8, bad=False):
+    def run(starts, rows=8, bad=False, stripped=False):
         req = make_span_request(176, span_starts=[32, 96])
+        req.spanfuse_query_stripped = stripped
         req.prompt_token_ids[64:68] = [7, 8, 9, 10]
         req.prompt_token_ids[128:132] = [7, 8, 9, 99] if bad else [7, 8, 9, 10]
         req.spanfuse_query_starts = starts
@@ -379,7 +380,31 @@ def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
     # one free batch row: the newest span keeps it
     _, out, _ = run([64, 128], rows=1)
     assert [(p.req_id, p.num_computed_tokens) for p in out] == [("gap_test.probe0", 128)]
+    # stripped: the sentence is not in the prompt; each probe writes it to scratch
+    req, out, _ = run([64, 128, 136], stripped=True)
+    assert [p.block_ids for p in out] == [(list(range(4)) + [11],), (list(range(8)) + [12],)]
+    assert [p.prompt_token_ids[-4:] for p in out] == [[7, 8, 9, 10]] * 2
+    assert [p.spanfuse_probe_lb for p in out] == [32, 96]
+    assert all(p.spanfuse_window == 0 for p in out)
     # no mw starts: the single tail probe
     monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
     _, out, _ = run(None)
     assert [p.req_id for p in out] == ["gap_test.probe"]
+
+
+def test_spanfuse_pad_rows_do_not_score(monkeypatch):
+    """A block of pads with high probe mass loses to a content block."""
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", 27)
+    req = make_span_request(96, span_starts=[16])
+    req.prompt_token_ids[64:80] = [27] * 16
+    imp = [0.0] * 96
+    imp[64:80] = [1.0] * 16
+    imp[40] = 0.5
+    pol = SpanFusePolicy(k_per_span=32)
+    assert pol._select(req, imp, 96) == [(16, 32), (32, 48)]
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", -1)
+    assert pol._select(req, imp, 96) == [(16, 32), (64, 80)]

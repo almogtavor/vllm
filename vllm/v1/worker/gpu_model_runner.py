@@ -1360,6 +1360,7 @@ class GPUModelRunner(
                 ),
                 spanfuse_window=getattr(new_req_data, "spanfuse_window", 0),
                 spanfuse_query_rows=getattr(new_req_data, "spanfuse_query_rows", 0),
+                spanfuse_probe_lb=getattr(new_req_data, "spanfuse_probe_lb", -1),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2073,9 +2074,10 @@ class GPUModelRunner(
                     attn_lb[req_start + start : req_start + end] = lb | full
                 if req.is_spanfuse_probe:
                     # SPANFUSE: the query rows read the whole prefix
-                    attn_lb[req_start + int(num_computed[i]) : req_start + req_len] |= (
-                        SPANS_FULLQ
-                    )
+                    rows = slice(req_start + int(num_computed[i]), req_start + req_len)
+                    if req.spanfuse_probe_lb >= 0:  # stripped: RoPE as if in its span
+                        attn_lb[rows] = req.spanfuse_probe_lb
+                    attn_lb[rows] |= SPANS_FULLQ
             self._spans_no_raw_k = not (attn_lb & SPANS_LB_MASK).any()
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             # copy the packed bounds into the strided buffer in place

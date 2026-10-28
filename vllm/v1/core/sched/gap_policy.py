@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS, spanfuse_query_ids
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
 from vllm.v1.core.sched.output import NewRequestData
@@ -362,6 +363,8 @@ def _schedule_spanfuse_span_probes(
     bs, nq = sched.block_size, len(qids)
     sources = request.prefix_hit_sources or []
     toks = request.prompt_token_ids or []
+    # stripped: the mw sent only the block-aligned start; the sentence lives in scratch
+    stripped = request.spanfuse_query_stripped
     probes = []
     for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens):
         if not any(
@@ -373,18 +376,20 @@ def _schedule_spanfuse_span_probes(
             (
                 q
                 for q in request.spanfuse_query_starts or ()
-                if s <= q < e and q + nq <= num_computed_tokens
+                # stripped: the start is the span's block-aligned end
+                if ((s < q <= e and not q % bs) if stripped else s <= q < e)
+                and q + (0 if stripped else nq) <= num_computed_tokens
             ),
             None,
         )
         if qs is None:
             continue
-        if list(toks[qs : qs + nq]) != qids:
+        if not stripped and list(toks[qs : qs + nq]) != qids:
             logger.warning(
                 "SpanFuse: sentence ids differ at %d in %s", qs, request.request_id
             )
             continue
-        probes.append((qs, list(range(s // bs, qs // bs))))
+        probes.append((qs, list(range(s // bs, qs // bs)), s))
     if not probes:
         return NO_SPAN_GAPS
     miss = sched._merge_gaps(miss_gaps(request, bs))
@@ -397,17 +402,25 @@ def _schedule_spanfuse_span_probes(
     )
     if free < 1:
         return None
+    f, nqb = cdiv(request.num_tokens, bs), cdiv(nq, bs)
+    if stripped:
+        # each probe writes its sentence KV to its own scratch blocks past the prompt
+        free = min(free, (cdiv(sched.max_model_len, bs) - f) // nqb)
+        if free < 1:
+            return NO_SPAN_GAPS
     probes = probes[-free:]  # ponytail: newest spans win when rows run out
     work = nq * len(probes) + sum(e - s for s, e in miss)
     if work > token_budget:
         return None
     tail = request.num_tokens - num_computed_tokens
+    scratch = (f + nqb * len(probes)) * bs - request.num_tokens if stripped else 0
     blocks = sched.kv_cache_manager.allocate_slots(
         request,
         tail,
         num_new_computed_tokens=num_new_local_computed_tokens,
         new_computed_blocks=new_computed_blocks,
         num_external_computed_tokens=num_external_computed_tokens,
+        num_lookahead_tokens=scratch,
         delay_cache_blocks=True,
         span_gaps=miss,
     )
@@ -429,7 +442,7 @@ def _schedule_spanfuse_span_probes(
             virtual_gap_req_ids,
             num_scheduled_tokens,
         )
-    for j, (qs, span_blocks) in enumerate(probes):
+    for j, (qs, span_blocks, s) in enumerate(probes):
         # the sentence is cached: window = all its rows, so no KV is rewritten
         probe = replace(
             parent_nrd,
@@ -441,6 +454,17 @@ def _schedule_spanfuse_span_probes(
             spanfuse_window=nq,
             spanfuse_query_rows=nq,
         )
+        if stripped:
+            lo = f + j * nqb
+            probe = replace(
+                probe,
+                block_ids=tuple(
+                    g[: qs // bs] + g[lo : lo + nqb] for g in parent_nrd.block_ids
+                ),
+                prompt_token_ids=list(toks[:qs]) + qids,
+                spanfuse_window=0,
+                spanfuse_probe_lb=s,
+            )
         num_scheduled_tokens[probe.req_id] = nq
         virtual_reqs_out.append(probe)
         virtual_gap_req_ids.add(probe.req_id)
@@ -814,6 +838,13 @@ class SpanFusePolicy(QCFusePolicy):
         if self.granularity == "token":
             return super()._select(request, importance, n)
         bs, gaps = self.block_size, []
+        toks, pad = request.prompt_token_ids, envs.VLLM_V1_SPANS_PAD_TOKEN
+
+        # pad rows carry no content, so they never vote for a block
+        def mass(b: int) -> float:
+            r = range(b * bs, (b + 1) * bs)
+            return sum(importance[i] for i in r if toks[i] != pad)
+
         for start, end in self._span_ranges(request, n):
             budget = self.k_per_span or int(self.rho * (end - start))
             if budget <= 0:
@@ -821,10 +852,7 @@ class SpanFusePolicy(QCFusePolicy):
             k = max(1, budget // bs)
             blocks = list(range(start // bs, min(end // bs, len(importance) // bs)))
             head = blocks[: min(self.anchor_blocks, k)]
-            rest = sorted(
-                blocks[len(head) :],
-                key=lambda b: -sum(importance[b * bs : (b + 1) * bs]),
-            )
+            rest = sorted(blocks[len(head) :], key=lambda b: -mass(b))
             top = head + rest[: k - len(head)]
             gaps += [(b * bs, (b + 1) * bs) for b in sorted(top)]
         return gaps
