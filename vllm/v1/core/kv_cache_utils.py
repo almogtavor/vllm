@@ -765,7 +765,7 @@ def get_request_block_hasher(
                 request, start_token_idx, end_token_idx, curr_mm_idx
             )
             if track_pd and block_in_span(start_token_idx):
-                # span K is cached un-rotated: never share it with rotated K
+                # span K is cached at p - span_start: never share it with K at p
                 extra_keys = (*(extra_keys or ()), SPANS_RAW_KEY)
 
             # Compute the hash of the current block

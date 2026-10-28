@@ -85,7 +85,7 @@ class QCFuseImportanceCapturer:
         if not self.descs or block_table is None:
             return
         if envs.VLLM_V1_SPANS_ENABLED and cos_sin_cache is None:
-            # SPANS caches K unrotated: scoring it against rotated Q is wrong
+            # SPANS caches Q and K at p - L: the probe must rotate them back
             raise RuntimeError("QCFuse probe under SPANS needs the layer's RoPE cache")
         rope = (cos_sin_cache, rotary_dim) if cos_sin_cache is not None else None
         # K/V-first (2, n_blocks, ...) or blocks-first (n_blocks, 2, ...)
@@ -111,6 +111,7 @@ class QCFuseImportanceCapturer:
             # mean-pool each GQA group onto its KV head
             q = q.view(nq, n_kv, num_queries_per_kv, head_dim).mean(2)
             q_pos = q_pos0 + torch.arange(nq, device=q.device)
+            q = self._rope(q, q_pos, rope, raw)
             if span_blocks is not None:
                 # SPANFUSE: normalize over the span blocks only, not the prefix
                 idx = torch.tensor(
@@ -151,13 +152,11 @@ class QCFuseImportanceCapturer:
 
     @staticmethod
     def _rope(k, pos, rope, raw=None):
-        """Neox-rotate raw (span) K to its absolute position, as the span kernel
-        does for the tail (lb=0) rows the probe scores from (_load_rotate_k).
-        Non-span K is cached rotated already: rotating it at 0 is the identity."""
-        if rope is None:
+        """Neox-rotate Q or K, cached at p - L, back to p (raw = L per position).
+        Off-span L is 0: the identity."""
+        if rope is None or raw is None:
             return k
-        if raw is not None:
-            pos = torch.where(raw[pos.to(raw.device)], pos.to(raw.device), 0)
+        pos = raw[pos.to(raw.device)].long()
         cos_sin_cache, rotary_dim = rope
         d = k.shape[-1]
         rot = d if rotary_dim <= 0 or rotary_dim > d else rotary_dim

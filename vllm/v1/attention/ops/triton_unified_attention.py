@@ -34,9 +34,11 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
-# SPANS lb word: low bits = lower bound, RAW = K stored un-rotated (vllm/v1/spans.py)
-SPANS_RAW = tl.constexpr(1 << 30)
-SPANS_LB_MASK = tl.constexpr((1 << 30) - 1)
+# SPANS lb word: low bits = L (K and Q stored at RoPE p - L), FULLQ = query reads
+# the whole prefix (vllm/v1/spans.py)
+SPANS_FULLQ = tl.constexpr(1 << 29)
+SPANS_LB_MASK = tl.constexpr((1 << 29) - 1)
+SPANS_SCAN = tl.constexpr(1024)  # lb words read per run-end scan step
 
 
 @triton.jit
@@ -180,19 +182,39 @@ def _store_output_td(
 
 
 @triton.jit
-def _load_k_plain(
-    key_cache_ptr, k_base, offs_d, dim_mask, tile_mask, k_scale, stride_k_cache_3,
-    KV_COMPUTE_DTYPE: tl.constexpr,
+def _load_rotate_q(
+    q_rows,  # [BLOCK_M, 1] pointers to each query row
+    row_mask,  # [BLOCK_M, 1]
+    shift,  # [BLOCK_M] per-row RoPE shift, may be negative
+    offs_d,
+    cos_sin_cache_ptr,
+    stride_cs_cache_0: tl.int64,
+    stride_cs_cache_1: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
 ):
-    """SPANS: load a K tile already rotated on write (no raw keys)."""
-    K = tl.load(
-        key_cache_ptr + k_base[None, :] + offs_d[:, None] * stride_k_cache_3,
-        mask=dim_mask[:, None] & tile_mask[None, :],
-        other=0.0,
+    """SPANS: R(shift) Q in fp32, reloaded from memory; shift 0 is the identity."""
+    ROT: tl.constexpr = (
+        HEAD_SIZE if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE) else ROTARY_DIM
     )
-    if K.dtype.is_fp8():
-        K = K.to(tl.float32) * tl.load(k_scale)
-    return K.to(KV_COMPUTE_DTYPE)
+    HALF_ROT: tl.constexpr = ROT // 2
+    x_part = offs_d < HALF_ROT
+    rope_mask = (offs_d < ROT)[None, :]
+    partner = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
+    q = tl.load(q_rows + offs_d[None, :], mask=row_mask & (offs_d < HEAD_SIZE)[None, :],
+                other=0.0).to(tl.float32)
+    qp = tl.load(q_rows + partner[None, :], mask=row_mask & rope_mask, other=0.0)
+    qp = qp.to(tl.float32) * tl.where(x_part, -1.0, 1.0)[None, :]
+    cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
+    row = cos_sin_cache_ptr + tl.abs(shift)[:, None] * stride_cs_cache_0
+    cos = tl.load(row + cos_idx[None, :] * stride_cs_cache_1, mask=rope_mask, other=1.0)
+    sin = tl.load(
+        row + (HALF_ROT + cos_idx[None, :]) * stride_cs_cache_1,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.where(shift[:, None] < 0, -sin, sin)
+    return q * cos.to(tl.float32) + qp * sin
 
 
 @triton.jit
@@ -210,7 +232,7 @@ def _load_rotate_k(
     HEAD_SIZE: tl.constexpr,
     ROTARY_DIM: tl.constexpr,  # 0 means rotary_dim == head_size
 ):
-    """Load un-rotated K, apply span-relative neox RoPE in fp32; caller rounds
+    """Load K cached at p - L, rotate it back to p with neox RoPE in fp32; caller rounds
     once (FR-parity, csrc/libtorch_stable/pos_encoding_kernels.cu). Shared by
     the fused path and kernel_rotate_k_prepass. Returns fp32 (D_PAD, KEYS)."""
     ROT: tl.constexpr = (
@@ -313,10 +335,7 @@ def kernel_rotate_k_prepass(
         key_word = tl.load(
             attn_lower_bounds_ptr + req_kv_start + pos, mask=slot_mask, other=0
         )
-        # rotated K (non-span) copies through at rel pos 0, an exact identity
-        rel_pos = tl.where(
-            (key_word & SPANS_RAW) != 0, pos - (key_word & SPANS_LB_MASK), 0
-        )
+        rel_pos = key_word & SPANS_LB_MASK  # K at p - L back to absolute p
     else:
         rel_pos = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
 
@@ -495,9 +514,8 @@ def kernel_unified_attention(
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
     # Fused span-relative RoPE (spans / Legolink). When ``FUSE_ROPE`` is set,
-    # K is stored un-rotated and rotated here per-tile using ``cos_sin_cache``
-    # indexed by span-relative key position; Q/K are loaded in halves and the
-    # score is the sum of the two half dots. Disabled (constexpr False) leaves
+    # Q and K are cached at RoPE p - L (L = span start, 0 off-span); each run of
+    # keys with one L is scored with Q re-rotated by q_off - L (``_load_rotate_q``). Disabled (constexpr False) leaves
     # the upstream path untouched (dead-code-eliminated at compile time).
     cos_sin_cache_ptr=None,
     stride_cs_cache_0: tl.int64 = 0,
@@ -528,6 +546,9 @@ def kernel_unified_attention(
     tl.static_assert(
         not (SEPARATE_K_TABLE and FUSE_ROPE),
         "SEPARATE_K_TABLE carries pre-rotated K; FUSE_ROPE must be off",
+    )
+    tl.static_assert(
+        USE_SPAN or not FUSE_ROPE, "FUSE_ROPE needs the span lb words (K at p - L)"
     )
 
     q_block_global_idx = tl.program_id(0)
@@ -651,124 +672,109 @@ def kernel_unified_attention(
     span_offset: tl.int32 = 0
     if USE_SPAN:
         req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-        q_lb_vec = (
-            tl.load(
-                attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
-                mask=query_mask_0,
-                other=INT32_MAX,
-            )
-            & SPANS_LB_MASK
+        q_word = tl.load(
+            attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
+            mask=query_mask_0,
+            other=0,
         )
+        q_off = q_word & SPANS_LB_MASK  # Q stored at RoPE p - q_off
+        q_lb = tl.where((q_word & SPANS_FULLQ) != 0, 0, q_off)
         # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
-        span_offset = tl.min(q_lb_vec)
+        span_offset = tl.min(tl.where(query_mask_0, q_lb, INT32_MAX))
         span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
         loop_lo = tl.maximum(loop_lo, span_offset // TILE_SIZE)
-
-    # iterate through tiles (now limited to the sliding window range)
-    for j in range(loop_lo, loop_hi):
-        seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
-
-        if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
-            key_word = tl.load(
-                attn_lower_bounds_ptr + req_kv_start + seq_offset,
-                mask=tile_mask,
-                other=0,
+        if FUSE_ROPE:  # score frame per key L: R(q_off - L) Q, cached per L
+            q_rows = (
+                query_ptr
+                + query_offset_0[:, None] * query_stride_0
+                + query_offset_1[:, None] * query_stride_1
             )
-            key_raw = (key_word & SPANS_RAW) != 0
-            key_span_lb = key_word & SPANS_LB_MASK
+            q_rmask = query_mask_0[:, None] & query_mask_1[:, None]
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+    # SPANS: K is stored at RoPE p - L, so the keys run in maximal stretches of
+    # one L, each scored by a loop-invariant R(q_off - L) Q; one pass otherwise
+    run_lo = loop_lo * TILE_SIZE
+    key_hi = tl.minimum(loop_hi * TILE_SIZE, max_seq_prefix_len)
+    while run_lo < key_hi:
+        run_hi = key_hi
+        if FUSE_ROPE:
+            lb_base = attn_lower_bounds_ptr + req_kv_start
+            L_run = tl.load(lb_base + run_lo) & SPANS_LB_MASK
+            scan = run_lo
+            while scan < run_hi:
+                offs_w = scan + tl.arange(0, SPANS_SCAN)
+                w = tl.load(lb_base + offs_w, mask=offs_w < run_hi, other=0)
+                brk = (offs_w < run_hi) & ((w & SPANS_LB_MASK) != L_run)
+                run_hi = tl.minimum(run_hi, tl.min(tl.where(brk, offs_w, INT32_MAX)))
+                scan += SPANS_SCAN
+            Qs = _load_rotate_q(
+                q_rows, q_rmask, q_off - L_run, offs_d, cos_sin_cache_ptr,
+                stride_cs_cache_0, stride_cs_cache_1, HEAD_SIZE, ROTARY_DIM,
+            ).to(Q.dtype)
+        # iterate through tiles (now limited to the sliding window range)
+        for j in range(run_lo // TILE_SIZE, tl.cdiv(run_hi, TILE_SIZE)):
+            seq_offset = j * TILE_SIZE + offs_t
+            tile_mask = seq_offset < max_seq_prefix_len
 
-        if SEPARATE_K_TABLE:  # SPANS prerotate: K lives in the scratch
-            k_physical_block_idx = tl.load(
-                k_block_tables_ptr
-                + seq_idx * k_block_table_stride
-                + seq_offset // BLOCK_SIZE
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
-        else:
-            k_physical_block_idx = physical_block_idx
 
-        if USE_TD:
-            # All TILE_SIZE slots within a single KV tile map to one
-            # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
-            # from the static_assert above), so load the block index as
-            # a scalar instead of a broadcast reduction.
-            offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
-            physical_block_scalar = tl.load(
-                block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
-            ).to(tl.int64)
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = _load_kv_tile_td(
-                key_cache_ptr,
-                physical_block_scalar,
-                kv_head_idx,
-                offset_in_block,
-                stride_k_cache_0,
-                stride_k_cache_1,
-                stride_k_cache_2,
-                stride_k_cache_3,
-                BLOCK_SIZE,
-                TILE_SIZE,
-                HEAD_SIZE,
-                HEAD_SIZE_PADDED,
-            ).T
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = _load_kv_tile_td(
-                value_cache_ptr,
-                physical_block_scalar,
-                kv_head_idx,
-                offset_in_block,
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                BLOCK_SIZE,
-                TILE_SIZE,
-                HEAD_SIZE,
-                HEAD_SIZE_PADDED,
-            )
-        else:
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
-            if FUSE_ROPE:
-                # SPANS: only span K is stored raw; everything else was rotated
-                # at its absolute position on write, which every query reads.
-                k_base = (
-                    physical_block_idx * stride_k_cache_0
-                    + kv_head_idx * stride_k_cache_2
-                    + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
-                )
-                K_rot = _load_k_plain(
-                    key_cache_ptr, k_base, offs_d, dim_mask, tile_mask, k_scale,
-                    stride_k_cache_3, KV_COMPUTE_DTYPE,
-                )
-                if USE_SPAN:
-                    if tl.max(key_raw.to(tl.int32), 0) > 0:
-                        # span-local queries see span-relative keys, cross-tail
-                        # queries (lb=0) absolute-position keys
-                        key_pos_shift = tl.minimum(key_span_lb, span_offset)
-                        K_rot = _load_rotate_k(
-                            key_cache_ptr,
-                            k_base,
-                            tl.where(key_raw, seq_offset - key_pos_shift, 0),
-                            tile_mask,
-                            offs_d,
-                            k_scale,
-                            cos_sin_cache_ptr,
-                            stride_k_cache_3,
-                            stride_cs_cache_0,
-                            stride_cs_cache_1,
-                            HEAD_SIZE,
-                            ROTARY_DIM,
-                        ).to(KV_COMPUTE_DTYPE)
+            if SEPARATE_K_TABLE:  # SPANS prerotate: K lives in the scratch
+                k_physical_block_idx = tl.load(
+                    k_block_tables_ptr
+                    + seq_idx * k_block_table_stride
+                    + seq_offset // BLOCK_SIZE
+                ).to(tl.int64)
             else:
+                k_physical_block_idx = physical_block_idx
+
+            if USE_TD:
+                # All TILE_SIZE slots within a single KV tile map to one
+                # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
+                # from the static_assert above), so load the block index as
+                # a scalar instead of a broadcast reduction.
+                offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
+                physical_block_scalar = tl.load(
+                    block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
+                ).to(tl.int64)
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = _load_kv_tile_td(
+                    key_cache_ptr,
+                    physical_block_scalar,
+                    kv_head_idx,
+                    offset_in_block,
+                    stride_k_cache_0,
+                    stride_k_cache_1,
+                    stride_k_cache_2,
+                    stride_k_cache_3,
+                    BLOCK_SIZE,
+                    TILE_SIZE,
+                    HEAD_SIZE,
+                    HEAD_SIZE_PADDED,
+                ).T
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = _load_kv_tile_td(
+                    value_cache_ptr,
+                    physical_block_scalar,
+                    kv_head_idx,
+                    offset_in_block,
+                    stride_v_cache_0,
+                    stride_v_cache_1,
+                    stride_v_cache_2,
+                    stride_v_cache_3,
+                    BLOCK_SIZE,
+                    TILE_SIZE,
+                    HEAD_SIZE,
+                    HEAD_SIZE_PADDED,
+                )
+            else:
+                v_offset = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_d[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 k_offset = (
                     k_physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
@@ -781,105 +787,111 @@ def kernel_unified_attention(
                     mask=dim_mask[:, None] & tile_mask[None, :],
                     other=0.0,
                 )
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
-        if not FUSE_ROPE:
-            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
-
-        # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
-        if USE_PER_TOKEN_HEAD_SCALES:
-            scale_idx = (
-                physical_block_idx * stride_ks_blk
-                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
-                + kv_head_idx * stride_ks_head
-            )
-            k_token_head_scales = tl.load(
-                k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
-            )
-            v_scale_idx = (
-                physical_block_idx * stride_vs_blk
-                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
-                + kv_head_idx * stride_vs_head
-            )
-            v_token_head_scales = tl.load(
-                v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
-            )
-
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = compute_kv_seq_mask(
-            query_abs_pos,
-            seq_offset,
-            seq_idx,
-            seq_len,
-            mm_prefix_range_ptr,
-            SLIDING_WINDOW,
-            USE_MM_PREFIX,
-            MAX_MM_RANGES,
-            USE_CAUSAL,
-            USE_PER_SEQ_CAUSAL,
-            per_seq_causal_ptr,
-            CHUNK_LOOKBACK,
-            CHUNK_SIZE,
-        )
-
-        # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if FUSE_ROPE:
-            S += score_scale * tl.dot(Q, K_rot)
-        elif USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: fuse softmax_scale with per-head k_scale
-            # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-            S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
-        else:
-            S += score_scale * tl.dot(Q, K)
-
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
-        if USE_ALIBI_SLOPES:
-            S = apply_alibi_to_score(
-                S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
-            )
-
-        if USE_QQ_BIAS:
-            S += load_qq_bias_tile(
-                qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
-            )
-
-        M, L, P, alpha = softmax_step(S, M, L)
-        acc = acc * alpha[:, None]
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :] & tile_mask[:, None],
+                    other=0.0,
                 )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
-            else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: apply v_scale to P instead of V.
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
+            # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
+            if USE_PER_TOKEN_HEAD_SCALES:
+                scale_idx = (
+                    physical_block_idx * stride_ks_blk
+                    + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                    + kv_head_idx * stride_ks_head
+                )
+                k_token_head_scales = tl.load(
+                    k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
+                )
+                v_scale_idx = (
+                    physical_block_idx * stride_vs_blk
+                    + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                    + kv_head_idx * stride_vs_head
+                )
+                v_token_head_scales = tl.load(
+                    v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
+                )
+
+            query_abs_pos = context_len + query_pos[:, None]
+            seq_mask = compute_kv_seq_mask(
+                query_abs_pos,
+                seq_offset,
+                seq_idx,
+                seq_len,
+                mm_prefix_range_ptr,
+                SLIDING_WINDOW,
+                USE_MM_PREFIX,
+                MAX_MM_RANGES,
+                USE_CAUSAL,
+                USE_PER_SEQ_CAUSAL,
+                per_seq_causal_ptr,
+                CHUNK_LOOKBACK,
+                CHUNK_SIZE,
+            )
+
+            if USE_SPAN:
+                seq_mask = seq_mask & (seq_offset[None, :] >= q_lb[:, None])
+                if FUSE_ROPE:
+                    run_keys = (seq_offset >= run_lo) & (seq_offset < run_hi)
+                    seq_mask = seq_mask & run_keys[None, :]
+
+            # S : (BLOCK_M, TILE_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+            if FUSE_ROPE:
+                S += score_scale * tl.dot(Qs, K)
+            elif USE_PER_TOKEN_HEAD_SCALES:
+                # Per-token-head quant: fuse softmax_scale with per-head k_scale
+                # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
+                S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
+            else:
+                S += score_scale * tl.dot(Q, K)
+
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
+
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+            )
+
+            if USE_ALIBI_SLOPES:
+                S = apply_alibi_to_score(
+                    S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
+                )
+
+            if USE_QQ_BIAS:
+                S += load_qq_bias_tile(
+                    qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+                )
+
+            M, L, P, alpha = softmax_step(S, M, L)
+            acc = acc * alpha[:, None]
+
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                dist = context_len + qpos_lo - seq_offset[:, None]
+                if USE_PER_SEQ_CAUSAL:
+                    is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                    sw_mask_v = tl.where(
+                        is_causal_seq,
+                        dist < SLIDING_WINDOW,
+                        (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                    )
+                elif USE_CAUSAL:
+                    sw_mask_v = dist < SLIDING_WINDOW
+                else:
+                    sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+                V = tl.where(sw_mask_v, V, 0.0)
+            if USE_PER_TOKEN_HEAD_SCALES:
+                # Per-token-head quant: apply v_scale to P instead of V.
+                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+                acc += tl.dot(P_v, V)
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
+
+        run_lo = run_hi
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
         if USE_FP8_Q_DESCALE:
@@ -1138,8 +1150,8 @@ def unified_attention(
     # disabling this flag costs nothing.
     use_td: bool = False,
     # Fused span-relative RoPE (spans / Legolink). When ``cos_sin_cache`` is
-    # provided, K is stored un-rotated and rotated inside the kernel using
-    # ``cos_sin_cache`` indexed by span-relative key position. ``rotary_dim``
+    # provided, Q and K are cached at RoPE p - L and Q is re-rotated per run of
+    # keys with one L (vllm/v1/spans.py). ``rotary_dim``
     # of 0 means rotary_dim == head_size (full rotary).
     cos_sin_cache=None,
     rotary_dim=0,
@@ -1363,10 +1375,8 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
-    # SPANS: the raw-K tile branch defeats load pipelining; 1 stage is 1.5-2x faster
-    if fuse_rope and use_span and max_seqlen_q == 1 and launch_num_stages is None:
-        launch_num_stages = 1
-
+    if fuse_rope and use_span and launch_num_stages is None:
+        launch_num_stages = 2  # SPANS: 3 stages spill the per-run Q rotation
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:
         launch_kwargs["num_warps"] = launch_num_warps

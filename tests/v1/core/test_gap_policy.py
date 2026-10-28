@@ -163,7 +163,7 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     q = torch.randn(4, 4, 8)
     table = torch.arange(n_blk)[None]
     cap = QCFuseImportanceCapturer(1, n_blk * bs, "cpu")
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs, None)])
     cap.capture(q, kv, 2, 0.3)
     got = cap.buffer[0].clone()
     in_span = torch.zeros(n_blk * bs, dtype=torch.bool)
@@ -173,18 +173,18 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     assert torch.isclose(got.sum(), torch.tensor(4.0 * 2))
     kv2 = kv.clone()
     kv2[0, :4] = torch.randn_like(kv2[0, :4])
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs, None)])
     cap.capture(q, kv2, 2, 0.3)
     assert torch.allclose(cap.buffer[0], got)
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs, None)])
     cap.capture(q, kv, 2, 0.3)
     full = cap.buffer[0][in_span]
     # same rows, one shared normalizer per row: per-row rankings are identical
     top = lambda m: m.topk(8).indices.sort().values
     assert torch.equal(top(full), top(got[in_span]))
 
-    # SPANS caches K unrotated: the probe must rotate it to its absolute
-    # position (as the kernel does for lb=0 rows) before scoring rotated Q
+    # SPANS caches K at p - L: the probe rotates it back by L (here L = p, K
+    # cached at 0) before scoring Q; the query rows sit at L = 0
     hd, rot = 8, 6
     inv = 1.0 / (10000 ** (torch.arange(0, rot, 2).float() / rot))
     ang = torch.arange(n_blk * bs).float()[:, None] * inv
@@ -196,17 +196,18 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     )
     k_rot = torch.cat((z.real, z.imag, k[..., rot:hd]), -1)
     pos = torch.cat([torch.arange(b * bs, (b + 1) * bs) for b in span])
+    lk = torch.cat((torch.arange(n_blk * bs), torch.zeros(4, dtype=torch.long)))
     want = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot[pos], 0.3)
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs, lk)])
     cap.capture(q, kv, 2, 0.3, cos_sin, rot)
     assert torch.allclose(cap.buffer[0][pos], want, atol=1e-5)
     assert not torch.allclose(got[pos], want, atol=1e-3)
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs, lk)])
     cap.capture(q, kv, 2, 0.3, cos_sin, rot)
     want_full = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot, 0.3)
     assert torch.allclose(cap.buffer[0], want_full, atol=1e-5)
     # query rows inside the last span block never score keys after themselves
-    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, 8 * bs + 2)])
+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, 8 * bs + 2, None)])
     cap.capture(q, kv, 2, 0.3)
     assert cap.buffer[0][8 * bs + 6 :].eq(0).all()
     assert cap.buffer[0][8 * bs + 2 : 8 * bs + 6].gt(0).all()

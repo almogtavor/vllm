@@ -2574,7 +2574,7 @@ def test_request_block_hasher_span_start_resets_hash():
             sha256_cbor,
             None,
             (3, 4, 5),
-            None,
+            (kv_cache_utils.SPANS_RAW_KEY,),
             is_span_start=True,
         )
         assert hashes[1] == standalone_hash
@@ -2677,7 +2677,7 @@ def test_hma_not_disabled_when_kv_events_enabled():
 
 @pytest.mark.spans
 def test_span_blocks_never_share_hash_with_rotated_blocks(monkeypatch):
-    """Span K is cached un-rotated, head/cross/tail K rotated: same tokens at
+    """Span K is cached at p - span_start, head/cross/tail K at p: same tokens at
     the same chain position must not hash alike across the two."""
     import vllm.envs as envs
 
