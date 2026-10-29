@@ -277,6 +277,8 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
     VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
     VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
+    VLLM_V1_SPANS_LB_NOCLIP: bool = False
+    VLLM_V1_SPANS_LB_SPILL_LOG: bool = False
     VLLM_V1_SPANS_SPANFUSE_QUERY: str = (
         "Based on this tool output, continue with the task."
     )
@@ -1775,6 +1777,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SPANFUSE: leading blocks of every span always repaired before probe ranking
     "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS": lambda: int(
         os.environ.get("VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", "1")
+    ),
+    # SPANS: diagnostic only - restore the unclipped lb regions that overflow
+    "VLLM_V1_SPANS_LB_NOCLIP": lambda: (
+        os.environ.get("VLLM_V1_SPANS_LB_NOCLIP", "False") == "True"
+    ),
+    # SPANS: log query rows whose lb word came from another request's regions
+    "VLLM_V1_SPANS_LB_SPILL_LOG": lambda: (
+        os.environ.get("VLLM_V1_SPANS_LB_SPILL_LOG", "False") == "True"
     ),
     # SPANFUSE: instruction appended in the scoring pass; its rows are the query,
     # "" scores from the prompt's own last QCFUSE_MAX_QUERY_TOKENS tokens instead

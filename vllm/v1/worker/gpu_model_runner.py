@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import collections
 import functools
 import gc
 import hashlib
@@ -447,6 +448,7 @@ def compute_span_lb_regions(
     span_starts: list[int],
     cross_span_starts: list[int] | None,
     req_len: int,
+    clip: bool = True,
 ) -> list[tuple[int, int, int]]:
     """SPANS: (start, end, lb) attention-lower-bound regions for a request.
 
@@ -454,15 +456,32 @@ def compute_span_lb_regions(
     start (adjacent spans carry no cross of their own - the client skips
     crosses that coincide with a span start) or the first cross past it.
     Index-pairing crosses to spans paints lb wrongly over later spans and the
-    generated tail whenever spans are adjacent."""
+    generated tail whenever spans are adjacent. Regions are clipped to
+    req_len: a chunk, probe or virtual request shorter than the prompt would
+    otherwise write lb words into the next request's packed slice, masking
+    every key of its rows (0/0 = NaN, sampled as token 0 = gemma <pad>)."""
     crosses = sorted(cross_span_starts or [])
     spans_sorted = sorted(span_starts)
     out = []
     for j, start in enumerate(spans_sorted):
+        if clip and start >= req_len:  # past this chunk: would paint the NEXT request
+            break
         nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
         cross = next((c for c in crosses if c > start), req_len)
-        out.append((start, min(nxt, cross), start))
+        end = min(nxt, cross)
+        out.append((start, min(end, req_len) if clip else end, start))
     return out
+
+
+def _spill_source(req, req_len: int) -> str:
+    """SPANS: which kind of short request overflows its lb slot."""
+    if req.is_spanfuse_probe:
+        return "probe"
+    if req.is_gap_recompute:
+        return "gap"
+    if req_len < req.num_prompt_tokens:
+        return "chunk"
+    return "other"
 
 
 class GPUModelRunner(
@@ -2013,6 +2032,48 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _log_lb_spill(
+        self, attn_lb, alt_lb, spill_src, req_kv_starts, num_computed,
+        seq_lens, noclip,
+    ) -> None:
+        """SPANS_LB_SPILL_LOG: count query rows that carry a foreign lb word."""
+        bad = alt_lb if not noclip else attn_lb  # the unclipped paint
+        good = attn_lb if not noclip else alt_lb
+        st = self.__dict__.setdefault("_lb_spill_stats", collections.Counter())
+        st["steps"] += 1
+        if not spill_src:
+            return
+        st["spill_steps"] += 1
+        ids = self.input_batch.req_ids
+        for i, src in spill_src:
+            st["spill_" + src] += 1
+        for j in range(len(ids)):
+            lo = int(req_kv_starts[j]) + int(num_computed[j])
+            hi = int(req_kv_starts[j]) + int(seq_lens[j])
+            diff = np.nonzero(bad[lo:hi] != good[lo:hi])[0]
+            if not len(diff):
+                continue
+            w = bad[lo:hi][diff]
+            pos = diff + int(num_computed[j])
+            lb = w & SPANS_LB_MASK
+            masked = int((((w & SPANS_FULLQ) == 0) & (lb > pos)).sum())
+            neg = int((lb > pos).sum())
+            st["victim_reqs"] += 1
+            st["victim_rows"] += len(diff)
+            st["masked_rows"] += masked
+            st["neg_pos_rows"] += neg
+            if st["logged"] < 50:
+                st["logged"] += 1
+                logger.warning(
+                    "SPANS_LB_SPILL victim=%s rows=%d masked=%d neg_pos=%d "
+                    "pos=%d..%d lb=%d..%d noclip=%s srcs=%s",
+                    ids[j], len(diff), masked, neg, int(pos[0]), int(pos[-1]),
+                    int(lb.min()), int(lb.max()), noclip,
+                    [(ids[i], s_) for i, s_ in spill_src if i < j],
+                )
+        if st["spill_steps"] % 100 == 1:
+            logger.warning("SPANS_LB_SPILL totals %s", dict(st))
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2056,6 +2117,11 @@ class GPUModelRunner(
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
             attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
+            noclip = envs.VLLM_V1_SPANS_LB_NOCLIP
+            spill_log = envs.VLLM_V1_SPANS_LB_SPILL_LOG
+            # SPILL_LOG paints both variants; ``attn_lb`` is the one that runs
+            alt_lb = np.zeros_like(attn_lb) if spill_log else None
+            spill_src: list[tuple[int, str]] = []
             for i in range(num_reqs):
                 req = self.requests[self.input_batch.req_ids[i]]
                 params = req.sampling_params
@@ -2066,18 +2132,35 @@ class GPUModelRunner(
                 if not spans or ea is None:
                     continue
                 req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-                for start, end, lb in compute_span_lb_regions(
-                    spans, ea.get("cross_span_starts"), req_len
+                # a gap recompute keeps span-local K but reads full context
+                full = SPANS_FULLQ if req.is_gap_recompute else 0
+                for arr, clip in ((attn_lb, not noclip), (alt_lb, noclip)):
+                    if arr is None:
+                        continue
+                    regions = compute_span_lb_regions(
+                        spans, ea.get("cross_span_starts"), req_len, clip
+                    )
+                    for start, end, lb in regions:
+                        arr[req_start + start : req_start + end] = lb | full
+                    if req.is_spanfuse_probe:
+                        # SPANFUSE: the query rows read the whole prefix
+                        q0 = req_start + int(num_computed[i])
+                        rows = slice(q0, req_start + req_len)
+                        if req.spanfuse_probe_lb >= 0:  # stripped: RoPE as in its span
+                            arr[rows] = req.spanfuse_probe_lb
+                        arr[rows] |= SPANS_FULLQ
+                if spill_log and any(
+                    e > req_len
+                    for _, e, _ in compute_span_lb_regions(
+                        spans, ea.get("cross_span_starts"), req_len, clip=False
+                    )
                 ):
-                    # a gap recompute keeps span-local K but reads full context
-                    full = SPANS_FULLQ if req.is_gap_recompute else 0
-                    attn_lb[req_start + start : req_start + end] = lb | full
-                if req.is_spanfuse_probe:
-                    # SPANFUSE: the query rows read the whole prefix
-                    rows = slice(req_start + int(num_computed[i]), req_start + req_len)
-                    if req.spanfuse_probe_lb >= 0:  # stripped: RoPE as if in its span
-                        attn_lb[rows] = req.spanfuse_probe_lb
-                    attn_lb[rows] |= SPANS_FULLQ
+                    spill_src.append((i, _spill_source(req, req_len)))
+            if spill_log:
+                self._log_lb_spill(
+                    attn_lb, alt_lb, spill_src, req_kv_starts, num_computed,
+                    seq_lens_arr, noclip,
+                )
             self._spans_no_raw_k = not (attn_lb & SPANS_LB_MASK).any()
             self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
             # copy the packed bounds into the strided buffer in place
