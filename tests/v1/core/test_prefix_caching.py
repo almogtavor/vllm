@@ -3906,9 +3906,9 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
 
 
 @pytest.mark.spans
-def test_spanfuse_probe_miss_copies_stay_private_until_repair(monkeypatch):
-    """A delayed probe swaps its MISS blocks to fresh hash-less copies; nothing
-    may hit them before the repair step rewrites them, which then caches them."""
+def test_spanfuse_probe_miss_copies_stay_private(monkeypatch):
+    """A delayed probe swaps its MISS blocks to fresh hash-less copies that the
+    repair step rewrites in place, so no other prefix may ever hit them."""
     import vllm.envs as envs
     from vllm.v1.core.kv_cache_utils import PrefixHitSource
 
@@ -3949,5 +3949,5 @@ def test_spanfuse_probe_miss_copies_stay_private_until_repair(monkeypatch):
     probe.num_computed_tokens = n
     manager.allocate_slots(probe, 1, span_gaps=gap)
     req_blocks = manager.coordinator.single_type_managers[0].req_to_blocks["probe"]
-    assert req_blocks[1] is copy_ and copy_.block_hash is not None
-    assert manager.block_pool.get_cached_block(probe.pd_block_hashes[1], [0]) == [copy_]
+    assert req_blocks[1] is copy_ and copy_.block_hash is None
+    assert manager.block_pool.get_cached_block(probe.pd_block_hashes[1], [0]) is None
