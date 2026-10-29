@@ -427,6 +427,26 @@ def test_spanfuse_pad_rows_do_not_score(monkeypatch):
     assert pol._select(req, imp, 96) == [(16, 32), (64, 80)]
 
 
+def test_spanfuse_anchor_blocks_env(monkeypatch):
+    """ANCHOR_BLOCKS=2 repairs span blocks 0-1, the probe ranks only the rest."""
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    req = make_span_request(128, span_starts=[16])
+    imp = [0.0] * 128
+    imp[96:112] = [1.0] * 16
+    imp[80] = 0.5
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", 2)
+    assert SpanFusePolicy(k_per_span=48)._select(req, imp, 128) == [
+        (16, 32), (32, 48), (96, 112)
+    ]
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", 1)
+    assert SpanFusePolicy(k_per_span=48)._select(req, imp, 128) == [
+        (16, 32), (80, 96), (96, 112)
+    ]
+
+
 def test_spanfuse_otf_warm_then_probe(monkeypatch):
     """A cold tail span is encoded span-locally and cached under its plain key,
     then the re-lookup sees it as a PIC hit and the probe repairs it."""

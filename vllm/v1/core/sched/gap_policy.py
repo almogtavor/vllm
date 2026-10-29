@@ -950,8 +950,16 @@ class NeighborAwarePolicy(QCFusePolicy):
 class SpanFusePolicy(QCFusePolicy):
     """QCFuse whose importance comes from the current request's probe."""
 
-    # every span keeps its head block repaired; the scoring pass ranks the rest
-    anchor_blocks = 1
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # every span keeps its first N blocks repaired; the scoring pass ranks the rest
+        self.anchor_blocks = envs.VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS
+        if self.anchor_blocks < 0:
+            raise ValueError(f"SpanFuse: anchor_blocks must be >= 0, got {self.anchor_blocks}")
+        logger.info(
+            "SpanFusePolicy initialized: k_per_span=%d rho=%s anchor_blocks=%d",
+            self.k_per_span, self.rho, self.anchor_blocks,
+        )
 
     def _select(
         self, request: "Request", importance: list[float], n: int

@@ -276,6 +276,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
     VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
     VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
+    VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
     VLLM_V1_SPANS_SPANFUSE_QUERY: str = (
         "Based on this tool output, continue with the task."
     )
@@ -1770,6 +1771,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SPANFUSE: also score the full prefix and log the per-span top-K agreement
     "VLLM_V1_SPANS_SPANFUSE_NORM_CHECK": lambda: (
         os.environ.get("VLLM_V1_SPANS_SPANFUSE_NORM_CHECK", "False") == "True"
+    ),
+    # SPANFUSE: leading blocks of every span always repaired before probe ranking
+    "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", "1")
     ),
     # SPANFUSE: instruction appended in the scoring pass; its rows are the query,
     # "" scores from the prompt's own last QCFUSE_MAX_QUERY_TOKENS tokens instead
