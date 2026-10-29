@@ -219,203 +219,6 @@ def _load_rotate_q(
 
 
 @triton.jit
-def _load_rotate_k(
-    key_cache_ptr,
-    k_base,  # [KEYS] per-key base offset (block + head + slot strides applied)
-    rel_pos,  # [KEYS] span-relative position indexing the cos/sin cache
-    key_mask,  # [KEYS] valid-key mask
-    offs_d,  # [HEAD_SIZE_PADDED]
-    k_scale,
-    cos_sin_cache_ptr,
-    stride_k_cache_3: tl.constexpr,
-    stride_cs_cache_0: tl.int64,
-    stride_cs_cache_1: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    ROTARY_DIM: tl.constexpr,  # 0 means rotary_dim == head_size
-):
-    """Load K cached at p - L, rotate it back to p with neox RoPE in fp32; caller rounds
-    once (FR-parity, csrc/libtorch_stable/pos_encoding_kernels.cu). Shared by
-    the fused path and kernel_rotate_k_prepass. Returns fp32 (D_PAD, KEYS)."""
-    ROT: tl.constexpr = (
-        HEAD_SIZE if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE) else ROTARY_DIM
-    )
-    HALF_ROT: tl.constexpr = ROT // 2
-    dim_mask = offs_d < HEAD_SIZE
-    x_part = offs_d < HALF_ROT
-    partner_d = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
-    K_raw = tl.load(
-        key_cache_ptr + k_base[None, :] + offs_d[:, None] * stride_k_cache_3,
-        mask=dim_mask[:, None] & key_mask[None, :],
-        other=0.0,
-    )
-    K_partner = tl.load(
-        key_cache_ptr + k_base[None, :] + partner_d[:, None] * stride_k_cache_3,
-        mask=dim_mask[:, None] & key_mask[None, :],
-        other=0.0,
-    )
-    rope_mask = (offs_d[:, None] < ROT) & key_mask[None, :]
-    cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
-    cos = tl.load(
-        cos_sin_cache_ptr
-        + rel_pos[None, :] * stride_cs_cache_0
-        + cos_idx[:, None] * stride_cs_cache_1,
-        mask=rope_mask,
-        other=1.0,
-    ).to(tl.float32)
-    sin = tl.load(
-        cos_sin_cache_ptr
-        + rel_pos[None, :] * stride_cs_cache_0
-        + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1,
-        mask=rope_mask,
-        other=0.0,
-    ).to(tl.float32)
-    rope_sign = tl.where(x_part, -1.0, 1.0)
-    if K_raw.dtype.is_fp8():
-        k_sc = tl.load(k_scale)
-        K_raw_f = K_raw.to(tl.float32) * k_sc
-        K_partner_f = K_partner.to(tl.float32) * k_sc
-    else:
-        K_raw_f = K_raw.to(tl.float32)
-        K_partner_f = K_partner.to(tl.float32)
-    return K_raw_f * cos + rope_sign[:, None] * K_partner_f * sin
-
-
-@triton.jit
-def kernel_rotate_k_prepass(
-    # SPANS prerotate: rotate the batch's K ONCE into a transient scratch;
-    # the attention kernel then reads it with FUSE_ROPE off.
-    key_cache_ptr,
-    scratch_ptr,
-    block_tables_ptr,
-    k_scratch_tables_ptr,
-    seq_lens_ptr,
-    cos_sin_cache_ptr,
-    attn_lower_bounds_ptr,
-    req_kv_starts_ptr,
-    block_table_stride: tl.int64,
-    scratch_table_stride: tl.int64,
-    stride_k_cache_0: tl.int64,
-    stride_k_cache_1: tl.int64,
-    stride_k_cache_2: tl.int64,
-    stride_k_cache_3: tl.constexpr,
-    stride_scr_0: tl.int64,
-    stride_scr_1: tl.int64,
-    stride_scr_2: tl.int64,
-    stride_scr_3: tl.constexpr,
-    stride_cs_cache_0: tl.int64,
-    stride_cs_cache_1: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    HEAD_SIZE_PADDED: tl.constexpr,
-    ROTARY_DIM: tl.constexpr,  # 0 means rotary_dim == head_size
-    USE_SPAN: tl.constexpr,
-):
-    seq_idx = tl.program_id(0)
-    blk_j = tl.program_id(1)
-    kv_head_idx = tl.program_id(2)
-
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
-    if blk_j * BLOCK_SIZE >= seq_len:
-        return
-
-    src_blk = tl.load(block_tables_ptr + seq_idx * block_table_stride + blk_j).to(
-        tl.int64
-    )
-    dst_blk = tl.load(k_scratch_tables_ptr + seq_idx * scratch_table_stride + blk_j).to(
-        tl.int64
-    )
-
-    offs_s = tl.arange(0, BLOCK_SIZE)
-    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    pos = blk_j * BLOCK_SIZE + offs_s
-    slot_mask = pos < seq_len
-    dim_mask = offs_d < HEAD_SIZE
-
-    if USE_SPAN:
-        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-        key_word = tl.load(
-            attn_lower_bounds_ptr + req_kv_start + pos, mask=slot_mask, other=0
-        )
-        rel_pos = key_word & _SPANS_LB_MASK  # K at p - L back to absolute p
-    else:
-        rel_pos = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-
-    k_base = (
-        src_blk * stride_k_cache_0
-        + kv_head_idx * stride_k_cache_2
-        + offs_s * stride_k_cache_1
-    )
-    # k_scale arg is a never-dereferenced stand-in (host gates out fp8)
-    K_rot = _load_rotate_k(
-        key_cache_ptr,
-        k_base,
-        rel_pos,
-        slot_mask,
-        offs_d,
-        key_cache_ptr,
-        cos_sin_cache_ptr,
-        stride_k_cache_3,
-        stride_cs_cache_0,
-        stride_cs_cache_1,
-        HEAD_SIZE,
-        ROTARY_DIM,
-    )
-
-    dst_offset = (
-        dst_blk * stride_scr_0
-        + kv_head_idx * stride_scr_2
-        + offs_d[:, None] * stride_scr_3
-        + offs_s[None, :] * stride_scr_1
-    )
-    tl.store(
-        scratch_ptr + dst_offset,
-        K_rot.to(scratch_ptr.dtype.element_ty),
-        mask=dim_mask[:, None] & slot_mask[None, :],
-    )
-
-
-def rotate_k_prepass(
-    key_cache: torch.Tensor,
-    k_scratch: torch.Tensor,
-    block_table: torch.Tensor,
-    k_scratch_block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_seq_len: int,
-    cos_sin_cache: torch.Tensor,
-    rotary_dim: int,
-    attn_lower_bounds: torch.Tensor | None,
-    req_kv_starts: torch.Tensor | None,
-) -> None:
-    # per-forward K rotation into the transient scratch
-    num_seqs = seq_lens.shape[0]
-    grid = (
-        num_seqs,
-        triton.cdiv(max_seq_len, key_cache.shape[1]),
-        key_cache.shape[2],
-    )
-    kernel_rotate_k_prepass[grid](
-        key_cache,
-        k_scratch,
-        block_table,
-        k_scratch_block_table,
-        seq_lens,
-        cos_sin_cache,
-        attn_lower_bounds,
-        req_kv_starts,
-        block_table.stride(0),
-        k_scratch_block_table.stride(0),
-        *key_cache.stride(),
-        *k_scratch.stride(),
-        *cos_sin_cache.stride(),
-        BLOCK_SIZE=key_cache.shape[1],
-        HEAD_SIZE=key_cache.shape[3],
-        HEAD_SIZE_PADDED=triton.next_power_of_2(key_cache.shape[3]),
-        ROTARY_DIM=rotary_dim,
-        USE_SPAN=attn_lower_bounds is not None,
-    )
-
-
-@triton.jit
 def kernel_unified_attention(
     # Output destination for the 2D path.  In 3D mode per-segment partials
     # go to the ``segm_*`` tensors (see bottom of signature) and
@@ -527,10 +330,6 @@ def kernel_unified_attention(
     attn_lower_bounds_ptr: torch.Tensor | None = None,  # SPANS: per-KV-pos lb
     req_kv_starts_ptr: torch.Tensor | None = None,  # SPANS: per-req KV start
     USE_SPAN: tl.constexpr = False,  # bool
-    # SPANS prerotate: pre-rotated K scratch table; excludes FUSE_ROPE
-    k_block_tables_ptr=None,
-    k_block_table_stride: tl.int64 = 0,
-    SEPARATE_K_TABLE: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -540,14 +339,6 @@ def kernel_unified_attention(
             BLOCK_SIZE % TILE_SIZE == 0,
             "USE_TD requires BLOCK_SIZE to be a multiple of TILE_SIZE",
         )
-        tl.static_assert(
-            not SEPARATE_K_TABLE,
-            "SPANS prerotate (SEPARATE_K_TABLE) does not support the TD path",
-        )
-    tl.static_assert(
-        not (SEPARATE_K_TABLE and FUSE_ROPE),
-        "SEPARATE_K_TABLE carries pre-rotated K; FUSE_ROPE must be off",
-    )
     tl.static_assert(
         USE_SPAN or not FUSE_ROPE, "FUSE_ROPE needs the span lb words (K at p - L)"
     )
@@ -721,15 +512,6 @@ def kernel_unified_attention(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
 
-            if SEPARATE_K_TABLE:  # SPANS prerotate: K lives in the scratch
-                k_physical_block_idx = tl.load(
-                    k_block_tables_ptr
-                    + seq_idx * k_block_table_stride
-                    + seq_offset // BLOCK_SIZE
-                ).to(tl.int64)
-            else:
-                k_physical_block_idx = physical_block_idx
-
             if USE_TD:
                 # All TILE_SIZE slots within a single KV tile map to one
                 # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
@@ -777,7 +559,7 @@ def kernel_unified_attention(
                     + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
                 )
                 k_offset = (
-                    k_physical_block_idx[None, :] * stride_k_cache_0
+                    physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
                     + offs_d[:, None] * stride_k_cache_3
                     + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
@@ -1158,9 +940,6 @@ def unified_attention(
     rotary_dim=0,
     attn_lower_bounds=None,  # SPANS: flat per-KV-pos lower bound
     req_kv_starts=None,  # SPANS: per-req start into attn_lower_bounds
-    # SPANS prerotate: pre-rotated K scratch + its block table
-    k_scratch=None,
-    k_scratch_block_table=None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1173,15 +952,6 @@ def unified_attention(
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
     fuse_rope = cos_sin_cache is not None
-    separate_k_table = k_scratch is not None
-    if separate_k_table:
-        assert not fuse_rope, "prerotated K scratch excludes fused RoPE"
-        assert k_scratch_block_table is not None
-        assert kv_quant_mode == KVQuantMode.NONE, (
-            "SPANS prerotate supports unquantized KV caches only"
-        )
-    # K is read from the scratch when prerotated; V always from the cache.
-    k_read = k_scratch if separate_k_table else k
     # Compute dtype for in-kernel RoPE + key cast, matching the layer-side RoPE
     # dtype. For fp8 caches keep fp16 (the dequant path lands there).
     if k.dtype == torch.bfloat16:
@@ -1392,7 +1162,7 @@ def unified_attention(
         segm_max_ptr=segm_max_ptr,
         segm_expsum_ptr=segm_expsum_ptr,
         query_ptr=q,
-        key_cache_ptr=k_read,
+        key_cache_ptr=k,
         value_cache_ptr=v,
         sink_ptr=sinks,
         block_tables_ptr=block_table,
@@ -1431,10 +1201,10 @@ def unified_attention(
         USE_MM_PREFIX=use_mm_prefix,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
-        stride_k_cache_0=k_read.stride(0),
-        stride_k_cache_1=k_read.stride(1),
-        stride_k_cache_2=k_read.stride(2),
-        stride_k_cache_3=k_read.stride(3),
+        stride_k_cache_0=k.stride(0),
+        stride_k_cache_1=k.stride(1),
+        stride_k_cache_2=k.stride(2),
+        stride_k_cache_3=k.stride(3),
         stride_v_cache_0=v.stride(0),
         stride_v_cache_1=v.stride(1),
         stride_v_cache_2=v.stride(2),
@@ -1467,11 +1237,6 @@ def unified_attention(
         attn_lower_bounds_ptr=attn_lower_bounds,
         req_kv_starts_ptr=req_kv_starts,
         USE_SPAN=use_span,
-        k_block_tables_ptr=k_scratch_block_table,
-        k_block_table_stride=(
-            k_scratch_block_table.stride(0) if separate_k_table else 0
-        ),
-        SEPARATE_K_TABLE=separate_k_table,
         **launch_kwargs,
     )
 

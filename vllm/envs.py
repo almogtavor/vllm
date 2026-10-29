@@ -268,7 +268,6 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_BLOCK_SIZE: int = 0
     VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
     VLLM_V1_SPANS_GAP_LENGTH: int = 32
-    VLLM_V1_SPANS_PREROTATE: bool = True
     VLLM_V1_SPANS_QCFUSE_ENABLE: bool = False
     VLLM_V1_SPANS_QCFUSE_RHO: float = 0.1
     VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
@@ -1742,10 +1741,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
         os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
     ),
-    # rotate K once per forward into a transient scratch (prefill batches)
-    # instead of per-tile inside the attention kernel
-    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
-    == "True",
     # QCFuse: recompute a query-selected subset of cached tokens on all layers
     "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"

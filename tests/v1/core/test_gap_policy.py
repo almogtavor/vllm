@@ -112,7 +112,6 @@ def test_qcfuse_selects_inside_spans_only(monkeypatch):
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     req = make_span_request(160, span_starts=[64])
     imp = [0.0] * 160
     imp[0] = 100.0  # the sink: exact prefix, never worth recomputing
@@ -127,7 +126,6 @@ def test_qcfuse_unmeasured_store_repairs_span_head(monkeypatch):
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     req = make_span_request(160, span_starts=[64])
     imp = QCFuseImportanceStore(16).lookup([object() for _ in range(10)], 160)
     assert imp == [0.0] * 160
@@ -151,7 +149,6 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])  # (2)-(4): prompt tail
     bs, n_blk, span = 16, 10, [4, 5, 6, 7, 8]
 
@@ -345,7 +342,6 @@ def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", "7,8,9,10")
     D, S = PrefixHitSource.PD, PrefixHitSource.PIC
     blocks = MagicMock()
@@ -418,7 +414,6 @@ def test_spanfuse_pad_rows_do_not_score(monkeypatch):
     from vllm.v1.core.sched.gap_policy import SpanFusePolicy
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
-    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", 27)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
     req = make_span_request(96, span_starts=[16])
@@ -443,7 +438,6 @@ def test_spanfuse_otf_warm_then_probe(monkeypatch):
     from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
-    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
     bs = 16

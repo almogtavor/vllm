@@ -804,9 +804,6 @@ class QCFusePolicy(GapPolicy):
             raise ValueError(f"QCFuse: bad rho={rho} or granularity={granularity}")
         if k_per_span < 0:
             raise ValueError(f"QCFuse: k_per_span must be >= 0, got {k_per_span}")
-        # without prerotate the span head carries a positional error QCFuse ignores
-        if not envs.VLLM_V1_SPANS_PREROTATE:
-            raise ValueError("QCFuse requires VLLM_V1_SPANS_PREROTATE=True")
         self.rho = rho
         self.block_size = block_size
         self.granularity = granularity

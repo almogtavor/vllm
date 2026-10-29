@@ -2633,7 +2633,6 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
             req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
-            spans_prerotate_safe=False,  # Q rotation is per query row: no prepass
             spans_no_raw_k=getattr(self, "_spans_no_raw_k", False),
         )
 
