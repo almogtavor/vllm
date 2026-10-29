@@ -241,9 +241,20 @@ def _schedule_spanfuse_probe(
     the probe never reads the null placeholder, and again with the repair."""
     bs = sched.block_size
     sources = request.prefix_hit_sources or []
+    ranges = QCFusePolicy._span_ranges(request, num_computed_tokens)
+    # a pd hit means this exact prefix already repaired the span: reuse it as cached
+    request.spanfuse_settled = {
+        s
+        for s, e in ranges
+        if any(
+            sources[b] == PrefixHitSource.PD
+            for b in range(s // bs, min(e // bs, len(sources)))
+        )
+    }
     span_blocks = [
         b
-        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+        for s, e in ranges
+        if s not in request.spanfuse_settled
         for b in range(s // bs, e // bs)
     ]
     if not any(
@@ -367,7 +378,7 @@ def _schedule_spanfuse_span_probes(
     stripped = request.spanfuse_query_stripped
     probes = []
     for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens):
-        if not any(
+        if s in request.spanfuse_settled or not any(
             sources[b] == PrefixHitSource.PIC
             for b in range(s // bs, min(e // bs, len(sources)))
         ):
@@ -835,8 +846,14 @@ class SpanFusePolicy(QCFusePolicy):
     def _select(
         self, request: "Request", importance: list[float], n: int
     ) -> list[tuple[int, int]]:
+        settled = request.spanfuse_settled
         if self.granularity == "token":
-            return super()._select(request, importance, n)
+            gaps = super()._select(request, importance, n)
+            return [
+                g
+                for g in gaps
+                if not any(s <= g[0] < e for s, e in self._span_ranges(request, n) if s in settled)
+            ]
         bs, gaps = self.block_size, []
         toks, pad = request.prompt_token_ids, envs.VLLM_V1_SPANS_PAD_TOKEN
 
@@ -847,7 +864,7 @@ class SpanFusePolicy(QCFusePolicy):
 
         for start, end in self._span_ranges(request, n):
             budget = self.k_per_span or int(self.rho * (end - start))
-            if budget <= 0:
+            if budget <= 0 or start in settled:
                 continue
             k = max(1, budget // bs)
             blocks = list(range(start // bs, min(end // bs, len(importance) // bs)))

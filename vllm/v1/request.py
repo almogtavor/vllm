@@ -122,6 +122,8 @@ class Request:
         self.spanfuse_state: str | None = None
         # SPANFUSE: MISS ranges the probe filled blind; recomputed again with the repair
         self.spanfuse_miss_gaps: list[tuple[int, int]] = []
+        # SPANFUSE: span starts already repaired under this exact prefix (pd hit)
+        self.spanfuse_settled: set[int] = set()
 
         if pooling_params is not None:
             # Pooling models.

@@ -336,13 +336,13 @@ def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
     blocks = MagicMock()
     blocks.get_block_ids.return_value = (list(range(13)),)
 
-    def run(starts, rows=8, bad=False, stripped=False):
+    def run(starts, rows=8, bad=False, stripped=False, settled=False):
         req = make_span_request(176, span_starts=[32, 96])
         req.spanfuse_query_stripped = stripped
         req.prompt_token_ids[64:68] = [7, 8, 9, 10]
         req.prompt_token_ids[128:132] = [7, 8, 9, 99] if bad else [7, 8, 9, 10]
         req.spanfuse_query_starts = starts
-        req.prefix_hit_sources = [D] * 2 + [S] * 8
+        req.prefix_hit_sources = [D] * (3 if settled else 2) + [S] * (7 if settled else 8)
         req.status = None
         sched = SimpleNamespace(
             gap_policy=SpanFusePolicy(k_per_span=32),
@@ -386,6 +386,12 @@ def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
     assert [p.prompt_token_ids[-4:] for p in out] == [[7, 8, 9, 10]] * 2
     assert [p.spanfuse_probe_lb for p in out] == [32, 96]
     assert all(p.spanfuse_window == 0 for p in out)
+    # span 0 hit its pd repair from an earlier turn: reused as cached, never re-probed
+    req, out, _ = run([64, 128], settled=True)
+    assert req.spanfuse_settled == {32}
+    assert [p.spanfuse_span_blocks for p in out] == [[6, 7]]
+    gaps = SpanFusePolicy(k_per_span=32)._select(req, [1.0] * 160, 160)
+    assert gaps and all(s >= 96 for s, _ in gaps)
     # no mw starts: the single tail probe
     monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
     _, out, _ = run(None)
@@ -399,6 +405,7 @@ def test_spanfuse_pad_rows_do_not_score(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", 27)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
     req = make_span_request(96, span_starts=[16])
     req.prompt_token_ids[64:80] = [27] * 16
     imp = [0.0] * 96
