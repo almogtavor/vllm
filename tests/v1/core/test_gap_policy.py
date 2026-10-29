@@ -430,3 +430,81 @@ def test_spanfuse_pad_rows_do_not_score(monkeypatch):
     assert pol._select(req, imp, 96) == [(16, 32), (32, 48)]
     monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", -1)
     assert pol._select(req, imp, 96) == [(16, 32), (64, 80)]
+
+
+def test_spanfuse_otf_warm_then_probe(monkeypatch):
+    """A cold tail span is encoded span-locally and cached under its plain key,
+    then the re-lookup sees it as a PIC hit and the probe repairs it."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.v1.attention import qcfuse
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
+    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    bs = 16
+    req = make_span_request(176, span_starts=[64], cross_span_starts=[128])
+    req.status = None
+    req.block_hashes = [f"h{i}" for i in range(11)]
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([0] * 11,)
+    pool = MagicMock()
+    sched = SimpleNamespace(
+        gap_policy=SpanFusePolicy(k_per_span=32),
+        block_size=bs,
+        max_num_scheduled_tokens=8192,
+        max_model_len=4096,
+        vllm_config=SimpleNamespace(model_config=None),
+        connector=None,
+        _merge_gaps=Scheduler._merge_gaps,
+        kv_cache_manager=SimpleNamespace(
+            allocate_slots=MagicMock(return_value=blocks),
+            get_blocks=MagicMock(return_value=blocks),
+            block_pool=pool,
+            coordinator=SimpleNamespace(
+                single_type_managers=[
+                    SimpleNamespace(req_to_blocks={"gap_test": [f"b{i}" for i in range(11)]})
+                ]
+            ),
+        ),
+    )
+    queue = create_request_queue(SchedulingPolicy.FCFS)
+    skipped = create_request_queue(SchedulingPolicy.FCFS)
+    out: list = []
+    nsched: dict[str, int] = {}
+    call = lambda n: schedule_span_gaps(
+        sched, req, True, n, 0, n, MagicMock(), 8192, nsched, out, set(), queue, skipped
+    )
+
+    # only the head is cached: the span is warmed span-locally, never probed
+    queue.add_request(req)
+    assert call(64) == 8192 - 64
+    assert [(r.req_id, r.is_gap_recompute) for r in out] == [("gap_test.64", False)]
+    assert nsched == {"gap_test.64": 64} and req.spanfuse_state == "otf"
+    pool.cache_blocks_under_hashes.assert_called_once_with(
+        ["b4", "b5", "b6", "b7"], ["h4", "h5", "h6", "h7"], 0
+    )
+
+    # the re-lookup returns the warmed span as PIC: the probe runs, then repair
+    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
+    req.spanfuse_state, req.prefix_hit_sources = None, [D] * 4 + [S] * 4
+    queue.add_request(req)
+    out.clear()
+    nsched.clear()
+    call(128)
+    assert [r.req_id for r in out] == ["gap_test.probe"]
+    assert out[0].spanfuse_span_blocks == [4, 5, 6, 7]
+    imp = [0.0] * 128
+    imp[100] = 1.0
+    req.qcfuse_importance, req.spanfuse_state = imp, "measured"
+    queue.add_request(req)
+    out.clear()
+    nsched.clear()
+    call(128)
+    assert req.spanfuse_state == "done"
+    got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
+    assert (64, 80) in got and (96, 112) in got and pool.cache_blocks_under_hashes.call_count == 1

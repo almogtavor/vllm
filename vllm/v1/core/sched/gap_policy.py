@@ -123,6 +123,23 @@ def schedule_span_gaps(
             request_queue.pop_request()
             step_skipped_waiting.prepend_request(request)
             return token_budget
+        if state is None and did_prefix_lookup and not request.spanfuse_otf_warmed:
+            warmed = _schedule_spanfuse_otf_warm(
+                sched,
+                request,
+                num_computed_tokens,
+                num_external_computed_tokens,
+                num_new_local_computed_tokens,
+                new_computed_blocks,
+                token_budget,
+                num_scheduled_tokens,
+                virtual_reqs_out,
+                virtual_gap_req_ids,
+                request_queue,
+                step_skipped_waiting,
+            )
+            if warmed is not NO_SPAN_GAPS:
+                return warmed
         if state is None and did_prefix_lookup:
             probed = _schedule_spanfuse_probe(
                 sched,
@@ -220,6 +237,83 @@ def schedule_span_gaps(
     request_queue.pop_request()
     step_skipped_waiting.prepend_request(request)
     return token_budget - gap_overhead
+
+
+def _schedule_spanfuse_otf_warm(
+    sched: "Scheduler",
+    request: "Request",
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """Encode the cold spans of the uncached tail span-locally and cache them
+    under their plain keys, then look the prefix up again ("otf" state), so the
+    probe and repair see them as warmed hits exactly as a separate warm-up would."""
+    request.spanfuse_otf_warmed = True
+    bs = sched.block_size
+    spans = [
+        (s, e // bs * bs)
+        for s, e in QCFusePolicy._span_ranges(request, request.num_tokens)
+        if s >= num_computed_tokens and s % bs == 0 and e // bs * bs > s
+    ]
+    if not spans or num_external_computed_tokens:
+        return NO_SPAN_GAPS
+    work = sum(e - s for s, e in spans)
+    if work > sched.max_num_scheduled_tokens:
+        logger.warning(
+            "SpanFuse: on-the-fly warm-up of %d tokens too large for %s",
+            work,
+            request.request_id,
+        )
+        return NO_SPAN_GAPS
+    if work > token_budget:
+        request.spanfuse_otf_warmed = False
+        return None
+    # nothing is cached here but the span blocks: the crosses would read blind spans
+    blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        spans[-1][1] - num_computed_tokens,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        delay_cache_blocks=True,
+    )
+    if blocks is None:
+        request.spanfuse_otf_warmed = False
+        return None
+    manager = sched.kv_cache_manager.coordinator.single_type_managers[0]
+    req_blocks = manager.req_to_blocks[request.request_id]
+    idx = [b for s, e in spans for b in range(s // bs, e // bs)]
+    sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
+        [req_blocks[b] for b in idx], [request.block_hashes[b] for b in idx], 0
+    )
+    logger.info(
+        "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s",
+        len(spans),
+        work,
+        request.request_id,
+    )
+    request.num_computed_tokens = num_computed_tokens
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+    )
+    n0 = len(virtual_reqs_out)
+    append_virtual_gap_reqs(
+        parent_nrd, spans, virtual_reqs_out, virtual_gap_req_ids, num_scheduled_tokens
+    )
+    for nrd in virtual_reqs_out[n0:]:
+        nrd.is_gap_recompute = False  # span-local, as the plain key promises
+    # the scheduler frees the blocks and runs a fresh lookup on the next step
+    request.spanfuse_state = "otf"
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - work
 
 
 def _schedule_spanfuse_probe(

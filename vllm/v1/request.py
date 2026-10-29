@@ -124,6 +124,8 @@ class Request:
         self.spanfuse_miss_gaps: list[tuple[int, int]] = []
         # SPANFUSE: span starts already repaired under this exact prefix (pd hit)
         self.spanfuse_settled: set[int] = set()
+        # SPANFUSE: the cold tail spans were encoded on the fly, once per request
+        self.spanfuse_otf_warmed = False
 
         if pooling_params is not None:
             # Pooling models.

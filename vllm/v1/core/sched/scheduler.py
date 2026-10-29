@@ -685,6 +685,12 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 num_uncached_common_prefix_tokens = 0
 
+                if request.spanfuse_state == "otf":
+                    # SPANFUSE: the cold spans are cached now, so look the prefix up again
+                    self.kv_cache_manager.free(request)
+                    request.num_computed_tokens = 0
+                    request.spanfuse_state = None
+                    request.span_gaps_selection = None
                 # Get already-cached tokens.
                 did_prefix_lookup = request.num_computed_tokens == 0
                 if did_prefix_lookup:
