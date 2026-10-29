@@ -251,6 +251,25 @@ def _schedule_spanfuse_probe(
             for b in range(s // bs, min(e // bs, len(sources)))
         )
     }
+    # the probe scores warmed spans only: a span with a MISS block is recomputed whole
+    cold = [
+        (s, e)
+        for s, e in ranges
+        if s not in request.spanfuse_settled
+        and any(
+            sources[b] == PrefixHitSource.MISS
+            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+        )
+    ]
+    if cold:
+        logger.info(
+            "SpanFuse: %d of %d spans unwarmed in %s, recomputed in context",
+            len(cold),
+            len(ranges),
+            request.request_id,
+        )
+    request.spanfuse_settled |= {s for s, _ in cold}
+    request.spanfuse_miss_gaps = cold
     span_blocks = [
         b
         for s, e in ranges
@@ -291,7 +310,7 @@ def _schedule_spanfuse_probe(
     w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
     w = num_computed_tokens if suffix else min(num_computed_tokens, w)
     window = num_computed_tokens - w
-    miss = sched._merge_gaps(miss_gaps(request, bs))
+    miss = sched._merge_gaps(miss_gaps(request, bs) + request.spanfuse_miss_gaps)
     work = tail + window + len(suffix) + sum(e - s for s, e in miss)
     if work > sched.max_num_scheduled_tokens:
         # ponytail: oversized probe falls back to span-head repair; chunk if it fires
@@ -403,7 +422,7 @@ def _schedule_spanfuse_span_probes(
         probes.append((qs, list(range(s // bs, qs // bs)), s))
     if not probes:
         return NO_SPAN_GAPS
-    miss = sched._merge_gaps(miss_gaps(request, bs))
+    miss = sched._merge_gaps(miss_gaps(request, bs) + request.spanfuse_miss_gaps)
     # every probe is a batch row; the input batch holds max_num_running_reqs
     free = (
         sched.max_num_running_reqs

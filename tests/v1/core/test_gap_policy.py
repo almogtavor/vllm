@@ -283,8 +283,9 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
     assert (64, 80) in got and (112, 128) in got
 
-    # (3) adjacent MISS blocks ride the probe as ONE virtual request, not one per block
-    req.prefix_hit_sources = [D] * 4 + [PrefixHitSource.MISS] * 3 + [S] * 3
+    # (3) a span with MISS blocks was never warmed: recomputed whole, never probed
+    M = PrefixHitSource.MISS
+    req.prefix_hit_sources = [D] * 4 + [M] * 3 + [S] * 3
     req.spanfuse_state = req.span_gaps_selection = None
     req.pending_span_gaps = []
     queue.add_request(req)
@@ -292,17 +293,31 @@ def test_spanfuse_span_only_scoring_and_query_probe(monkeypatch):
     ids.clear()
     nsched.clear()
     call()
-    assert [r.req_id for r in out] == ["gap_test.64", "gap_test.probe"]
-    assert nsched == {"gap_test.64": 48, "gap_test.probe": 64}
-    # (4) the MISS blocks read the blind spans: the repair step recomputes them
+    assert req.spanfuse_state == "done" and req.spanfuse_settled == {64}
+    assert [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out] == [(64, 160)]
+
+    # (4) MISS blocks outside a warmed span ride the probe as ONE virtual
+    # request, and the repair step recomputes them again
+    req0, req = req, make_span_request(176, span_starts=[80])
+    req.prefix_hit_sources = [D] + [M] * 3 + [D] + [S] * 5
+    req.status = None
+    queue.add_request(req)
+    out.clear()
+    ids.clear()
+    nsched.clear()
+    call()
+    assert [r.req_id for r in out] == ["gap_test.16", "gap_test.probe"]
+    assert nsched == {"gap_test.16": 48, "gap_test.probe": 64}
     req.qcfuse_importance, req.spanfuse_state = imp, "measured"
     queue.add_request(req)
     out.clear()
     ids.clear()
     nsched.clear()
     call()
-    assert [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out] == [(64, 128)]
+    got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
+    assert (16, 64) in got and (80, 96) in got
     assert req.spanfuse_miss_gaps == []
+    req = req0
 
     # (5) an appended instruction replaces the cached window as the query rows
     monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [7] * 12)
