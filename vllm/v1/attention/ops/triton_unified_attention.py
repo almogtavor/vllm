@@ -1379,6 +1379,8 @@ def unified_attention(
     if fuse_rope and use_span and launch_num_stages is None:
         launch_num_stages = 2  # SPANS: 3 stages spill the per-run Q rotation
     launch_kwargs: dict[str, int] = {}
+    if fuse_rope and use_span and head_size <= 128:
+        launch_kwargs["maxnreg"] = 128  # SPANS: R(q_off - L) Q lifts B to 146 regs, 3 CTAs/SM instead of 4
     if launch_num_warps is not None:
         launch_kwargs["num_warps"] = launch_num_warps
     if launch_num_stages is not None:
