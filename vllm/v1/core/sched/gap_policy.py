@@ -265,6 +265,71 @@ def _schedule_spanfuse_otf_warm(
     ]
     if not spans or num_external_computed_tokens:
         return NO_SPAN_GAPS
+    sources = request.prefix_hit_sources or []
+    end = spans[-1][1]
+    k = sched.gap_policy.k_per_span
+    # whole span: encode every cold span in context now and cache it under the pd key
+    if (
+        k
+        and all(e - s <= k for s, e in spans)
+        and request.pd_block_hashes is not None
+        and len(sources) >= num_computed_tokens // bs
+        and PrefixHitSource.MISS not in sources
+        and all(
+            sources[b] == PrefixHitSource.PD
+            for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+        )
+        and len(request.pd_block_hashes) >= end // bs
+        and end - num_computed_tokens <= sched.max_num_scheduled_tokens
+    ):
+        work = end - num_computed_tokens
+        if work > token_budget:
+            request.spanfuse_otf_warmed = False
+            return None
+        blocks = sched.kv_cache_manager.allocate_slots(
+            request,
+            work,
+            num_new_computed_tokens=num_new_local_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            delay_cache_blocks=True,
+        )
+        if blocks is None:
+            request.spanfuse_otf_warmed = False
+            return None
+        manager = sched.kv_cache_manager.coordinator.single_type_managers[0]
+        req_blocks = manager.req_to_blocks[request.request_id]
+        first = min(request.span_starts)
+        idx = range(num_computed_tokens // bs, end // bs)
+        sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
+            [req_blocks[b] for b in idx],
+            [
+                request.pd_block_hashes[b] if b * bs >= first else request.block_hashes[b]
+                for b in idx
+            ],
+            0,
+        )
+        logger.info(
+            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s",
+            len(spans),
+            work,
+            request.request_id,
+        )
+        request.num_computed_tokens = num_computed_tokens
+        parent_nrd = NewRequestData.from_request(
+            request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+        )
+        append_virtual_gap_reqs(
+            parent_nrd,
+            [(num_computed_tokens, end)],
+            virtual_reqs_out,
+            virtual_gap_req_ids,
+            num_scheduled_tokens,
+        )
+        request.spanfuse_state = "otf"
+        request_queue.pop_request()
+        step_skipped_waiting.prepend_request(request)
+        return token_budget - work
     work = sum(e - s for s, e in spans)
     if work > sched.max_num_scheduled_tokens:
         logger.warning(
@@ -373,6 +438,11 @@ def _schedule_spanfuse_probe(
     if not any(
         b < len(sources) and sources[b] == PrefixHitSource.PIC for b in span_blocks
     ):
+        return NO_SPAN_GAPS
+    k = sched.gap_policy.k_per_span
+    if k and all(e - s <= k for s, e in ranges if s not in request.spanfuse_settled):
+        # whole span: importance cannot change the selection, so skip the scoring pass
+        request.qcfuse_importance = [0.0] * num_computed_tokens
         return NO_SPAN_GAPS
     qids = [
         int(x)
