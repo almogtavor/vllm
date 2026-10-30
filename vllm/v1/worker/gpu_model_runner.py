@@ -4405,6 +4405,44 @@ class GPUModelRunner(
 
             traceback.print_exc()
 
+    def _spanshift_dump(self, pairs: list[tuple]) -> None:
+        """SPANSHIFT: save each swapped block's blind and repaired K/V, per layer."""
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        ctx = self.compilation_config.static_forward_context
+        layers = {}
+        for name, layer in ctx.items():
+            kv = getattr(layer, "kv_cache", None)
+            if not isinstance(kv, list) or not kv or kv[0].dim() != 5:
+                continue
+            layers[name] = (kv[0], getattr(layer, "spans_cos_sin_cache", None),
+                            getattr(layer, "spans_rotary_dim", 0))
+        for rid, starts, idx, old, new, src, toks in pairs:
+            o = torch.tensor(old, device=self.device)
+            n = torch.tensor(new, device=self.device)
+            bs = self.cache_config.block_size
+            out = {"req": rid, "span_starts": starts, "block_idx": idx, "src": src,
+                   "tokens": toks,
+                   "block_size": bs, "layers": {}, "rope": {}}
+            npos = (max(idx) + 1) * bs  # span-local positions are below this
+            for name, (kv, csc, rdim) in layers.items():
+                # blocks-first (n_blocks, 2, bs, heads, d) or K/V-first
+                bf = kv.shape[1] == 2
+                blind = kv[o] if bf else kv[:, o].transpose(0, 1)
+                fresh = kv[n] if bf else kv[:, n].transpose(0, 1)
+                key = None if csc is None else csc.data_ptr()
+                if key is not None and key not in out["rope"]:
+                    out["rope"][key] = csc[:npos].cpu()
+                out["layers"][name] = {"blind": blind.cpu(), "fresh": fresh.cpu(),
+                                       "rotary_dim": rdim, "rope": key}
+            os.makedirs(envs.VLLM_V1_SPANS_SHIFT_DUMP, exist_ok=True)
+            torch.save(out, os.path.join(envs.VLLM_V1_SPANS_SHIFT_DUMP,
+                                         f"{rid}_{idx[0]}.pt"))
+            logger.info("SpanShift dump %s: %d blocks, %d layers", rid, len(idx),
+                        len(layers))
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4987,6 +5025,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if scheduler_output.spanshift_pairs and envs.VLLM_V1_SPANS_SHIFT_DUMP:
+            self._spanshift_dump(scheduler_output.spanshift_pairs)
 
         # === DEBUG: KV Cache Hash ===
         if self._should_debug_kv_hash():

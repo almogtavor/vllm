@@ -413,6 +413,11 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
+        # SPANSHIFT: the last step's blind copies have been read by now
+        kvm = self.kv_cache_manager
+        if kvm.spanshift_held:
+            kvm.block_pool.free_blocks(kvm.spanshift_held)
+            kvm.spanshift_held = []
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1133,7 +1138,9 @@ class Scheduler(SchedulerInterface):
             virtual_gap_req_ids=virtual_gap_req_ids if virtual_gap_req_ids else None,
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            spanshift_pairs=kvm.spanshift_pairs or None,
         )
+        kvm.spanshift_pairs = []
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
