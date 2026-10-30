@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import bisect
 import collections
 import functools
 import gc
@@ -484,6 +485,40 @@ def _spill_source(req, req_len: int) -> str:
     return "other"
 
 
+def _span_lb_geom(req) -> tuple | None:
+    """SPANS: (sorted starts, unclipped ends, gap flag, first raw-K start) or None."""
+    sp = req.sampling_params
+    ea = sp.extra_args if sp is not None else None
+    spans = ea.get("span_starts") if ea else None
+    if not spans:
+        return None
+    starts = sorted(spans)
+    crosses = sorted(ea.get("cross_span_starts") or [])
+    inf = 1 << 62
+    ends = []
+    for j, s in enumerate(starts):
+        k = bisect.bisect_right(crosses, s)
+        nxt = starts[j + 1] if j + 1 < len(starts) else inf
+        ends.append(min(nxt, crosses[k] if k < len(crosses) else inf))
+    raw = next((s for s, e in zip(starts, ends) if 0 < s < e), inf)
+    return starts, ends, SPANS_FULLQ if req.is_gap_recompute else 0, raw
+
+
+def _paint_span_lb(geom, a: int, b: int, out: np.ndarray, off: int) -> bool:
+    """SPANS: paint lb of [a, b) into out at off; False (untouched) if all zero."""
+    starts, ends, full, _ = geom
+    j, wrote = max(bisect.bisect_right(starts, a) - 1, 0), False
+    while j < len(starts) and starts[j] < b:
+        lo, hi = max(starts[j], a), min(ends[j], b)
+        if hi > lo and starts[j] | full:
+            if not wrote:
+                out[off + a : off + b] = 0
+                wrote = True
+            out[off + lo : off + hi] = starts[j] | full
+        j += 1
+    return wrote
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -851,6 +886,10 @@ class GPUModelRunner(
                 )
                 # per-slot live length, to clear stale tails on slot reuse
                 self._spans_lb_len = [0] * self.max_num_reqs
+                # per row: owner, lb geometry, and whether it holds nonzero words
+                self._spans_lb_owner: list = [None] * self.max_num_reqs
+                self._spans_lb_geom: list = [None] * self.max_num_reqs
+                self._spans_lb_dirty = [False] * self.max_num_reqs
         # QCFUSE: importance probe, allocated only under the knob
         self.qcfuse_capturer = None
         self._qcfuse_descs: list[tuple] = []
@@ -2074,6 +2113,60 @@ class GPUModelRunner(
         if st["spill_steps"] % 100 == 1:
             logger.warning("SPANS_LB_SPILL totals %s", dict(st))
 
+    def _spans_lb_fast(self, num_reqs: int, num_scheduled_tokens: np.ndarray) -> bool:
+        """SPANS: copy only lb positions new to a row; False if packed lb is needed."""
+        stride = self._spans_lb_stride
+        if (
+            not stride
+            or envs.VLLM_V1_SPANS_LB_SPILL_LOG
+            or envs.VLLM_V1_SPANS_LB_NOCLIP
+            or (
+                self.qcfuse_capturer is not None
+                and not envs.VLLM_V1_SPANS_SPANFUSE_ENABLE
+            )
+        ):
+            return False
+        ids = self.input_batch.req_ids
+        reqs = [self.requests[ids[i]] for i in range(num_reqs)]
+        if any(r.is_spanfuse_probe for r in reqs):
+            return False
+        seq_lens = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        ).tolist()
+        lb_gpu, staging = self._attn_lower_bounds_gpu, self._spans_lb_staging
+        stg = staging.numpy()
+        owner, geom = self._spans_lb_owner, self._spans_lb_geom
+        lens, dirty = self._spans_lb_len, self._spans_lb_dirty
+        raw_k = False
+        for i, req in enumerate(reqs):
+            n, base, prev = min(seq_lens[i], stride), i * stride, lens[i]
+            fresh = owner[i] is not req
+            if fresh:
+                owner[i], geom[i] = req, _span_lb_geom(req)
+            g = geom[i]
+            lens[i] = n
+            if g is None:  # span-free: the row must read all zero
+                if fresh and dirty[i] and prev:
+                    lb_gpu[base : base + prev].zero_()
+                dirty[i] = False
+                continue
+            raw_k = raw_k or g[3] < seq_lens[i]
+            if prev > n:
+                lb_gpu[base + n : base + prev].zero_()
+            a, wrote = 0 if fresh else prev, False
+            if n > a:
+                wrote = _paint_span_lb(g, a, n, stg, base)
+                if wrote:
+                    lb_gpu[base + a : base + n].copy_(
+                        staging[base + a : base + n], non_blocking=True
+                    )
+                elif fresh and dirty[i]:
+                    lb_gpu[base : base + n].zero_()
+            dirty[i] = wrote or (dirty[i] and not fresh)
+        self._spans_no_raw_k = not raw_k
+        self._attn_lb_np = None
+        return True
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2111,7 +2204,9 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
-        if envs.VLLM_V1_SPANS_ENABLED:
+        if envs.VLLM_V1_SPANS_ENABLED and not self._spans_lb_fast(
+            num_reqs, num_scheduled_tokens
+        ):
             num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
             seq_lens_arr = num_computed + num_scheduled_tokens
             req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
@@ -2190,6 +2285,9 @@ class GPUModelRunner(
                 lb_gpu[base : base + n].copy_(
                     staging[base : base + n], non_blocking=True
                 )
+            if stride:  # the fast path must rewrite every row it meets next
+                self._spans_lb_owner = [None] * self.max_num_reqs
+                self._spans_lb_dirty = [True] * self.max_num_reqs
 
         # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
         if self.qcfuse_capturer is not None:
