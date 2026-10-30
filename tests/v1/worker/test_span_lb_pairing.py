@@ -54,3 +54,17 @@ def test_request_pic_token_ranges_pairing():
     # The range rule mirrors compute_span_lb_regions with None for "open":
     regions = compute_span_lb_regions([B, 3 * B], [5 * B], 10 * B)
     assert regions[0][1] == 3 * B and regions[1][1] == 5 * B
+
+
+def test_regions_clipped_to_req_len():
+    # non-final prefill chunk / probe / virtual request: req_len < prompt.
+    # Nothing may reach past req_len, or it lands in the next request's slice.
+    regions = compute_span_lb_regions([B, 4 * B, 8 * B], [6 * B, 10 * B], 5 * B)
+    assert regions == [(B, 4 * B, B), (4 * B, 5 * B, 4 * B)]
+    assert compute_span_lb_regions([8 * B], [10 * B], 5 * B) == []
+
+
+def test_noclip_keeps_the_old_overflow():
+    # VLLM_V1_SPANS_LB_NOCLIP knock-in: same regions as before the clip
+    regions = compute_span_lb_regions([B, 4 * B, 8 * B], [6 * B, 10 * B], 5 * B, False)
+    assert regions == [(B, 4 * B, B), (4 * B, 6 * B, 4 * B), (8 * B, 5 * B, 8 * B)]

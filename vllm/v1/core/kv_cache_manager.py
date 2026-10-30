@@ -492,17 +492,20 @@ class KVCacheManager:
             fresh = manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
                 request.request_id, swap_indices
             )
-            bs = self.coordinator.block_size  # type: ignore[attr-defined]
-            assert request.span_starts and request.pd_block_hashes is not None
-            first = min(request.span_starts)
-            # the key the dual lookup tries first: pd from the first span start on
-            hashes = [
-                request.pd_block_hashes[i]
-                if i * bs >= first
-                else request.block_hashes[i]
-                for i in swap_indices
-            ]
-            self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
+            # SPANFUSE: a probe's MISS copies are rewritten in place at repair, so
+            # they stay private to this request
+            if not delay_cache_blocks:
+                bs = self.coordinator.block_size  # type: ignore[attr-defined]
+                assert request.span_starts and request.pd_block_hashes is not None
+                first = min(request.span_starts)
+                # the key the dual lookup tries first: pd from the first span start on
+                hashes = [
+                    request.pd_block_hashes[i]
+                    if i * bs >= first
+                    else request.block_hashes[i]
+                    for i in swap_indices
+                ]
+                self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
 
         return self.create_kv_cache_blocks(new_blocks)
 

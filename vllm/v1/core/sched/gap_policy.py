@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS, spanfuse_query_ids
 from vllm.v1.core.kv_cache_utils import PrefixHitSource
 from vllm.v1.core.sched.output import NewRequestData
@@ -122,6 +123,23 @@ def schedule_span_gaps(
             request_queue.pop_request()
             step_skipped_waiting.prepend_request(request)
             return token_budget
+        if state is None and did_prefix_lookup and not request.spanfuse_otf_warmed:
+            warmed = _schedule_spanfuse_otf_warm(
+                sched,
+                request,
+                num_computed_tokens,
+                num_external_computed_tokens,
+                num_new_local_computed_tokens,
+                new_computed_blocks,
+                token_budget,
+                num_scheduled_tokens,
+                virtual_reqs_out,
+                virtual_gap_req_ids,
+                request_queue,
+                step_skipped_waiting,
+            )
+            if warmed is not NO_SPAN_GAPS:
+                return warmed
         if state is None and did_prefix_lookup:
             probed = _schedule_spanfuse_probe(
                 sched,
@@ -221,6 +239,148 @@ def schedule_span_gaps(
     return token_budget - gap_overhead
 
 
+def _schedule_spanfuse_otf_warm(
+    sched: "Scheduler",
+    request: "Request",
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """Encode the cold spans of the uncached tail span-locally and cache them
+    under their plain keys, then look the prefix up again ("otf" state), so the
+    probe and repair see them as warmed hits exactly as a separate warm-up would."""
+    request.spanfuse_otf_warmed = True
+    bs = sched.block_size
+    spans = [
+        (s, e // bs * bs)
+        for s, e in QCFusePolicy._span_ranges(request, request.num_tokens)
+        if s >= num_computed_tokens and s % bs == 0 and e // bs * bs > s
+    ]
+    if not spans or num_external_computed_tokens:
+        return NO_SPAN_GAPS
+    sources = request.prefix_hit_sources or []
+    end = spans[-1][1]
+    k = sched.gap_policy.k_per_span
+    # whole span: encode every cold span in context now and cache it under the pd key
+    if (
+        k
+        and all(e - s <= k for s, e in spans)
+        and request.pd_block_hashes is not None
+        and len(sources) >= num_computed_tokens // bs
+        and PrefixHitSource.MISS not in sources
+        and all(
+            sources[b] == PrefixHitSource.PD
+            for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+        )
+        and len(request.pd_block_hashes) >= end // bs
+        and end - num_computed_tokens <= sched.max_num_scheduled_tokens
+    ):
+        work = end - num_computed_tokens
+        if work > token_budget:
+            request.spanfuse_otf_warmed = False
+            return None
+        blocks = sched.kv_cache_manager.allocate_slots(
+            request,
+            work,
+            num_new_computed_tokens=num_new_local_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            delay_cache_blocks=True,
+        )
+        if blocks is None:
+            request.spanfuse_otf_warmed = False
+            return None
+        manager = sched.kv_cache_manager.coordinator.single_type_managers[0]
+        req_blocks = manager.req_to_blocks[request.request_id]
+        first = min(request.span_starts)
+        idx = range(num_computed_tokens // bs, end // bs)
+        sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
+            [req_blocks[b] for b in idx],
+            [
+                request.pd_block_hashes[b] if b * bs >= first else request.block_hashes[b]
+                for b in idx
+            ],
+            0,
+        )
+        logger.info(
+            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s",
+            len(spans),
+            work,
+            request.request_id,
+        )
+        request.num_computed_tokens = num_computed_tokens
+        parent_nrd = NewRequestData.from_request(
+            request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+        )
+        append_virtual_gap_reqs(
+            parent_nrd,
+            [(num_computed_tokens, end)],
+            virtual_reqs_out,
+            virtual_gap_req_ids,
+            num_scheduled_tokens,
+        )
+        request.spanfuse_state = "otf"
+        request_queue.pop_request()
+        step_skipped_waiting.prepend_request(request)
+        return token_budget - work
+    work = sum(e - s for s, e in spans)
+    if work > sched.max_num_scheduled_tokens:
+        logger.warning(
+            "SpanFuse: on-the-fly warm-up of %d tokens too large for %s",
+            work,
+            request.request_id,
+        )
+        return NO_SPAN_GAPS
+    if work > token_budget:
+        request.spanfuse_otf_warmed = False
+        return None
+    # nothing is cached here but the span blocks: the crosses would read blind spans
+    blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        spans[-1][1] - num_computed_tokens,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        delay_cache_blocks=True,
+    )
+    if blocks is None:
+        request.spanfuse_otf_warmed = False
+        return None
+    manager = sched.kv_cache_manager.coordinator.single_type_managers[0]
+    req_blocks = manager.req_to_blocks[request.request_id]
+    idx = [b for s, e in spans for b in range(s // bs, e // bs)]
+    sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
+        [req_blocks[b] for b in idx], [request.block_hashes[b] for b in idx], 0
+    )
+    logger.info(
+        "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s",
+        len(spans),
+        work,
+        request.request_id,
+    )
+    request.num_computed_tokens = num_computed_tokens
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+    )
+    n0 = len(virtual_reqs_out)
+    append_virtual_gap_reqs(
+        parent_nrd, spans, virtual_reqs_out, virtual_gap_req_ids, num_scheduled_tokens
+    )
+    for nrd in virtual_reqs_out[n0:]:
+        nrd.is_gap_recompute = False  # span-local, as the plain key promises
+    # the scheduler frees the blocks and runs a fresh lookup on the next step
+    request.spanfuse_state = "otf"
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - work
+
+
 def _schedule_spanfuse_probe(
     sched: "Scheduler",
     request: "Request",
@@ -240,15 +400,71 @@ def _schedule_spanfuse_probe(
     the probe never reads the null placeholder, and again with the repair."""
     bs = sched.block_size
     sources = request.prefix_hit_sources or []
+    ranges = QCFusePolicy._span_ranges(request, num_computed_tokens)
+    # a pd hit means this exact prefix already repaired the span: reuse it as cached
+    request.spanfuse_settled = {
+        s
+        for s, e in ranges
+        if any(
+            sources[b] == PrefixHitSource.PD
+            for b in range(s // bs, min(e // bs, len(sources)))
+        )
+    }
+    # the probe scores warmed spans only: a span with a MISS block is recomputed whole
+    cold = [
+        (s, e)
+        for s, e in ranges
+        if s not in request.spanfuse_settled
+        and any(
+            sources[b] == PrefixHitSource.MISS
+            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+        )
+    ]
+    if cold:
+        logger.info(
+            "SpanFuse: %d of %d spans unwarmed in %s, recomputed in context",
+            len(cold),
+            len(ranges),
+            request.request_id,
+        )
+    request.spanfuse_settled |= {s for s, _ in cold}
+    request.spanfuse_miss_gaps = cold
     span_blocks = [
         b
-        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+        for s, e in ranges
+        if s not in request.spanfuse_settled
         for b in range(s // bs, e // bs)
     ]
     if not any(
         b < len(sources) and sources[b] == PrefixHitSource.PIC for b in span_blocks
     ):
         return NO_SPAN_GAPS
+    k = sched.gap_policy.k_per_span
+    if k and all(e - s <= k for s, e in ranges if s not in request.spanfuse_settled):
+        # whole span: importance cannot change the selection, so skip the scoring pass
+        request.qcfuse_importance = [0.0] * num_computed_tokens
+        return NO_SPAN_GAPS
+    qids = [
+        int(x)
+        for x in envs.VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS.replace("\\", "").split(",")
+        if x.strip()
+    ]
+    if request.spanfuse_query_starts and qids:
+        return _schedule_spanfuse_span_probes(
+            sched,
+            request,
+            qids,
+            num_computed_tokens,
+            num_external_computed_tokens,
+            num_new_local_computed_tokens,
+            new_computed_blocks,
+            token_budget,
+            num_scheduled_tokens,
+            virtual_reqs_out,
+            virtual_gap_req_ids,
+            request_queue,
+            step_skipped_waiting,
+        )
     tail = request.num_tokens - num_computed_tokens
     # the appended instruction rows are the query, so no cached window is re-run
     suffix = spanfuse_query_ids(sched.vllm_config.model_config)
@@ -258,7 +474,7 @@ def _schedule_spanfuse_probe(
     w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
     w = num_computed_tokens if suffix else min(num_computed_tokens, w)
     window = num_computed_tokens - w
-    miss = sched._merge_gaps(miss_gaps(request, bs))
+    miss = sched._merge_gaps(miss_gaps(request, bs) + request.spanfuse_miss_gaps)
     work = tail + window + len(suffix) + sum(e - s for s, e in miss)
     if work > sched.max_num_scheduled_tokens:
         # ponytail: oversized probe falls back to span-head repair; chunk if it fires
@@ -315,6 +531,140 @@ def _schedule_spanfuse_probe(
     num_scheduled_tokens[probe.req_id] = tail + window + len(suffix)
     virtual_reqs_out.append(probe)
     virtual_gap_req_ids.add(probe.req_id)
+    request.spanfuse_state = "inflight"
+    request_queue.pop_request()
+    step_skipped_waiting.prepend_request(request)
+    return token_budget - work
+
+
+def _schedule_spanfuse_span_probes(
+    sched: "Scheduler",
+    request: "Request",
+    qids: list[int],
+    num_computed_tokens: int,
+    num_external_computed_tokens: int,
+    num_new_local_computed_tokens: int,
+    new_computed_blocks,
+    token_budget: int,
+    num_scheduled_tokens: dict[str, int],
+    virtual_reqs_out: list[NewRequestData],
+    virtual_gap_req_ids: set[str],
+    request_queue,
+    step_skipped_waiting,
+):
+    """One probe row per re-read span: the mw sentence spliced at that span's
+    tail reads the whole prefix and scores only that span's blocks."""
+    bs, nq = sched.block_size, len(qids)
+    sources = request.prefix_hit_sources or []
+    toks = request.prompt_token_ids or []
+    # stripped: the mw sent only the block-aligned start; the sentence lives in scratch
+    stripped = request.spanfuse_query_stripped
+    probes = []
+    for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens):
+        if s in request.spanfuse_settled or not any(
+            sources[b] == PrefixHitSource.PIC
+            for b in range(s // bs, min(e // bs, len(sources)))
+        ):
+            continue
+        qs = next(
+            (
+                q
+                for q in request.spanfuse_query_starts or ()
+                # stripped: the start is the span's block-aligned end
+                if ((s < q <= e and not q % bs) if stripped else s <= q < e)
+                and q + (0 if stripped else nq) <= num_computed_tokens
+            ),
+            None,
+        )
+        if qs is None:
+            continue
+        if not stripped and list(toks[qs : qs + nq]) != qids:
+            logger.warning(
+                "SpanFuse: sentence ids differ at %d in %s", qs, request.request_id
+            )
+            continue
+        probes.append((qs, list(range(s // bs, qs // bs)), s))
+    if not probes:
+        return NO_SPAN_GAPS
+    miss = sched._merge_gaps(miss_gaps(request, bs) + request.spanfuse_miss_gaps)
+    # every probe is a batch row; the input batch holds max_num_running_reqs
+    free = (
+        sched.max_num_running_reqs
+        - len(sched.running)
+        - len(virtual_reqs_out)
+        - len(miss)
+    )
+    if free < 1:
+        return None
+    f, nqb = cdiv(request.num_tokens, bs), cdiv(nq, bs)
+    if stripped:
+        # each probe writes its sentence KV to its own scratch blocks past the prompt
+        free = min(free, (cdiv(sched.max_model_len, bs) - f) // nqb)
+        if free < 1:
+            return NO_SPAN_GAPS
+    probes = probes[-free:]  # ponytail: newest spans win when rows run out
+    work = nq * len(probes) + sum(e - s for s, e in miss)
+    if work > token_budget:
+        return None
+    tail = request.num_tokens - num_computed_tokens
+    scratch = (f + nqb * len(probes)) * bs - request.num_tokens if stripped else 0
+    blocks = sched.kv_cache_manager.allocate_slots(
+        request,
+        tail,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        num_external_computed_tokens=num_external_computed_tokens,
+        num_lookahead_tokens=scratch,
+        delay_cache_blocks=True,
+        span_gaps=miss,
+    )
+    if blocks is None:
+        return None
+    request.prefix_hit_sources = [
+        PrefixHitSource.PD if s == PrefixHitSource.MISS else s for s in sources
+    ]
+    request.spanfuse_miss_gaps = miss
+    request.num_computed_tokens = num_computed_tokens
+    parent_nrd = NewRequestData.from_request(
+        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+    )
+    if miss:
+        append_virtual_gap_reqs(
+            parent_nrd,
+            miss,
+            virtual_reqs_out,
+            virtual_gap_req_ids,
+            num_scheduled_tokens,
+        )
+    for j, (qs, span_blocks, s) in enumerate(probes):
+        # the sentence is cached: window = all its rows, so no KV is rewritten
+        probe = replace(
+            parent_nrd,
+            req_id=f"{request.request_id}.probe{j}",
+            parent_req_id=request.request_id,
+            num_computed_tokens=qs,
+            is_spanfuse_probe=True,
+            spanfuse_span_blocks=span_blocks,
+            spanfuse_window=nq,
+            spanfuse_query_rows=nq,
+        )
+        if stripped:
+            lo = f + j * nqb
+            probe = replace(
+                probe,
+                block_ids=tuple(
+                    g[: qs // bs] + g[lo : lo + nqb] for g in parent_nrd.block_ids
+                ),
+                prompt_token_ids=list(toks[:qs]) + qids,
+                spanfuse_window=0,
+                spanfuse_probe_lb=s,
+            )
+        num_scheduled_tokens[probe.req_id] = nq
+        virtual_reqs_out.append(probe)
+        virtual_gap_req_ids.add(probe.req_id)
+    logger.info(
+        "SpanFuse per-span probe %s: %d sentences", request.request_id, len(probes)
+    )
     request.spanfuse_state = "inflight"
     request_queue.pop_request()
     step_skipped_waiting.prepend_request(request)
@@ -524,9 +874,6 @@ class QCFusePolicy(GapPolicy):
             raise ValueError(f"QCFuse: bad rho={rho} or granularity={granularity}")
         if k_per_span < 0:
             raise ValueError(f"QCFuse: k_per_span must be >= 0, got {k_per_span}")
-        # without prerotate the span head carries a positional error QCFuse ignores
-        if not envs.VLLM_V1_SPANS_PREROTATE:
-            raise ValueError("QCFuse requires VLLM_V1_SPANS_PREROTATE=True")
         self.rho = rho
         self.block_size = block_size
         self.granularity = granularity
@@ -673,26 +1020,44 @@ class NeighborAwarePolicy(QCFusePolicy):
 class SpanFusePolicy(QCFusePolicy):
     """QCFuse whose importance comes from the current request's probe."""
 
-    # every span keeps its head block repaired; the scoring pass ranks the rest
-    anchor_blocks = 1
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # every span keeps its first N blocks repaired; the scoring pass ranks the rest
+        self.anchor_blocks = envs.VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS
+        if self.anchor_blocks < 0:
+            raise ValueError(f"SpanFuse: anchor_blocks must be >= 0, got {self.anchor_blocks}")
+        logger.info(
+            "SpanFusePolicy initialized: k_per_span=%d rho=%s anchor_blocks=%d",
+            self.k_per_span, self.rho, self.anchor_blocks,
+        )
 
     def _select(
         self, request: "Request", importance: list[float], n: int
     ) -> list[tuple[int, int]]:
+        settled = request.spanfuse_settled
         if self.granularity == "token":
-            return super()._select(request, importance, n)
+            gaps = super()._select(request, importance, n)
+            return [
+                g
+                for g in gaps
+                if not any(s <= g[0] < e for s, e in self._span_ranges(request, n) if s in settled)
+            ]
         bs, gaps = self.block_size, []
+        toks, pad = request.prompt_token_ids, envs.VLLM_V1_SPANS_PAD_TOKEN
+
+        # pad rows carry no content, so they never vote for a block
+        def mass(b: int) -> float:
+            r = range(b * bs, (b + 1) * bs)
+            return sum(importance[i] for i in r if toks[i] != pad)
+
         for start, end in self._span_ranges(request, n):
             budget = self.k_per_span or int(self.rho * (end - start))
-            if budget <= 0:
+            if budget <= 0 or start in settled:
                 continue
             k = max(1, budget // bs)
             blocks = list(range(start // bs, min(end // bs, len(importance) // bs)))
             head = blocks[: min(self.anchor_blocks, k)]
-            rest = sorted(
-                blocks[len(head) :],
-                key=lambda b: -sum(importance[b * bs : (b + 1) * bs]),
-            )
+            rest = sorted(blocks[len(head) :], key=lambda b: -mass(b))
             top = head + rest[: k - len(head)]
             gaps += [(b * bs, (b + 1) * bs) for b in sorted(top)]
         return gaps

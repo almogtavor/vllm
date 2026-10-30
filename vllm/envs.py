@@ -268,7 +268,6 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_BLOCK_SIZE: int = 0
     VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
     VLLM_V1_SPANS_GAP_LENGTH: int = 32
-    VLLM_V1_SPANS_PREROTATE: bool = True
     VLLM_V1_SPANS_QCFUSE_ENABLE: bool = False
     VLLM_V1_SPANS_QCFUSE_RHO: float = 0.1
     VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
@@ -277,9 +276,13 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
     VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
     VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
+    VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
+    VLLM_V1_SPANS_LB_NOCLIP: bool = False
+    VLLM_V1_SPANS_LB_SPILL_LOG: bool = False
     VLLM_V1_SPANS_SPANFUSE_QUERY: str = (
         "Based on this tool output, continue with the task."
     )
+    VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS: str = ""
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1741,10 +1744,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
         os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
     ),
-    # rotate K once per forward into a transient scratch (prefill batches)
-    # instead of per-tile inside the attention kernel
-    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
-    == "True",
     # QCFuse: recompute a query-selected subset of cached tokens on all layers
     "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
         "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"
@@ -1775,11 +1774,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_SPANFUSE_NORM_CHECK": lambda: (
         os.environ.get("VLLM_V1_SPANS_SPANFUSE_NORM_CHECK", "False") == "True"
     ),
+    # SPANFUSE: leading blocks of every span always repaired before probe ranking
+    "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", "1")
+    ),
+    # SPANS: diagnostic only - restore the unclipped lb regions that overflow
+    "VLLM_V1_SPANS_LB_NOCLIP": lambda: (
+        os.environ.get("VLLM_V1_SPANS_LB_NOCLIP", "False") == "True"
+    ),
+    # SPANS: log query rows whose lb word came from another request's regions
+    "VLLM_V1_SPANS_LB_SPILL_LOG": lambda: (
+        os.environ.get("VLLM_V1_SPANS_LB_SPILL_LOG", "False") == "True"
+    ),
     # SPANFUSE: instruction appended in the scoring pass; its rows are the query,
     # "" scores from the prompt's own last QCFUSE_MAX_QUERY_TOKENS tokens instead
     "VLLM_V1_SPANS_SPANFUSE_QUERY": lambda: os.environ.get(
         "VLLM_V1_SPANS_SPANFUSE_QUERY",
         "Based on this tool output, continue with the task.",
+    ),
+    # SPANFUSE: ids of the sentence the mw splices after every span (qcfuse_query_starts)
+    "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS": lambda: os.environ.get(
+        "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", ""
     ),
     "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
         os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"

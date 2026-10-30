@@ -685,6 +685,12 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 num_uncached_common_prefix_tokens = 0
 
+                if request.spanfuse_state == "otf":
+                    # SPANFUSE: the cold spans are cached now, so look the prefix up again
+                    self.kv_cache_manager.free(request)
+                    request.num_computed_tokens = 0
+                    request.spanfuse_state = None
+                    request.span_gaps_selection = None
                 # Get already-cached tokens.
                 did_prefix_lookup = request.num_computed_tokens == 0
                 if did_prefix_lookup:
@@ -1604,17 +1610,26 @@ class Scheduler(SchedulerInterface):
         # SPANFUSE: the probe's importance feeds its own parent's repair
         if isinstance(self.gap_policy, SpanFusePolicy):
             imps = model_runner_output.qcfuse_importance or {}
+            summed: dict[str, list[float]] = {}
             for req_id in scheduler_output.num_scheduled_tokens:
-                if not req_id.endswith(".probe"):
+                parent, sep, j = req_id.rpartition(".probe")
+                if not sep or not (j == "" or j.isdigit()):
                     continue
-                req = self.requests.get(req_id[: -len(".probe")])
+                req = self.requests.get(parent)
                 if req is None or req.spanfuse_state != "inflight":
                     continue
+                acc = summed.setdefault(parent, [])
                 imp = imps.get(req_id)
                 if imp is None:
                     logger.warning("SpanFuse: no probe importance for %s", req_id)
-                    imp = [0.0] * req.num_computed_tokens
-                req.qcfuse_importance = imp
+                    continue
+                # per-span probes score disjoint blocks, so their sum is the union
+                acc.extend([0.0] * (len(imp) - len(acc)))
+                for k, v in enumerate(imp):
+                    acc[k] += v
+            for parent, acc in summed.items():
+                req = self.requests[parent]
+                req.qcfuse_importance = acc or [0.0] * req.num_computed_tokens
                 req.spanfuse_state = "measured"
 
         # Persist per-step routed experts into the scheduler-side slot

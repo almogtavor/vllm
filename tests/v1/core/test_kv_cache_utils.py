@@ -2673,3 +2673,36 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+@pytest.mark.spans
+def test_span_blocks_never_share_hash_with_rotated_blocks(monkeypatch):
+    """Span K is cached at p - span_start: a span block matches the same tokens
+    prefilled bare (the warm-up copy), but its pd copy, chained from position 0,
+    never matches a pd copy whose K is at p."""
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    bs = 16
+
+    def req(extra_args, toks=range(4 * bs)):
+        sp = SamplingParams(max_tokens=17, extra_args=extra_args)
+        sp.update_from_generation_config({}, eos_token_id=100)
+        return Request(
+            request_id="r",
+            prompt_token_ids=list(toks),
+            sampling_params=sp,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(bs, sha256),
+        )
+
+    plain = req(None).block_hashes
+    # a span at 0 is K at p, the same KV as a spans-off prompt
+    assert req({"span_starts": [0], "cross_span_starts": [2 * bs]}).block_hashes[:2] == plain[:2]
+    span1 = req({"span_starts": [bs], "cross_span_starts": [2 * bs]})
+    assert span1.block_hashes[0] == plain[0]
+    assert span1.block_hashes[1] == req(None, range(bs, 2 * bs)).block_hashes[0]
+    # same tokens and pd chain, K at p - bs (span) vs K at p (head)
+    head = req({"span_starts": [2 * bs], "cross_span_starts": [3 * bs]})
+    assert span1.pd_block_hashes[0] == head.pd_block_hashes[0]
+    assert span1.pd_block_hashes[1] != head.pd_block_hashes[1]

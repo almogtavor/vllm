@@ -105,6 +105,8 @@ class Request:
         # SPANS: Per-request span boundary metadata
         self.span_starts: list[int] | None = None
         self.cross_span_starts: list[int] | None = None
+        self.spanfuse_query_starts: list[int] | None = None  # mw sentence after each span
+        self.spanfuse_query_stripped = False  # mw sent the starts, not the sentence
         # SPANS: pd sibling hashes (parallel to block_hashes), the token
         # ranges where the dual pd/pic lookup applies, and the per-block hit
         # sources of the latest dual lookup.
@@ -120,6 +122,10 @@ class Request:
         self.spanfuse_state: str | None = None
         # SPANFUSE: MISS ranges the probe filled blind; recomputed again with the repair
         self.spanfuse_miss_gaps: list[tuple[int, int]] = []
+        # SPANFUSE: span starts already repaired under this exact prefix (pd hit)
+        self.spanfuse_settled: set[int] = set()
+        # SPANFUSE: the cold tail spans were encoded on the fly, once per request
+        self.spanfuse_otf_warmed = False
 
         if pooling_params is not None:
             # Pooling models.
@@ -139,6 +145,12 @@ class Request:
                     self.span_starts = sampling_params.extra_args.get("span_starts")
                     self.cross_span_starts = sampling_params.extra_args.get(
                         "cross_span_starts"
+                    )
+                    self.spanfuse_query_starts = sampling_params.extra_args.get(
+                        "qcfuse_query_starts"
+                    )
+                    self.spanfuse_query_stripped = bool(
+                        sampling_params.extra_args.get("spanfuse_query_stripped")
                     )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")

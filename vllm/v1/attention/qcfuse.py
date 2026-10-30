@@ -65,7 +65,7 @@ class QCFuseImportanceCapturer:
     def begin_step(self, block_table: torch.Tensor | None, descs: list) -> None:
         self.block_table = block_table
         self.descs = descs
-        for row, _, _, ctx_len, _, _ in descs:
+        for row, _, _, ctx_len, *_ in descs:
             self.buffer[row, :ctx_len].zero_()
 
     def end_step(self) -> None:
@@ -85,7 +85,7 @@ class QCFuseImportanceCapturer:
         if not self.descs or block_table is None:
             return
         if envs.VLLM_V1_SPANS_ENABLED and cos_sin_cache is None:
-            # SPANS caches K unrotated: scoring it against rotated Q is wrong
+            # SPANS caches Q and K at p - L: the probe must rotate them back
             raise RuntimeError("QCFuse probe under SPANS needs the layer's RoPE cache")
         rope = (cos_sin_cache, rotary_dim) if cos_sin_cache is not None else None
         # K/V-first (2, n_blocks, ...) or blocks-first (n_blocks, 2, ...)
@@ -101,7 +101,7 @@ class QCFuseImportanceCapturer:
             )
         key_cache = kv_cache[0] if kv_cache.shape[0] == 2 else kv_cache[:, 0]
         bs = key_cache.shape[1]
-        for row, q_start, q_end, ctx_len, span_blocks, q_pos0 in self.descs:
+        for row, q_start, q_end, ctx_len, span_blocks, q_pos0, raw in self.descs:
             n_blk = min(ctx_len // bs, block_table.shape[1])
             if n_blk <= 0 or q_end <= q_start:
                 continue
@@ -111,6 +111,7 @@ class QCFuseImportanceCapturer:
             # mean-pool each GQA group onto its KV head
             q = q.view(nq, n_kv, num_queries_per_kv, head_dim).mean(2)
             q_pos = q_pos0 + torch.arange(nq, device=q.device)
+            q = self._rope(q, q_pos, rope, raw)
             if span_blocks is not None:
                 # SPANFUSE: normalize over the span blocks only, not the prefix
                 idx = torch.tensor(
@@ -124,7 +125,9 @@ class QCFuseImportanceCapturer:
                     idx[:, None] * bs + torch.arange(bs, device=idx.device)
                 ).flatten()
                 k_ctx = key_cache[block_table[row, idx].long()].flatten(0, 1).float()
-                mass = self._mass(q, self._rope(k_ctx, pos, rope), scale, q_pos, pos)
+                mass = self._mass(
+                    q, self._rope(k_ctx, pos, rope, raw), scale, q_pos, pos
+                )
                 self.buffer[row].index_add_(0, pos.to(self.buffer.device), mass)
                 if envs.VLLM_V1_SPANS_SPANFUSE_NORM_CHECK:
                     self._log_norm_check(
@@ -136,6 +139,7 @@ class QCFuseImportanceCapturer:
                         mass,
                         scale,
                         rope,
+                        raw,
                     )
                 continue
             blk_ids = block_table[row, :n_blk].long()
@@ -143,15 +147,16 @@ class QCFuseImportanceCapturer:
             k_ctx = key_cache[blk_ids].flatten(0, 1).float()
             pos = torch.arange(n_blk * bs, device=k_ctx.device)
             self.buffer[row, : n_blk * bs] += self._mass(
-                q, self._rope(k_ctx, pos, rope), scale, q_pos, pos
+                q, self._rope(k_ctx, pos, rope, raw), scale, q_pos, pos
             )
 
     @staticmethod
-    def _rope(k, pos, rope):
-        """Neox-rotate K to its absolute position, as the span kernel does for
-        the tail (lb=0) rows the probe scores from (_load_rotate_k)."""
-        if rope is None:
+    def _rope(k, pos, rope, raw=None):
+        """Neox-rotate Q or K, cached at p - L, back to p (raw = L per position).
+        Off-span L is 0: the identity."""
+        if rope is None or raw is None:
             return k
+        pos = raw[pos.to(raw.device)].long()
         cos_sin_cache, rotary_dim = rope
         d = k.shape[-1]
         rot = d if rotary_dim <= 0 or rotary_dim > d else rotary_dim
@@ -170,11 +175,11 @@ class QCFuseImportanceCapturer:
         return scores.softmax(dim=-1).nan_to_num(0.0).sum(dim=(0, 1))
 
     def _log_norm_check(
-        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope
+        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope, raw=None
     ) -> None:
         k_all = key_cache[blk_row.long()].flatten(0, 1).float()
         ar = torch.arange(k_all.shape[0], device=k_all.device)
-        full = self._mass(q, self._rope(k_all, ar, rope), scale, q_pos, ar)[pos]
+        full = self._mass(q, self._rope(k_all, ar, rope, raw), scale, q_pos, ar)[pos]
         n = max(1, pos.numel() // 10)
         a = set(mass.topk(n).indices.tolist())
         b = set(full.topk(n).indices.tolist())

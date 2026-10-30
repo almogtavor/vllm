@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
 
+import bisect
 import copy
 import hashlib
 import math
@@ -575,6 +576,9 @@ def generate_block_hash_extra_keys(
     return tuple(extra_keys), new_start_mm_idx
 
 
+SPANS_RAW_KEY = "spans_raw_k"
+
+
 def hash_block_tokens(
     hash_function: Callable[[Any], bytes],
     parent_block_hash: BlockHash | None,
@@ -736,6 +740,18 @@ def get_request_block_hasher(
         prev_pd_hash_value = (
             request.pd_block_hashes[-1] if request.pd_block_hashes else PD_NONE_HASH
         )
+        spans_sorted = sorted(span_starts_set)
+        crosses_sorted = sorted(cross_starts_set)
+
+        def block_in_span(idx: int) -> bool:
+            # same rule as compute_span_lb_regions: a span runs to the next
+            # span start or the first cross after it
+            j = bisect.bisect_right(spans_sorted, idx)
+            if j == 0:
+                return False
+            c = bisect.bisect_right(crosses_sorted, idx)
+            return c == 0 or spans_sorted[j - 1] >= crosses_sorted[c - 1]
+
         new_block_hashes: list[BlockHash] = []
         new_pd_block_hashes: list[BlockHash] = []
         while True:
@@ -748,26 +764,30 @@ def get_request_block_hasher(
             extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
                 request, start_token_idx, end_token_idx, curr_mm_idx
             )
-
             # Compute the hash of the current block
             block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
 
             if track_pd:
+                pd_keys = extra_keys
+                if block_in_span(start_token_idx):
+                    # pd chain runs from 0, but span K is cached at p - span_start
+                    pd_keys = (*(extra_keys or ()), SPANS_RAW_KEY)
                 pd_block_hash = hash_block_tokens(
                     caching_hash_fn,
                     prev_pd_hash_value,
                     block_tokens,
-                    extra_keys,
+                    pd_keys,
                 )
                 new_pd_block_hashes.append(pd_block_hash)
                 prev_pd_hash_value = pd_block_hash
 
-            is_cross_span = start_token_idx in cross_starts_set
-            extra_keys = recompute_token_handler(
-                request.all_token_ids[:start_token_idx],
-                extra_keys,
-                is_cross_span=is_cross_span,
-            )
+            # slice the prefix only for a cross: copying it on every block is O(n^2)
+            if start_token_idx in cross_starts_set:
+                extra_keys = recompute_token_handler(
+                    request.all_token_ids[:start_token_idx],
+                    extra_keys,
+                    is_cross_span=True,
+                )
 
             is_span_start = start_token_idx in span_starts_set
             block_hash = hash_block_tokens(
