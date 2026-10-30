@@ -781,12 +781,13 @@ def get_request_block_hasher(
                 new_pd_block_hashes.append(pd_block_hash)
                 prev_pd_hash_value = pd_block_hash
 
-            is_cross_span = start_token_idx in cross_starts_set
-            extra_keys = recompute_token_handler(
-                request.all_token_ids[:start_token_idx],
-                extra_keys,
-                is_cross_span=is_cross_span,
-            )
+            # slice the prefix only for a cross: copying it on every block is O(n^2)
+            if start_token_idx in cross_starts_set:
+                extra_keys = recompute_token_handler(
+                    request.all_token_ids[:start_token_idx],
+                    extra_keys,
+                    is_cross_span=True,
+                )
 
             is_span_start = start_token_idx in span_starts_set
             block_hash = hash_block_tokens(
