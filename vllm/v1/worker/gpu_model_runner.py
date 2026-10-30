@@ -4415,9 +4415,11 @@ class GPUModelRunner(
         layers = {}
         for name, layer in ctx.items():
             kv = getattr(layer, "kv_cache", None)
-            if not isinstance(kv, list) or not kv or kv[0].dim() != 5:
+            if isinstance(kv, list):
+                kv = kv[0] if kv else None
+            if not isinstance(kv, torch.Tensor) or kv.dim() != 5:
                 continue
-            layers[name] = (kv[0], getattr(layer, "spans_cos_sin_cache", None),
+            layers[name] = (kv, getattr(layer, "spans_cos_sin_cache", None),
                             getattr(layer, "spans_rotary_dim", 0))
         for rid, starts, idx, old, new, src, toks in pairs:
             o = torch.tensor(old, device=self.device)
