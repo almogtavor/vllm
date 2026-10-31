@@ -529,6 +529,13 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
                 continue
             computed.append(block[0])
             sources.append(source)
+        if request.spanfuse_seed:
+            # a span whose hits stop inside it (a shared tool-call header) is cold: seed all of it
+            for s, e in request.pic_token_ranges:
+                blk = range(s // bs, min(len(sources), (e or request.num_tokens) // bs))
+                if blk and sources[blk[-1]] == PrefixHitSource.MISS:
+                    for b in blk:
+                        computed[b], sources[b] = self.block_pool.null_block, PrefixHitSource.MISS
         while sources and sources[-1] == PrefixHitSource.MISS:
             computed.pop()
             sources.pop()
