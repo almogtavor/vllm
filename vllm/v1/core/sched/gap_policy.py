@@ -454,6 +454,11 @@ def _schedule_spanfuse_probe(
         # whole span: importance cannot change the selection, so skip the scoring pass
         request.qcfuse_importance = [0.0] * num_computed_tokens
         return NO_SPAN_GAPS
+    rho = request.spanfuse_rho
+    if (rho == 0 if rho is not None else not k and not sched.gap_policy.rho):
+        # zero repair budget: the scores would select nothing
+        request.qcfuse_importance = [0.0] * num_computed_tokens
+        return NO_SPAN_GAPS
     qids = [
         int(x)
         for x in envs.VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS.replace("\\", "").split(",")

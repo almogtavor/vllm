@@ -523,7 +523,14 @@ def test_spanfuse_otf_warm_then_probe(monkeypatch):
 
     # the re-lookup returns the warmed span as PIC: the probe runs, then repair
     D, S = PrefixHitSource.PD, PrefixHitSource.PIC
-    req.spanfuse_state, req.prefix_hit_sources = None, [D] * 4 + [S] * 4
+    # a zero repair share skips the probe: its scores would select nothing
+    req.spanfuse_rho, req.spanfuse_state, req.prefix_hit_sources = 0.0, None, [D] * 4 + [S] * 4
+    queue.add_request(req)
+    out.clear()
+    nsched.clear()
+    call(128)
+    assert out == [] and req.qcfuse_importance == [0.0] * 128
+    req.spanfuse_rho, req.spanfuse_state, req.span_gaps_selection = None, None, None
     queue.add_request(req)
     out.clear()
     nsched.clear()
