@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -28,6 +29,22 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash, PrefixHitSource
+
+logger = init_logger(__name__)
+
+
+def _parse_rho(value: Any) -> float | None:
+    """spans_repair_rho as a share in [0, 1]; anything else is ignored, not raised in the scheduler."""
+    if value is None:
+        return None
+    try:
+        rho = float(value)
+    except (TypeError, ValueError):
+        rho = float("nan")
+    if not 0.0 <= rho <= 1.0:
+        logger.warning("ignoring spans_repair_rho=%r: not a share in [0, 1]", value)
+        return None
+    return rho
 
 
 @dataclass
@@ -156,10 +173,12 @@ class Request:
                     self.spanfuse_query_stripped = bool(
                         sampling_params.extra_args.get("spanfuse_query_stripped")
                     )
-                    self.spanfuse_rho = sampling_params.extra_args.get("spans_repair_rho")
-                    self.spanfuse_seed = bool(
-                        sampling_params.extra_args.get("spans_seed", self.spanfuse_seed)
+                    self.spanfuse_rho = _parse_rho(
+                        sampling_params.extra_args.get("spans_repair_rho")
                     )
+                    seed = sampling_params.extra_args.get("spans_seed")
+                    if seed is not None:
+                        self.spanfuse_seed = str(seed).lower() in ("true", "1")
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 

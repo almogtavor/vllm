@@ -465,6 +465,27 @@ def test_spanfuse_per_request_rho(monkeypatch):
     assert pol._select(req, imp, 144) == []
 
 
+def test_spanfuse_request_share_on_every_path(monkeypatch):
+    """The request's share sets the token-granularity budget too; xargs outside [0, 1]
+    are ignored and spans_seed is parsed as a flag, not by truthiness."""
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
+    from vllm.v1.request import _parse_rho
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    req = make_span_request(144, span_starts=[16])
+    req.spanfuse_rho = 0.0
+    assert SpanFusePolicy(rho=0.15, granularity="token")._select(req, [0.0] * 144, 144) == []
+    assert SpanFusePolicy(k_per_span=512)._budget(req, 16, 144) == 0
+    vals = [None, "0.15", 2, -1, float("nan"), [1], "x"]
+    assert [_parse_rho(v) for v in vals] == [None, 0.15, None, None, None, None, None]
+    for flag, want in (("false", False), ("0", False), ("True", True), (True, True)):
+        sp = SamplingParams(max_tokens=1, extra_args={"span_starts": [16], "spans_seed": flag})
+        sp.update_from_generation_config({}, eos_token_id=100)
+        r = Request(request_id="s", prompt_token_ids=list(range(64)), sampling_params=sp, pooling_params=None)
+        assert r.spanfuse_seed is want, flag
+
+
 def test_spanfuse_otf_warm_then_probe(monkeypatch):
     """A cold tail span is encoded span-locally and cached under its plain key,
     then the re-lookup sees it as a PIC hit and the probe repairs it."""
@@ -530,12 +551,21 @@ def test_spanfuse_otf_warm_then_probe(monkeypatch):
     nsched.clear()
     call(128)
     assert out == [] and req.qcfuse_importance == [0.0] * 128
-    req.spanfuse_rho, req.spanfuse_state, req.span_gaps_selection = None, None, None
+    # so does a share that covers the whole span
+    req.spanfuse_rho, req.spanfuse_state = 1.0, None
+    queue.add_request(req)
+    out.clear()
+    call(128)
+    assert out == []
+    # a partial share is scored even when the server k covers the span
+    sched.gap_policy.k_per_span = 64
+    req.spanfuse_rho, req.spanfuse_state, req.span_gaps_selection = 0.5, None, None
     queue.add_request(req)
     out.clear()
     nsched.clear()
     call(128)
     assert [r.req_id for r in out] == ["gap_test.probe"]
+    sched.gap_policy.k_per_span, req.spanfuse_rho = 32, None
     assert out[0].spanfuse_span_blocks == [4, 5, 6, 7]
     imp = [0.0] * 128
     imp[100] = 1.0
@@ -612,3 +642,22 @@ def test_spanfuse_seed_encodes_in_context_under_plain_key(monkeypatch):
     out.clear()
     call(128)
     assert 64 in req.spanfuse_settled and out == []
+
+
+    # not settled: a seed that read an unrepaired earlier span, or a span whose block
+    # hash another span in this tail shares (the lookup resolves it to the first copy)
+    for starts, crosses, hashes in (
+        ([16, 64], [48, 128], [f"h{i}" for i in range(11)]),
+        ([64, 96], [128], ["h0", "h1", "h2", "h3", "x", "h5", "x", "h7", "h8", "h9", "h10"]),
+    ):
+        req2 = make_span_request(176, span_starts=starts, cross_span_starts=crosses)
+        req2.status, req2.spanfuse_seed, req2.block_hashes = None, True, hashes
+        req2.pd_block_hashes = [f"p{i}" for i in range(11)]
+        req2.prefix_hit_sources = [S] * 4
+        queue.add_request(req2)
+        out.clear()
+        schedule_span_gaps(
+            sched, req2, True, 64, 0, 64, MagicMock(), 8192, nsched, out, set(), queue, skipped
+        )
+        assert req2.spanfuse_state == "otf" and req2.spanfuse_seeded == set(), starts
+        assert pool.cache_blocks_under_hashes.call_args[0][1] == hashes[4:8], starts

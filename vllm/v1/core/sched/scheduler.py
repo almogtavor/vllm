@@ -1191,6 +1191,8 @@ class Scheduler(SchedulerInterface):
         if request.spanfuse_state is not None:
             request.spanfuse_state = request.qcfuse_importance = None
             request.spanfuse_miss_gaps = []
+        # the seed blocks may be evicted while preempted: re-seed or re-warm on resume
+        request.spanfuse_seeded, request.spanfuse_otf_warmed = set(), False
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
