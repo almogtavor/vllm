@@ -891,7 +891,7 @@ class QCFusePolicy(GapPolicy):
         # ValueError, since create_policy() swallows TypeError into NoGapPolicy
         if not parse_critical_layers():
             raise ValueError("QCFuse needs VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS")
-        if not 0.0 < rho <= 1.0 or granularity not in ("block", "token"):
+        if not 0.0 <= rho <= 1.0 or granularity not in ("block", "token"):
             raise ValueError(f"QCFuse: bad rho={rho} or granularity={granularity}")
         if k_per_span < 0:
             raise ValueError(f"QCFuse: k_per_span must be >= 0, got {k_per_span}")

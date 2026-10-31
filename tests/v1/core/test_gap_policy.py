@@ -477,6 +477,7 @@ def test_spanfuse_request_share_on_every_path(monkeypatch):
     req.spanfuse_rho = 0.0
     assert SpanFusePolicy(rho=0.15, granularity="token")._select(req, [0.0] * 144, 144) == []
     assert SpanFusePolicy(k_per_span=512)._budget(req, 16, 144) == 0
+    assert SpanFusePolicy(k_per_span=0, rho=0.0)._budget(make_span_request(144, span_starts=[16]), 16, 144) == 0
     vals = [None, "0.15", 2, -1, float("nan"), [1], "x"]
     assert [_parse_rho(v) for v in vals] == [None, 0.15, None, None, None, None, None]
     for flag, want in (("false", False), ("0", False), ("True", True), (True, True)):
