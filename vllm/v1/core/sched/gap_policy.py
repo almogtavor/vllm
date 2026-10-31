@@ -9,6 +9,7 @@ came from (local prefix cache, external connector, or both).
 """
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -267,19 +268,22 @@ def _schedule_spanfuse_otf_warm(
         return NO_SPAN_GAPS
     sources = request.prefix_hit_sources or []
     end = spans[-1][1]
-    k = sched.gap_policy.k_per_span
-    # whole span: encode every cold span in context now and cache it under the pd key
+    pol = sched.gap_policy
+    seed = request.spanfuse_seed
+    # every earlier span was repaired under this prefix, so an in-context encode reads exact KV
+    prefix_exact = all(
+        sources[b] == PrefixHitSource.PD
+        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+        for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+    )
+    # whole span: encode every cold span in context now and cache it under the pd key,
+    # or, as a seed, under the plain key so later contexts start from this copy, not the blind one
     if (
-        k
-        and all(e - s <= k for s, e in spans)
+        (seed or all(pol._budget(request, s, e) >= e - s for s, e in spans))
         and request.pd_block_hashes is not None
         and len(sources) >= num_computed_tokens // bs
         and PrefixHitSource.MISS not in sources
-        and all(
-            sources[b] == PrefixHitSource.PD
-            for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
-            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
-        )
+        and (seed or prefix_exact)
         and len(request.pd_block_hashes) >= end // bs
         and end - num_computed_tokens <= sched.max_num_scheduled_tokens
     ):
@@ -304,16 +308,27 @@ def _schedule_spanfuse_otf_warm(
         sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
             [req_blocks[b] for b in idx],
             [
-                request.pd_block_hashes[b] if b * bs >= first else request.block_hashes[b]
+                request.pd_block_hashes[b]
+                if b * bs >= first and not seed
+                else request.block_hashes[b]
                 for b in idx
             ],
             0,
         )
+        if seed and prefix_exact:
+            # a block hash shared by two spans here resolves to the first one's copy
+            n = Counter(request.block_hashes[b] for b in idx)
+            request.spanfuse_seeded = {
+                s
+                for s, e in spans
+                if all(n[request.block_hashes[b]] == 1 for b in range(s // bs, e // bs))
+            }
         logger.info(
-            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s",
+            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s%s",
             len(spans),
             work,
             request.request_id,
+            " (seed)" if seed else "",
         )
         request.num_computed_tokens = num_computed_tokens
         parent_nrd = NewRequestData.from_request(
@@ -359,10 +374,11 @@ def _schedule_spanfuse_otf_warm(
         [req_blocks[b] for b in idx], [request.block_hashes[b] for b in idx], 0
     )
     logger.info(
-        "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s",
+        "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s%s",
         len(spans),
         work,
         request.request_id,
+        " (seed fell back to blind)" if seed else "",
     )
     request.num_computed_tokens = num_computed_tokens
     parent_nrd = NewRequestData.from_request(
@@ -427,7 +443,8 @@ def _schedule_spanfuse_probe(
             len(ranges),
             request.request_id,
         )
-    request.spanfuse_settled |= {s for s, _ in cold}
+    # a seed is this request's own in-context copy: repairing it would recompute the same KV
+    request.spanfuse_settled |= {s for s, _ in cold} | request.spanfuse_seeded
     request.spanfuse_miss_gaps = cold
     span_blocks = [
         b
@@ -439,9 +456,13 @@ def _schedule_spanfuse_probe(
         b < len(sources) and sources[b] == PrefixHitSource.PIC for b in span_blocks
     ):
         return NO_SPAN_GAPS
-    k = sched.gap_policy.k_per_span
-    if k and all(e - s <= k for s, e in ranges if s not in request.spanfuse_settled):
-        # whole span: importance cannot change the selection, so skip the scoring pass
+    budgets = [
+        (sched.gap_policy._budget(request, s, e), e - s)
+        for s, e in ranges
+        if s not in request.spanfuse_settled
+    ]
+    # whole span or zero budget: importance cannot change the selection, so skip the scoring pass
+    if all(b >= n for b, n in budgets) or all(b <= 0 for b, _ in budgets):
         request.qcfuse_importance = [0.0] * num_computed_tokens
         return NO_SPAN_GAPS
     qids = [
@@ -870,7 +891,7 @@ class QCFusePolicy(GapPolicy):
         # ValueError, since create_policy() swallows TypeError into NoGapPolicy
         if not parse_critical_layers():
             raise ValueError("QCFuse needs VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS")
-        if not 0.0 < rho <= 1.0 or granularity not in ("block", "token"):
+        if not 0.0 <= rho <= 1.0 or granularity not in ("block", "token"):
             raise ValueError(f"QCFuse: bad rho={rho} or granularity={granularity}")
         if k_per_span < 0:
             raise ValueError(f"QCFuse: k_per_span must be >= 0, got {k_per_span}")
@@ -894,6 +915,13 @@ class QCFusePolicy(GapPolicy):
             "%s: %d gaps for %s", type(self).__name__, len(gaps), request.request_id
         )
         return gaps
+
+    def _budget(self, request: "Request", start: int, end: int) -> int:
+        """Tokens to repair in span [start, end): the request's share, else the server's."""
+        rho = getattr(request, "spanfuse_rho", None)
+        if rho is not None:
+            return int(rho * (end - start))
+        return self.k_per_span or int(self.rho * (end - start))
 
     @staticmethod
     def _span_ranges(
@@ -920,7 +948,7 @@ class QCFusePolicy(GapPolicy):
         # TopK inside each span: prefix blocks are already exact
         bs, gaps = self.block_size, []
         for start, end in self._span_ranges(request, n):
-            budget = self.k_per_span or int(self.rho * (end - start))
+            budget = self._budget(request, start, end)
             if budget <= 0:
                 continue
             if self.granularity == "token":
@@ -1051,7 +1079,7 @@ class SpanFusePolicy(QCFusePolicy):
             return sum(importance[i] for i in r if toks[i] != pad)
 
         for start, end in self._span_ranges(request, n):
-            budget = self.k_per_span or int(self.rho * (end - start))
+            budget = self._budget(request, start, end)
             if budget <= 0 or start in settled:
                 continue
             k = max(1, budget // bs)

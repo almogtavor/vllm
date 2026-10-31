@@ -256,6 +256,8 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    # SPANSHIFT: (req, span_starts, block idx, blind ids, fresh ids) per gap swap
+    spanshift_pairs: list[tuple] | None = None
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.

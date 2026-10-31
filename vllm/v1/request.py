@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -28,6 +29,22 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash, PrefixHitSource
+
+logger = init_logger(__name__)
+
+
+def _parse_rho(value: Any) -> float | None:
+    """spans_repair_rho as a share in [0, 1]; anything else is ignored, not raised in the scheduler."""
+    if value is None:
+        return None
+    try:
+        rho = float(value)
+    except (TypeError, ValueError):
+        rho = float("nan")
+    if not 0.0 <= rho <= 1.0:
+        logger.warning("ignoring spans_repair_rho=%r: not a share in [0, 1]", value)
+        return None
+    return rho
 
 
 @dataclass
@@ -107,6 +124,8 @@ class Request:
         self.cross_span_starts: list[int] | None = None
         self.spanfuse_query_starts: list[int] | None = None  # mw sentence after each span
         self.spanfuse_query_stripped = False  # mw sent the starts, not the sentence
+        self.spanfuse_rho: float | None = None  # per-request share of span tokens to repair
+        self.spanfuse_seed = envs.VLLM_V1_SPANS_SPANFUSE_SEED  # cold spans seed the plain key
         # SPANS: pd sibling hashes (parallel to block_hashes), the token
         # ranges where the dual pd/pic lookup applies, and the per-block hit
         # sources of the latest dual lookup.
@@ -126,6 +145,8 @@ class Request:
         self.spanfuse_settled: set[int] = set()
         # SPANFUSE: the cold tail spans were encoded on the fly, once per request
         self.spanfuse_otf_warmed = False
+        # SPANFUSE: span starts this request encoded in context as the seed copy
+        self.spanfuse_seeded: set[int] = set()
 
         if pooling_params is not None:
             # Pooling models.
@@ -152,6 +173,12 @@ class Request:
                     self.spanfuse_query_stripped = bool(
                         sampling_params.extra_args.get("spanfuse_query_stripped")
                     )
+                    self.spanfuse_rho = _parse_rho(
+                        sampling_params.extra_args.get("spans_repair_rho")
+                    )
+                    seed = sampling_params.extra_args.get("spans_seed")
+                    if seed is not None:
+                        self.spanfuse_seed = str(seed).lower() in ("true", "1")
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 

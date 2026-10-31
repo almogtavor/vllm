@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -174,6 +175,9 @@ class KVCacheManager:
         # overhead.
         #
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
+        # SPANSHIFT: (req, span_starts, block idx, blind ids, fresh ids) per swap
+        self.spanshift_pairs: list[tuple] = []
+        self.spanshift_held: list[KVCacheBlock] = []
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
@@ -489,9 +493,25 @@ class KVCacheManager:
             # SPANS: fresh pd-keyed blocks for the gap recompute; the shared
             # warmed (pic) blocks are left untouched for other prefixes.
             manager = self.coordinator.single_type_managers[0]
+            hold = [] if envs.VLLM_V1_SPANS_SHIFT_DUMP else None
+            bs = self.coordinator.block_size  # type: ignore[attr-defined]
             fresh = manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
-                request.request_id, swap_indices
+                request.request_id, swap_indices, hold
             )
+            if hold is not None:
+                # SPANSHIFT: blind copies stay alive until the next schedule()
+                self.spanshift_held.extend(hold)
+                self.spanshift_pairs.append(
+                    (
+                        request.request_id,
+                        list(request.span_starts or ()),
+                        list(swap_indices),
+                        [b.block_id for b in hold],
+                        [b.block_id for b in fresh],
+                        [str(request.prefix_hit_sources[i]) for i in swap_indices],
+                        [request.all_token_ids[i * bs : (i + 1) * bs] for i in swap_indices],
+                    )
+                )
             # SPANFUSE: a probe's MISS copies are rewritten in place at repair, so
             # they stay private to this request
             if not delay_cache_blocks:

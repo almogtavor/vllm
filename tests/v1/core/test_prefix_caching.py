@@ -3906,6 +3906,43 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
 
 
 @pytest.mark.spans
+@pytest.mark.parametrize("seed", [False, True])
+def test_seed_drops_a_span_that_hits_only_its_header(monkeypatch, seed):
+    """Two files read through the same tool share the span's first block. Without
+    seed the lookup stops inside the new span; with seed the whole span is cold,
+    so the otf encode sees it from its start."""
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    bs = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(bs, 32), max_model_len=8192, hash_block_size=bs
+    )
+
+    def req(rid, body):
+        sp = SamplingParams(max_tokens=17, extra_args={"span_starts": [bs]})
+        sp.update_from_generation_config({}, eos_token_id=100)
+        r = Request(
+            request_id=rid,
+            prompt_token_ids=list(range(2 * bs)) + body + [7],
+            sampling_params=sp,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(bs, sha256),
+        )
+        r.spanfuse_seed = seed
+        return r
+
+    first = req("first", list(range(1000, 1000 + 3 * bs)))
+    blocks, n = manager.get_computed_blocks(first)
+    manager.allocate_slots(first, first.num_tokens - n, n, blocks)
+    manager.free(first)
+
+    other = req("other", list(range(2000, 2000 + 3 * bs)))
+    _, n = manager.get_computed_blocks(other)
+    assert n == (bs if seed else 2 * bs)
+
+
+@pytest.mark.spans
 def test_spanfuse_probe_miss_copies_stay_private(monkeypatch):
     """A delayed probe swaps its MISS blocks to fresh hash-less copies that the
     repair step rewrites in place, so no other prefix may ever hit them."""
