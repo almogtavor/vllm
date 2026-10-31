@@ -107,6 +107,8 @@ class Request:
         self.cross_span_starts: list[int] | None = None
         self.spanfuse_query_starts: list[int] | None = None  # mw sentence after each span
         self.spanfuse_query_stripped = False  # mw sent the starts, not the sentence
+        self.spanfuse_rho: float | None = None  # per-request share of span tokens to repair
+        self.spanfuse_seed = envs.VLLM_V1_SPANS_SPANFUSE_SEED  # cold spans seed the plain key
         # SPANS: pd sibling hashes (parallel to block_hashes), the token
         # ranges where the dual pd/pic lookup applies, and the per-block hit
         # sources of the latest dual lookup.
@@ -126,6 +128,8 @@ class Request:
         self.spanfuse_settled: set[int] = set()
         # SPANFUSE: the cold tail spans were encoded on the fly, once per request
         self.spanfuse_otf_warmed = False
+        # SPANFUSE: span starts this request encoded in context as the seed copy
+        self.spanfuse_seeded: set[int] = set()
 
         if pooling_params is not None:
             # Pooling models.
@@ -151,6 +155,10 @@ class Request:
                     )
                     self.spanfuse_query_stripped = bool(
                         sampling_params.extra_args.get("spanfuse_query_stripped")
+                    )
+                    self.spanfuse_rho = sampling_params.extra_args.get("spans_repair_rho")
+                    self.spanfuse_seed = bool(
+                        sampling_params.extra_args.get("spans_seed", self.spanfuse_seed)
                     )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")

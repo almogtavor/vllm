@@ -268,17 +268,21 @@ def _schedule_spanfuse_otf_warm(
     sources = request.prefix_hit_sources or []
     end = spans[-1][1]
     k = sched.gap_policy.k_per_span
-    # whole span: encode every cold span in context now and cache it under the pd key
+    seed = request.spanfuse_seed
+    # whole span: encode every cold span in context now and cache it under the pd key,
+    # or, as a seed, under the plain key so later contexts start from this copy, not the blind one
     if (
-        k
-        and all(e - s <= k for s, e in spans)
+        (seed or (k and all(e - s <= k for s, e in spans)))
         and request.pd_block_hashes is not None
         and len(sources) >= num_computed_tokens // bs
         and PrefixHitSource.MISS not in sources
-        and all(
-            sources[b] == PrefixHitSource.PD
-            for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
-            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+        and (
+            seed
+            or all(
+                sources[b] == PrefixHitSource.PD
+                for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
+                for b in range(s // bs, min(cdiv(e, bs), len(sources)))
+            )
         )
         and len(request.pd_block_hashes) >= end // bs
         and end - num_computed_tokens <= sched.max_num_scheduled_tokens
@@ -304,16 +308,21 @@ def _schedule_spanfuse_otf_warm(
         sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
             [req_blocks[b] for b in idx],
             [
-                request.pd_block_hashes[b] if b * bs >= first else request.block_hashes[b]
+                request.pd_block_hashes[b]
+                if b * bs >= first and not seed
+                else request.block_hashes[b]
                 for b in idx
             ],
             0,
         )
+        if seed:
+            request.spanfuse_seeded = {s for s, _ in spans}
         logger.info(
-            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s",
+            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s%s",
             len(spans),
             work,
             request.request_id,
+            " (seed)" if seed else "",
         )
         request.num_computed_tokens = num_computed_tokens
         parent_nrd = NewRequestData.from_request(
@@ -427,7 +436,8 @@ def _schedule_spanfuse_probe(
             len(ranges),
             request.request_id,
         )
-    request.spanfuse_settled |= {s for s, _ in cold}
+    # a seed is this request's own in-context copy: repairing it would recompute the same KV
+    request.spanfuse_settled |= {s for s, _ in cold} | request.spanfuse_seeded
     request.spanfuse_miss_gaps = cold
     span_blocks = [
         b
@@ -1050,8 +1060,12 @@ class SpanFusePolicy(QCFusePolicy):
             r = range(b * bs, (b + 1) * bs)
             return sum(importance[i] for i in r if toks[i] != pad)
 
+        rho = request.spanfuse_rho
         for start, end in self._span_ranges(request, n):
-            budget = self.k_per_span or int(self.rho * (end - start))
+            if rho is None:
+                budget = self.k_per_span or int(self.rho * (end - start))
+            else:
+                budget = int(rho * (end - start))
             if budget <= 0 or start in settled:
                 continue
             k = max(1, budget // bs)

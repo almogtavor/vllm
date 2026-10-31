@@ -447,6 +447,24 @@ def test_spanfuse_anchor_blocks_env(monkeypatch):
     ]
 
 
+def test_spanfuse_per_request_rho(monkeypatch):
+    """spans_repair_rho repairs that share of every span, overriding k_per_span; 0 repairs nothing."""
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
+    req = make_span_request(144, span_starts=[16])
+    imp = [0.0] * 144
+    imp[96:112] = [1.0] * 16
+    imp[64] = 0.5
+    pol = SpanFusePolicy(k_per_span=16)
+    assert pol._select(req, imp, 144) == [(16, 32)]
+    req.spanfuse_rho = 0.25  # 128 span tokens -> 32 -> head + best block
+    assert pol._select(req, imp, 144) == [(16, 32), (96, 112)]
+    req.spanfuse_rho = 0.0
+    assert pol._select(req, imp, 144) == []
+
+
 def test_spanfuse_otf_warm_then_probe(monkeypatch):
     """A cold tail span is encoded span-locally and cached under its plain key,
     then the re-lookup sees it as a PIC hit and the probe repairs it."""
@@ -522,3 +540,68 @@ def test_spanfuse_otf_warm_then_probe(monkeypatch):
     assert req.spanfuse_state == "done"
     got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
     assert (64, 80) in got and (96, 112) in got and pool.cache_blocks_under_hashes.call_count == 1
+
+
+def test_spanfuse_seed_encodes_in_context_under_plain_key(monkeypatch):
+    """With seed on, a cold tail span is encoded in its own context and cached
+    under the plain key that other contexts look up; this request never repairs it."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.v1.attention import qcfuse
+    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
+    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
+    req = make_span_request(176, span_starts=[64], cross_span_starts=[128])
+    req.status = None
+    req.spanfuse_seed = True
+    req.block_hashes = [f"h{i}" for i in range(11)]
+    req.pd_block_hashes = [f"p{i}" for i in range(11)]
+    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
+    req.prefix_hit_sources = [S] * 4  # the prefix itself may be unrepaired PIC
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([0] * 11,)
+    pool = MagicMock()
+    sched = SimpleNamespace(
+        gap_policy=SpanFusePolicy(k_per_span=0, rho=0.25),
+        block_size=16,
+        max_num_scheduled_tokens=8192,
+        max_model_len=4096,
+        vllm_config=SimpleNamespace(model_config=None),
+        connector=None,
+        _merge_gaps=Scheduler._merge_gaps,
+        kv_cache_manager=SimpleNamespace(
+            allocate_slots=MagicMock(return_value=blocks),
+            get_blocks=MagicMock(return_value=blocks),
+            block_pool=pool,
+            coordinator=SimpleNamespace(
+                single_type_managers=[
+                    SimpleNamespace(req_to_blocks={"gap_test": [f"b{i}" for i in range(11)]})
+                ]
+            ),
+        ),
+    )
+    queue = create_request_queue(SchedulingPolicy.FCFS)
+    skipped = create_request_queue(SchedulingPolicy.FCFS)
+    out: list = []
+    nsched: dict[str, int] = {}
+    call = lambda n: schedule_span_gaps(
+        sched, req, True, n, 0, n, MagicMock(), 8192, nsched, out, set(), queue, skipped
+    )
+
+    queue.add_request(req)
+    assert call(64) == 8192 - 64
+    assert [(r.req_id, r.is_gap_recompute) for r in out] == [("gap_test.64", True)]
+    pool.cache_blocks_under_hashes.assert_called_once_with(
+        ["b4", "b5", "b6", "b7"], ["h4", "h5", "h6", "h7"], 0
+    )
+    assert req.spanfuse_seeded == {64} and req.spanfuse_state == "otf"
+
+    # the re-lookup sees the seed as PIC, but it is this request's own copy: no probe
+    req.spanfuse_state, req.prefix_hit_sources = None, [D] * 4 + [S] * 4
+    queue.add_request(req)
+    out.clear()
+    call(128)
+    assert 64 in req.spanfuse_settled and out == []

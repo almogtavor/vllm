@@ -277,6 +277,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
     VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
     VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
+    VLLM_V1_SPANS_SPANFUSE_SEED: bool = False
     VLLM_V1_SPANS_SHIFT_DUMP: str = ""
     VLLM_V1_SPANS_LB_NOCLIP: bool = False
     VLLM_V1_SPANS_LB_SPILL_LOG: bool = False
@@ -1778,6 +1779,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SPANFUSE: leading blocks of every span always repaired before probe ranking
     "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS": lambda: int(
         os.environ.get("VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", "1")
+    ),
+    # SPANFUSE: a cold span is encoded in its first context and that copy is the shared one
+    "VLLM_V1_SPANS_SPANFUSE_SEED": lambda: (
+        os.environ.get("VLLM_V1_SPANS_SPANFUSE_SEED", "False") == "True"
     ),
     # SPANSHIFT: dump blind and repaired K/V of every gap-swapped block to this dir
     "VLLM_V1_SPANS_SHIFT_DUMP": lambda: os.environ.get("VLLM_V1_SPANS_SHIFT_DUMP", ""),
