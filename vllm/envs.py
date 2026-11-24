@@ -278,6 +278,7 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
     VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
     VLLM_V1_SPANS_SPANFUSE_SEED: bool = False
+    VLLM_V1_SPANS_PIN_FRACTION: float = 0.0
     VLLM_V1_SPANS_SHIFT_DUMP: str = ""
     VLLM_V1_SPANS_LB_NOCLIP: bool = False
     VLLM_V1_SPANS_LB_SPILL_LOG: bool = False
@@ -1783,6 +1784,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SPANFUSE: a cold span is encoded in its first context and that copy is the shared one
     "VLLM_V1_SPANS_SPANFUSE_SEED": lambda: (
         os.environ.get("VLLM_V1_SPANS_SPANFUSE_SEED", "False") == "True"
+    ),
+    # SPANS: share of the KV pool shared span blocks hold against eviction (0 = off)
+    "VLLM_V1_SPANS_PIN_FRACTION": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_PIN_FRACTION", "0")
     ),
     # SPANSHIFT: dump blind and repaired K/V of every gap-swapped block to this dir
     "VLLM_V1_SPANS_SHIFT_DUMP": lambda: os.environ.get("VLLM_V1_SPANS_SHIFT_DUMP", ""),

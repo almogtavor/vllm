@@ -315,6 +315,11 @@ def _schedule_spanfuse_otf_warm(
             ],
             0,
         )
+        if seed:
+            pool = sched.kv_cache_manager.block_pool
+            pool.pin_blocks(
+                req_blocks[b] for s, e in spans for b in range(s // bs, e // bs)
+            )
         if seed and prefix_exact:
             # a block hash shared by two spans here resolves to the first one's copy
             n = Counter(request.block_hashes[b] for b in idx)
@@ -373,6 +378,7 @@ def _schedule_spanfuse_otf_warm(
     sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
         [req_blocks[b] for b in idx], [request.block_hashes[b] for b in idx], 0
     )
+    sched.kv_cache_manager.block_pool.pin_blocks(req_blocks[b] for b in idx)
     logger.info(
         "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s%s",
         len(spans),
