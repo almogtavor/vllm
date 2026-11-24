@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from vllm import envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -180,6 +181,8 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # SPANS: ids of shared span blocks the pool holds a reference on
+        self.pinned_block_ids: set[int] = set()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -223,6 +226,32 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+
+    def pin_blocks(self, blocks: Iterable[KVCacheBlock]) -> int:
+        """SPANS: hold one pool reference on shared span blocks, so they never
+        reach the free queue and are never evicted. Returns the number pinned."""
+        # ceiling: pins are never released, so past this share of the pool span
+        # blocks stay evictable; upgrade path is LRU among the pinned blocks
+        cap = int(envs.VLLM_V1_SPANS_PIN_FRACTION * (self.num_gpu_blocks - 1))
+        pinned = 0
+        for blk in blocks:
+            if len(self.pinned_block_ids) >= cap:
+                break
+            if blk.is_null or blk.block_id in self.pinned_block_ids:
+                continue
+            # a duplicate of an already cached hash is never the copy a lookup returns
+            if (
+                blk.block_hash is None
+                or self.cached_block_hash_to_block.get_one_block(blk.block_hash)
+                is not blk
+            ):
+                continue
+            if blk.ref_cnt == 0:
+                self.free_block_queue.remove(blk)
+            blk.ref_cnt += 1
+            self.pinned_block_ids.add(blk.block_id)
+            pinned += 1
+        return pinned
 
     def cache_full_blocks(
         self,

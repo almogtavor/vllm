@@ -3988,3 +3988,20 @@ def test_spanfuse_probe_miss_copies_stay_private(monkeypatch):
     req_blocks = manager.coordinator.single_type_managers[0].req_to_blocks["probe"]
     assert req_blocks[1] is copy_ and copy_.block_hash is None
     assert manager.block_pool.get_cached_block(probe.pd_block_hashes[1], [0]) is None
+
+
+def test_pin_blocks_survive_eviction(monkeypatch):
+    """SPANS: pinned shared span blocks keep their hash when the pool is drained,
+    and the pinned share of the pool is capped."""
+    monkeypatch.setenv("VLLM_V1_SPANS_PIN_FRACTION", "0.5")
+    pool = BlockPool(num_gpu_blocks=9, enable_caching=True, hash_block_size=4)
+    req = make_request("0", list(range(24)), 4, sha256)
+    blocks = pool.get_new_blocks(6)
+    pool.cache_blocks_under_hashes(blocks, req.block_hashes[:6], 0)
+    # cap = int(0.5 * 8) = 4 of the 6 offered
+    assert pool.pin_blocks(blocks) == 4 and pool.pin_blocks(blocks) == 0
+    pool.free_blocks(blocks)
+    assert pool.get_num_free_blocks() == 4
+    pool.get_new_blocks(4)
+    assert [b.block_hash is not None for b in blocks] == [True] * 4 + [False] * 2
+    assert pool.get_cached_block(req.block_hashes[0], [0]) == [blocks[0]]
